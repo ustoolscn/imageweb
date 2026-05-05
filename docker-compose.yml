@@ -1,0 +1,15 @@
+services:
+  image-web:
+    build: .
+    container_name: image-web
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      DATA_DIR: /app/data
+      DATABASE_PATH: /app/data/app.db
+      STATIC_DIR: /app/static
+      SCDN_UPLOAD_URL: https://img.scdn.io/api/v1.php
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

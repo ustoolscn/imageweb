@@ -1,0 +1,8 @@
+data/
+frontend/node_modules/
+frontend/dist/
+backend/bin/
+.claude/
+*.db
+*.db-shm
+*.db-wal
