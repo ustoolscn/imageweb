@@ -54,7 +54,7 @@ http://localhost:8080
 | `DATA_DIR` | `/app/data` | 数据目录 |
 | `DATABASE_PATH` | `/app/data/app.db` | SQLite 数据库路径 |
 | `STATIC_DIR` | `/app/static` | 前端静态文件目录 |
-| `SCDN_UPLOAD_URL` | `https://img.scdn.io/api/v1.php` | 图床上传接口 |
+| `SCDN_UPLOAD_URL` | `https://2bad.lujilujilujilujiluji.com/` | 图床上传接口 |
 
 ## 本地开发
 

@@ -6,6 +6,7 @@ export interface UploadedImage {
   original_size?: number
   compressed_size?: number
   compression_ratio?: number
+  mask_url?: string
 }
 
 export interface Task {
@@ -37,6 +38,8 @@ export interface Task {
   updated_at: string
   started_at?: string
   completed_at?: string
+  queue_position: number
+  shared_to_plaza: boolean
 }
 
 export interface CreateTaskPayload {
@@ -54,4 +57,25 @@ export interface CreateTaskPayload {
   style?: string
   response_format?: string
   reference_images: UploadedImage[]
+}
+
+export interface PlazaItem {
+  id: string
+  task_id: string
+  prompt: string
+  model: string
+  size: string
+  quality: string
+  output_format: string
+  output_compression: number
+  background: string
+  moderation: string
+  n: number
+  style?: string
+  response_format?: string
+  reference_images: UploadedImage[]
+  result_images: UploadedImage[]
+  like_count: number
+  liked: boolean
+  created_at: string
 }

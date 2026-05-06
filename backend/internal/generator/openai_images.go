@@ -6,10 +6,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	_ "image/jpeg"
+	"image/png"
 	"io"
 	"math"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -165,11 +171,6 @@ func (c *Client) generateWithReferences(ctx context.Context, task *model.Task, f
 	if err != nil {
 		return GenerateResult{}, err
 	}
-	for key, value := range requestSummary {
-		if value != "" {
-			_ = writer.WriteField(key, value)
-		}
-	}
 
 	cleanup := []string{}
 	defer func() {
@@ -178,8 +179,9 @@ func (c *Client) generateWithReferences(ctx context.Context, task *model.Task, f
 		}
 	}()
 	requestImages := []multipartFileSource{}
+	maskedReferences := []maskedReferencePromptInfo{}
 	for index, image := range referenceInputs(task) {
-		path, err := c.downloadReferenceImage(ctx, task.ID, index, image.URL)
+		path, err := c.downloadReferenceAsset(ctx, task.ID, "ref", index, image.URL)
 		if err != nil {
 			_ = writer.Close()
 			return GenerateResult{RequestJSON: buildMultipartRequestSource(requestSummary, requestImages)}, err
@@ -193,6 +195,39 @@ func (c *Client) generateWithReferences(ctx context.Context, task *model.Task, f
 		if err := addMultipartFile(writer, "image", path); err != nil {
 			_ = writer.Close()
 			return GenerateResult{RequestJSON: buildMultipartRequestSource(requestSummary, requestImages)}, err
+		}
+		if image.MaskURL != "" {
+			maskPath, err := c.downloadReferenceAsset(ctx, task.ID, "mask", index, image.MaskURL)
+			if err != nil {
+				_ = writer.Close()
+				return GenerateResult{RequestJSON: buildMultipartRequestSource(requestSummary, requestImages)}, err
+			}
+			cleanup = append(cleanup, maskPath)
+			mergedPath, err := c.createMaskedReferencePreview(task.ID, index, path, maskPath)
+			if err != nil {
+				_ = writer.Close()
+				return GenerateResult{RequestJSON: buildMultipartRequestSource(requestSummary, requestImages)}, err
+			}
+			cleanup = append(cleanup, mergedPath)
+			maskedReferences = append(maskedReferences, maskedReferencePromptInfo{
+				OriginalFilename: filepath.Base(path),
+				MarkedFilename:   filepath.Base(mergedPath),
+			})
+			requestImages = append(requestImages, multipartFileSource{
+				Field:    "image",
+				Filename: filepath.Base(mergedPath),
+				Source:   fmt.Sprintf("generated from %s with mask %s", image.URL, image.MaskURL),
+			})
+			if err := addMultipartFile(writer, "image", mergedPath); err != nil {
+				_ = writer.Close()
+				return GenerateResult{RequestJSON: buildMultipartRequestSource(requestSummary, requestImages)}, err
+			}
+		}
+	}
+	requestSummary["prompt"] = buildMaskedEditPrompt(finalPrompt, maskedReferences)
+	for key, value := range requestSummary {
+		if value != "" {
+			_ = writer.WriteField(key, value)
 		}
 	}
 	if err := writer.Close(); err != nil {
@@ -414,6 +449,30 @@ func referenceInputs(task *model.Task) []model.UploadedImage {
 	return append([]model.UploadedImage{}, task.ReferenceImages...)
 }
 
+type maskedReferencePromptInfo struct {
+	OriginalFilename string
+	MarkedFilename   string
+}
+
+func buildMaskedEditPrompt(userPrompt string, references []maskedReferencePromptInfo) string {
+	prompt := strings.TrimSpace(userPrompt)
+	if len(references) == 0 {
+		return prompt
+	}
+	lines := []string{"参考图说明："}
+	for _, reference := range references {
+		lines = append(lines, fmt.Sprintf("- %s 是需要编辑的原图；%s 是由 %s 和蒙板合并生成的标记图。", reference.OriginalFilename, reference.MarkedFilename, reference.OriginalFilename))
+	}
+	lines = append(lines,
+		"标记图中的白色涂抹区域表示允许修改的区域；其余区域表示需要尽量保持不变。",
+		"请根据上面列出的文件名匹配每组原图和标记图，只修改标记图中白色涂抹区域对应的位置，其他区域保持原图一致。",
+		"",
+		"用户真实输入：",
+		prompt,
+	)
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
 func buildEditRequestSummary(task *model.Task, finalPrompt string) (map[string]string, error) {
 	size, err := normalizeGPTImage2Size(task.Size)
 	if err != nil {
@@ -436,7 +495,7 @@ func buildEditRequestSummary(task *model.Task, finalPrompt string) (map[string]s
 	return payload, nil
 }
 
-func (c *Client) downloadReferenceImage(ctx context.Context, taskID string, index int, imageURL string) (string, error) {
+func (c *Client) downloadReferenceAsset(ctx context.Context, taskID, kind string, index int, imageURL string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, imageURL, nil)
 	if err != nil {
 		return "", err
@@ -450,7 +509,7 @@ func (c *Client) downloadReferenceImage(ctx context.Context, taskID string, inde
 		return "", fmt.Errorf("下载参考图失败：HTTP %d", resp.StatusCode)
 	}
 	ext := extFromContentType(resp.Header.Get("Content-Type"))
-	path := filepath.Join(c.TempDir, fmt.Sprintf("%s-ref-%d.%s", taskID, index, ext))
+	path := filepath.Join(c.TempDir, fmt.Sprintf("%s-%s-%d.%s", taskID, kind, index, ext))
 	file, err := os.Create(path)
 	if err != nil {
 		return "", err
@@ -460,13 +519,61 @@ func (c *Client) downloadReferenceImage(ctx context.Context, taskID string, inde
 	return path, err
 }
 
+func (c *Client) createMaskedReferencePreview(taskID string, index int, imagePath, maskPath string) (string, error) {
+	baseFile, err := os.Open(imagePath)
+	if err != nil {
+		return "", err
+	}
+	defer baseFile.Close()
+	baseImage, _, err := image.Decode(baseFile)
+	if err != nil {
+		return "", err
+	}
+	maskFile, err := os.Open(maskPath)
+	if err != nil {
+		return "", err
+	}
+	defer maskFile.Close()
+	maskImage, _, err := image.Decode(maskFile)
+	if err != nil {
+		return "", err
+	}
+	bounds := baseImage.Bounds()
+	output := image.NewNRGBA(bounds)
+	draw.Draw(output, bounds, baseImage, bounds.Min, draw.Src)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			_, _, _, alpha := maskImage.At(x, y).RGBA()
+			if alpha < 0xffff {
+				base := output.NRGBAAt(x, y)
+				output.SetNRGBA(x, y, color.NRGBA{
+					R: uint8((uint16(base.R)*71 + 255*184) / 255),
+					G: uint8((uint16(base.G)*71 + 255*184) / 255),
+					B: uint8((uint16(base.B)*71 + 255*184) / 255),
+					A: base.A,
+				})
+			}
+		}
+	}
+	path := filepath.Join(c.TempDir, fmt.Sprintf("%s-mask-preview-%d.png", taskID, index))
+	file, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	return path, png.Encode(file, output)
+}
+
 func addMultipartFile(writer *multipart.Writer, fieldName, path string) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	part, err := writer.CreateFormFile(fieldName, filepath.Base(path))
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, fieldName, filepath.Base(path)))
+	header.Set("Content-Type", contentTypeFromPath(path))
+	part, err := writer.CreatePart(header)
 	if err != nil {
 		return err
 	}
@@ -542,6 +649,17 @@ func extFromContentType(contentType string) string {
 		return "webp"
 	}
 	return "png"
+}
+
+func contentTypeFromPath(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	default:
+		return "image/png"
+	}
 }
 
 func joinURL(baseURL, path string) (string, error) {

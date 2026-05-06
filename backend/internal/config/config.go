@@ -16,7 +16,7 @@ func Load() Config {
 		Port:          getEnv("PORT", "8080"),
 		DataDir:       dataDir,
 		DatabasePath:  getEnv("DATABASE_PATH", dataDir+"/app.db"),
-		ScdnUploadURL: getEnv("SCDN_UPLOAD_URL", "https://img.scdn.io/api/v1.php"),
+		ScdnUploadURL: getEnv("SCDN_UPLOAD_URL", "https://2bad.lujilujilujilujiluji.com/"),
 		StaticDir:     getEnv("STATIC_DIR", "./static"),
 	}
 }

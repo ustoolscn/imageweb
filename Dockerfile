@@ -21,7 +21,7 @@ ENV PORT=8080
 ENV DATA_DIR=/app/data
 ENV DATABASE_PATH=/app/data/app.db
 ENV STATIC_DIR=/app/static
-ENV SCDN_UPLOAD_URL=https://img.scdn.io/api/v1.php
+ENV SCDN_UPLOAD_URL=https://2bad.lujilujilujilujiluji.com/
 EXPOSE 8080
 VOLUME ["/app/data"]
 CMD ["/app/image-web"]

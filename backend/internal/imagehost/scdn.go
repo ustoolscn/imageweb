@@ -42,7 +42,7 @@ func New(uploadURL string) *Client {
 func (c *Client) UploadReader(ctx context.Context, filename string, reader io.Reader) (model.UploadedImage, error) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile("image", filename)
+	part, err := writer.CreateFormFile("file", filename)
 	if err != nil {
 		return model.UploadedImage{}, err
 	}
@@ -58,6 +58,7 @@ func (c *Client) UploadReader(ctx context.Context, filename string, reader io.Re
 		return model.UploadedImage{}, err
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer cooper")
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {

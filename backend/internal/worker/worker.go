@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
+	"sync/atomic"
 	"time"
 
 	"image-web/backend/internal/db"
@@ -17,21 +17,41 @@ type Worker struct {
 	Store     *db.Store
 	Generator *generator.Client
 	ImageHost *imagehost.Client
+	running   int64
 }
 
 func (w *Worker) Start(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				w.processNext(ctx)
+				w.dispatch(ctx)
 			}
 		}
 	}()
+}
+
+func (w *Worker) dispatch(ctx context.Context) {
+	config, err := w.Store.SiteConfig(ctx)
+	if err != nil {
+		fmt.Println("worker get config:", err)
+		return
+	}
+	concurrency := config.WorkerConcurrency
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	for atomic.LoadInt64(&w.running) < int64(concurrency) {
+		atomic.AddInt64(&w.running, 1)
+		go func() {
+			defer atomic.AddInt64(&w.running, -1)
+			w.processNext(ctx)
+		}()
+	}
 }
 
 func (w *Worker) processNext(ctx context.Context) {
@@ -43,7 +63,7 @@ func (w *Worker) processNext(ctx context.Context) {
 		return
 	}
 	started := time.Now()
-	finalPrompt := buildFinalPrompt(task)
+	finalPrompt := task.Prompt
 	requestHeaders := ""
 	requestJSON := ""
 	responseHeaders := ""
@@ -74,8 +94,4 @@ func (w *Worker) processNext(ctx context.Context) {
 	if err := w.Store.CompleteTask(ctx, task.ID, finalPrompt, requestHeaders, requestJSON, responseHeaders, responseJSON, uploaded, time.Since(started).Milliseconds()); err != nil {
 		fmt.Println("worker complete task:", err)
 	}
-}
-
-func buildFinalPrompt(task *model.Task) string {
-	return strings.TrimSpace(task.Prompt)
 }
