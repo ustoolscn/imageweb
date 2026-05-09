@@ -15,10 +15,10 @@ import TaskGrid from './components/TaskGrid.vue'
 import { ratioOptions, sizeFromRatio } from './lib/sizes'
 import { canOpenSource, canShareTask, maskBaseURL } from './lib/view'
 import type { PlazaItem, Task, UploadedImage } from './types'
-import type { ImageForm, PendingReferenceImage, PreviewImage, SettingsPayload, ThemeMode, ViewMode } from './uiTypes'
+import type { ImageForm, PendingReferenceImage, PreviewImage, SettingsPayload, ThemeMode, ViewMode, AppliedThemeMode } from './uiTypes'
 
 const savedModel = localStorage.getItem('image_web_model') || 'gpt-image-2'
-const savedTheme = localStorage.getItem('image_web_theme') === 'light' ? 'light' : 'dark'
+const savedTheme = parseSavedTheme(localStorage.getItem('image_web_theme'))
 const baseurl = ref(localStorage.getItem('image_web_baseurl') || '')
 const apikey = ref(localStorage.getItem('image_web_apikey') || '')
 const tasks = ref<Task[]>([])
@@ -27,6 +27,7 @@ const plazaItems = ref<PlazaItem[]>([])
 const totalPlazaItems = ref(0)
 const viewMode = ref<ViewMode>('tasks')
 const themeMode = ref<ThemeMode>(savedTheme)
+const systemThemeMode = ref<AppliedThemeMode>(getSystemThemeMode())
 const plazaSort = ref<'time' | 'likes'>('time')
 const plazaClientID = ref(localStorage.getItem('image_web_plaza_client_id') || '')
 const models = ref<string[]>(['gpt-image-2'])
@@ -66,6 +67,19 @@ const referenceMaskFiles = ref<Array<File | null>>([])
 const referenceMaskPreviews = ref<Array<string | null>>([])
 let pollTimer: number | undefined
 let clockTimer: number | undefined
+let systemThemeQuery: MediaQueryList | undefined
+
+function parseSavedTheme(value: string | null): ThemeMode {
+  return value === 'light' || value === 'dark' || value === 'system' ? value : 'system'
+}
+
+function getSystemThemeMode(): AppliedThemeMode {
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+function syncSystemThemeMode(event?: MediaQueryListEvent) {
+  systemThemeMode.value = event?.matches ? 'dark' : getSystemThemeMode()
+}
 
 const form = reactive<ImageForm>({
   prompt: '',
@@ -91,6 +105,7 @@ const hasConfig = computed(() => Boolean(baseurl.value && apikey.value))
 const runningCount = computed(() => tasks.value.filter((task) => task.status === 'pending' || task.status === 'running').length)
 const visibleSubtitle = computed(() => viewMode.value === 'plaza' ? `公开广场 · 已加载 ${plazaItems.value.length} 条 · 总计 ${totalPlazaItems.value} 条` : (hasConfig.value ? `${maskBaseURL(baseurl.value)} · 已加载 ${tasks.value.length} 条 · 总计 ${totalTasks.value} 条` : '通过 URL 传入 baseurl 和 apikey 后开始使用'))
 const draftSize = computed(() => sizeFromRatio(sizeDraft.base, sizeDraft.ratio))
+const appliedThemeMode = computed<AppliedThemeMode>(() => themeMode.value === 'system' ? systemThemeMode.value : themeMode.value)
 
 watch(() => form.model, (model) => {
   localStorage.setItem('image_web_model', model)
@@ -130,7 +145,9 @@ async function saveSettings(settings?: SettingsPayload) {
 }
 
 function toggleTheme() {
-  themeMode.value = themeMode.value === 'dark' ? 'light' : 'dark'
+  if (themeMode.value === 'system') themeMode.value = 'light'
+  else if (themeMode.value === 'light') themeMode.value = 'dark'
+  else themeMode.value = 'system'
 }
 
 function toggleFavoriteOnly() {
@@ -225,6 +242,9 @@ async function openSourceTask(task: Task, event?: Event) {
 }
 
 onMounted(() => {
+  systemThemeQuery = window.matchMedia?.('(prefers-color-scheme: dark)')
+  systemThemeQuery?.addEventListener('change', syncSystemThemeMode)
+  syncSystemThemeMode()
   loadConfigFromURL()
   refreshSiteBrand()
   syncSizeDraft(form.size)
@@ -241,6 +261,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (pollTimer) window.clearInterval(pollTimer)
   if (clockTimer) window.clearInterval(clockTimer)
+  systemThemeQuery?.removeEventListener('change', syncSystemThemeMode)
   window.removeEventListener('resize', syncMaskCanvasDisplaySize)
   window.removeEventListener('scroll', onPageScroll)
   revokePreviews()
@@ -857,7 +878,7 @@ function showMessage(text: string) {
 </script>
 
 <template>
-  <main class="page" :class="`theme-${themeMode}`">
+  <main class="page" :class="`theme-${appliedThemeMode}`">
     <AppToolbar
       v-model:status="status"
       v-model:keyword="keyword"

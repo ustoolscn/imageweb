@@ -1,7 +1,8 @@
 import type { UploadedImage } from './types'
 
 export type ViewMode = 'tasks' | 'plaza'
-export type ThemeMode = 'dark' | 'light'
+export type ThemeMode = 'system' | 'dark' | 'light'
+export type AppliedThemeMode = 'dark' | 'light'
 export type PlazaSort = 'time' | 'likes'
 export type PreviewSource = 'reused' | 'new'
 
