@@ -26,6 +26,10 @@ function previewImageUrl(item: PlazaItem) {
   return image?.thumbnail_url || image?.url || ''
 }
 
+function cardImageUrl(item: PlazaItem) {
+  return previewImageUrl(item) || imageUrl(item)
+}
+
 function referenceImageUrl(item: PlazaItem) {
   const image = item.reference_images?.[0]
   return image?.thumbnail_url || image?.url || ''
@@ -61,23 +65,20 @@ function imageAspectRatio(item: PlazaItem) {
   <section class="plaza-grid">
     <article v-for="item in items" :key="item.id" class="plaza-card" @click="emit('selectItem', item)">
       <div
-        v-if="imageUrl(item)"
+        v-if="cardImageUrl(item)"
         class="plaza-image-wrap"
-        :class="{ loaded: isImageLoaded(imageUrl(item)) }"
+        :class="{ loaded: isImageLoaded(cardImageUrl(item)) }"
         :style="{ aspectRatio: imageAspectRatio(item) }"
       >
         <div class="plaza-image-placeholder">加载中</div>
-        <picture>
-          <source media="(max-width: 640px)" :srcset="previewImageUrl(item)" />
-          <img
-            :src="imageUrl(item)"
-            alt="广场作品"
-            loading="lazy"
-            decoding="async"
-            fetchpriority="low"
-            @load="markImageLoaded(imageUrl(item))"
-          />
-        </picture>
+        <img
+          :src="cardImageUrl(item)"
+          alt="广场作品"
+          loading="lazy"
+          decoding="async"
+          fetchpriority="low"
+          @load="markImageLoaded(cardImageUrl(item))"
+        />
         <div v-if="referenceImageUrl(item)" class="plaza-reference-overlay" title="参考图">
           <div class="plaza-reference-badge">参考图</div>
           <img :src="referenceImageUrl(item)" alt="参考图" loading="lazy" decoding="async" />
