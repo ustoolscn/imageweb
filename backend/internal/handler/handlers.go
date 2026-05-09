@@ -271,7 +271,7 @@ func (h *Handler) plaza(w http.ResponseWriter, r *http.Request) {
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	beforeLikeCount, _ := strconv.Atoi(r.URL.Query().Get("before_like_count"))
-	items, total, err := h.Store.ListPlazaItems(r.Context(), r.URL.Query().Get("sort"), r.URL.Query().Get("before_created_at"), r.URL.Query().Get("before_id"), beforeLikeCount, r.URL.Query().Get("client_id"), limit)
+	items, total, err := h.Store.ListPlazaItems(r.Context(), r.URL.Query().Get("sort"), r.URL.Query().Get("q"), r.URL.Query().Get("before_created_at"), r.URL.Query().Get("before_id"), beforeLikeCount, r.URL.Query().Get("client_id"), limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

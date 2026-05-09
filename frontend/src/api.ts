@@ -147,8 +147,9 @@ export async function unshareTask(id: string, apikey: string, baseurl: string) {
   })
 }
 
-export async function listPlazaItems(sort: string, clientID: string, beforeCreatedAt = '', beforeID = '', beforeLikeCount = 0, limit = 30) {
+export async function listPlazaItems(sort: string, clientID: string, q = '', beforeCreatedAt = '', beforeID = '', beforeLikeCount = 0, limit = 30) {
   const params = new URLSearchParams({ sort, client_id: clientID, limit: String(limit) })
+  if (q) params.set('q', q)
   if (beforeCreatedAt && beforeID) {
     params.set('before_created_at', beforeCreatedAt)
     params.set('before_id', beforeID)

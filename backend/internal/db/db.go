@@ -388,13 +388,25 @@ func (s *Store) TaskUpdates(ctx context.Context, apiKey, baseURL string, ids []s
 	return updates, rows.Err()
 }
 
-func (s *Store) ListPlazaItems(ctx context.Context, sort, beforeCreatedAt, beforeID string, beforeLikeCount int, clientID string, limit int) ([]model.PlazaItem, int, error) {
+func (s *Store) ListPlazaItems(ctx context.Context, sort, q, beforeCreatedAt, beforeID string, beforeLikeCount int, clientID string, limit int) ([]model.PlazaItem, int, error) {
 	total := 0
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM plaza_items`).Scan(&total); err != nil {
-		return nil, 0, err
-	}
 	args := []any{clientID}
 	where := []string{"1 = 1"}
+	countArgs := []any{}
+	countWhere := []string{"1 = 1"}
+	keyword := strings.TrimSpace(q)
+	if keyword != "" {
+		pattern := "%" + strings.ToLower(keyword) + "%"
+		args = append(args, pattern)
+		wherePlaceholder := placeholder(len(args))
+		where = append(where, fmt.Sprintf("(LOWER(prompt) LIKE %s OR LOWER(model) LIKE %s OR LOWER(size) LIKE %s OR LOWER(quality) LIKE %s OR LOWER(output_format) LIKE %s OR LOWER(background) LIKE %s)", wherePlaceholder, wherePlaceholder, wherePlaceholder, wherePlaceholder, wherePlaceholder, wherePlaceholder))
+		countArgs = append(countArgs, pattern)
+		countPlaceholder := placeholder(len(countArgs))
+		countWhere = append(countWhere, fmt.Sprintf("(LOWER(prompt) LIKE %s OR LOWER(model) LIKE %s OR LOWER(size) LIKE %s OR LOWER(quality) LIKE %s OR LOWER(output_format) LIKE %s OR LOWER(background) LIKE %s)", countPlaceholder, countPlaceholder, countPlaceholder, countPlaceholder, countPlaceholder, countPlaceholder))
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM plaza_items WHERE `+strings.Join(countWhere, " AND "), countArgs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
 	orderBy := "created_at DESC, id DESC"
 	if sort == "likes" {
 		orderBy = "like_count DESC, created_at DESC, id DESC"

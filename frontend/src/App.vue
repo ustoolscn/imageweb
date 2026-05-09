@@ -36,6 +36,7 @@ const siteIcon = ref('AI')
 const sizeAccess = reactive({ allow2K: true, allow4K: true })
 const status = ref('all')
 const keyword = ref('')
+const plazaKeyword = ref('')
 const favoriteOnly = ref(false)
 const loading = ref(false)
 const loadingMore = ref(false)
@@ -379,7 +380,7 @@ async function resetTasks() {
 async function refreshPlazaItems(limit = Math.max(30, plazaItems.value.length)) {
   loading.value = true
   try {
-    const result = await listPlazaItems(plazaSort.value, ensurePlazaClientID(), '', '', 0, limit)
+    const result = await listPlazaItems(plazaSort.value, ensurePlazaClientID(), plazaKeyword.value, '', '', 0, limit)
     plazaItems.value = result.data
     totalPlazaItems.value = result.total
     hasMorePlazaItems.value = result.has_more
@@ -424,7 +425,7 @@ async function loadMorePlazaItems() {
   if (loading.value || loadingMore.value || !hasMorePlazaItems.value) return
   loadingMore.value = true
   try {
-    const result = await listPlazaItems(plazaSort.value, ensurePlazaClientID(), nextPlazaBeforeCreatedAt.value, nextPlazaBeforeID.value, nextPlazaBeforeLikeCount.value)
+    const result = await listPlazaItems(plazaSort.value, ensurePlazaClientID(), plazaKeyword.value, nextPlazaBeforeCreatedAt.value, nextPlazaBeforeID.value, nextPlazaBeforeLikeCount.value)
     const existing = new Set(plazaItems.value.map((item) => item.id))
     plazaItems.value.push(...result.data.filter((item) => !existing.has(item.id)))
     totalPlazaItems.value = result.total
@@ -911,6 +912,7 @@ function showMessage(text: string) {
     <AppToolbar
       v-model:status="status"
       v-model:keyword="keyword"
+      v-model:plaza-keyword="plazaKeyword"
       :site-title="siteTitle"
       :site-icon="siteIcon"
       :visible-subtitle="visibleSubtitle"

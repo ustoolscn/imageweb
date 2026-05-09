@@ -1,6 +1,9 @@
 <script setup lang="ts">
+import { ref } from 'vue'
 import type { Task } from '../types'
 import { canOpenSource, canShareTask, displayImageURL, isFavorite, queueText, statusClass, statusText, taskReferenceImages, timeText } from '../lib/view'
+
+const loadedImages = ref(new Set<string>())
 
 defineProps<{
   tasks: Task[]
@@ -23,6 +26,14 @@ const emit = defineEmits<{
   toggleShare: [task: Task, event: Event]
   loadMore: []
 }>()
+
+function markImageLoaded(url: string) {
+  loadedImages.value = new Set(loadedImages.value).add(url)
+}
+
+function isImageLoaded(url?: string) {
+  return Boolean(url && loadedImages.value.has(url))
+}
 </script>
 
 <template>
@@ -50,7 +61,10 @@ const emit = defineEmits<{
     <section class="grid">
       <article v-for="task in tasks" :key="task.id" class="task-card" :class="statusClass(task.status)" @click="emit('selectTask', task)">
         <div class="preview" :class="task.status">
-          <img v-if="task.result_images?.[0]?.url" :src="displayImageURL(task.result_images[0])" alt="生成结果" loading="lazy" decoding="async" />
+          <div v-if="task.result_images?.[0]?.url" class="preview-image-wrap" :class="{ loaded: isImageLoaded(displayImageURL(task.result_images[0])) }">
+            <div class="task-image-placeholder">加载中</div>
+            <img :src="displayImageURL(task.result_images[0])" alt="生成结果" loading="lazy" decoding="async" @load="markImageLoaded(displayImageURL(task.result_images[0]))" />
+          </div>
           <div v-else class="state-mark">
             <span v-if="task.status === 'running'" class="spinner"></span>
             <span v-else class="state-icon">{{ task.status === 'failed' ? '!' : '...' }}</span>

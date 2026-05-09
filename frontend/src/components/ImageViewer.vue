@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import type { ComponentPublicInstance } from 'vue'
 import type { PreviewImage } from '../uiTypes'
 
@@ -29,6 +29,7 @@ type TemplateRef = Element | ComponentPublicInstance | null
 const zoom = ref(1)
 const offset = ref({ x: 0, y: 0 })
 const isDragging = ref(false)
+const imageLoaded = ref(false)
 const panSpeed = 1.45
 const pointers = new Map<number, { x: number; y: number }>()
 let dragStart: { pointerId: number; x: number; y: number } | null = null
@@ -38,6 +39,15 @@ const zoomable = computed(() => !props.image.editable)
 const zoomStyle = computed(() => ({
   transform: `translate(${offset.value.x}px, ${offset.value.y}px) scale(${zoom.value})`,
 }))
+
+watch(() => props.image.url, () => {
+  imageLoaded.value = false
+  resetZoom()
+})
+
+function markImageLoaded() {
+  imageLoaded.value = true
+}
 
 function clampZoom(value: number) {
   return Math.min(6, Math.max(1, value))
@@ -177,7 +187,7 @@ function updateBrushSize(event: Event) {
       <div
         v-else-if="image.maskUrl"
         class="mask-stage readonly-mask zoom-stage"
-        :class="{ zoomed: zoom > 1, dragging: isDragging }"
+        :class="{ zoomed: zoom > 1, dragging: isDragging, loaded: imageLoaded }"
         @wheel="onWheel"
         @pointerdown.prevent="onPointerDown"
         @pointermove.prevent="onPointerMove"
@@ -185,15 +195,16 @@ function updateBrushSize(event: Event) {
         @pointercancel="onPointerEnd"
         @dblclick="resetZoom"
       >
+        <div v-if="!imageLoaded" class="image-viewer-placeholder">加载原图中</div>
         <div class="zoom-content" :style="zoomStyle">
-          <img :src="image.url" :alt="image.label" />
+          <img :src="image.url" :alt="image.label" @load="markImageLoaded" />
           <img class="readonly-mask-overlay" :src="maskPreviewUrl(image.maskUrl)" alt="蒙板" />
         </div>
       </div>
       <div
         v-else
         class="zoom-stage"
-        :class="{ zoomed: zoom > 1, dragging: isDragging }"
+        :class="{ zoomed: zoom > 1, dragging: isDragging, loaded: imageLoaded }"
         @wheel="onWheel"
         @pointerdown.prevent="onPointerDown"
         @pointermove.prevent="onPointerMove"
@@ -201,7 +212,8 @@ function updateBrushSize(event: Event) {
         @pointercancel="onPointerEnd"
         @dblclick="resetZoom"
       >
-        <img class="zoom-content" :style="zoomStyle" :src="image.url" :alt="image.label" />
+        <div v-if="!imageLoaded" class="image-viewer-placeholder">加载原图中</div>
+        <img class="zoom-content" :style="zoomStyle" :src="image.url" :alt="image.label" @load="markImageLoaded" />
       </div>
       <div v-if="!image.editable" class="zoom-controls" @click.stop>
         <span>{{ Math.round(zoom * 100) }}%</span>

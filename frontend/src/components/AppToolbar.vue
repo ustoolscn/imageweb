@@ -9,6 +9,7 @@ const props = defineProps<{
   viewMode: ViewMode
   status: string
   keyword: string
+  plazaKeyword: string
   favoriteOnly: boolean
   plazaSort: PlazaSort
   themeMode: ThemeMode
@@ -25,6 +26,7 @@ const emit = defineEmits<{
   toggleFavoriteOnly: []
   'update:status': [status: string]
   'update:keyword': [keyword: string]
+  'update:plazaKeyword': [keyword: string]
 }>()
 
 const currentStatus = computed({
@@ -35,6 +37,11 @@ const currentStatus = computed({
 const currentKeyword = computed({
   get: () => props.keyword,
   set: (value: string) => emit('update:keyword', value),
+})
+
+const currentPlazaKeyword = computed({
+  get: () => props.plazaKeyword,
+  set: (value: string) => emit('update:plazaKeyword', value),
 })
 
 const currentThemeLabel = computed(() => {
@@ -85,10 +92,16 @@ const currentThemeIcon = computed(() => {
           <span>⌕</span>
           <input v-model="currentKeyword" class="search" placeholder="搜索提示词、参数..." @keyup.enter="emit('resetTasks')" />
         </div>
+        <button class="ghost task-search-button" @click="emit('resetTasks')">搜索</button>
         <button class="ghost" :class="{ active: favoriteOnly }" @click="emit('toggleFavoriteOnly')">{{ favoriteOnly ? '看全部' : '只看收藏' }}</button>
         <button class="ghost" @click="emit('refreshTasks')">刷新</button>
       </template>
       <template v-else>
+        <div class="search-wrap plaza-search">
+          <span>⌕</span>
+          <input v-model="currentPlazaKeyword" class="search" placeholder="搜索广场作品..." @keyup.enter="emit('refreshPlazaItems')" />
+        </div>
+        <button class="ghost plaza-search-button" @click="emit('refreshPlazaItems')">搜索</button>
         <div class="plaza-sort">
           <button :class="{ active: plazaSort === 'time' }" @click="emit('switchPlazaSort', 'time')">最新发布</button>
           <button :class="{ active: plazaSort === 'likes' }" @click="emit('switchPlazaSort', 'likes')">点赞最多</button>

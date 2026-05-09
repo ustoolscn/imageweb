@@ -1,6 +1,8 @@
 <script setup lang="ts">
+import { ref } from 'vue'
 import type { PlazaItem } from '../types'
-import { displayImageURL } from '../lib/view'
+
+const loadedImages = ref(new Set<string>())
 
 defineProps<{
   items: PlazaItem[]
@@ -14,6 +16,40 @@ const emit = defineEmits<{
   toggleLike: [item: PlazaItem, event: Event]
   loadMore: []
 }>()
+
+function imageUrl(item: PlazaItem) {
+  return item.result_images?.[0]?.url || ''
+}
+
+function previewImageUrl(item: PlazaItem) {
+  const image = item.result_images?.[0]
+  return image?.thumbnail_url || image?.url || ''
+}
+
+function referenceImageUrl(item: PlazaItem) {
+  const image = item.reference_images?.[0]
+  return image?.thumbnail_url || image?.url || ''
+}
+
+function referenceMoreCount(item: PlazaItem) {
+  return Math.max(0, (item.reference_images?.length || 0) - 1)
+}
+
+function markImageLoaded(url: string) {
+  loadedImages.value = new Set(loadedImages.value).add(url)
+}
+
+function isImageLoaded(url?: string) {
+  return Boolean(url && loadedImages.value.has(url))
+}
+
+function imageAspectRatio(item: PlazaItem) {
+  const match = item.size?.toLowerCase().match(/^(\d+)x(\d+)$/)
+  if (!match) return '1 / 1'
+  const width = Number(match[1])
+  const height = Number(match[2])
+  return width > 0 && height > 0 ? `${width} / ${height}` : '1 / 1'
+}
 </script>
 
 <template>
@@ -24,7 +60,34 @@ const emit = defineEmits<{
 
   <section class="plaza-grid">
     <article v-for="item in items" :key="item.id" class="plaza-card" @click="emit('selectItem', item)">
-      <img v-if="item.result_images?.[0]?.url" :src="displayImageURL(item.result_images[0])" alt="广场作品" loading="lazy" decoding="async" />
+      <div
+        v-if="imageUrl(item)"
+        class="plaza-image-wrap"
+        :class="{ loaded: isImageLoaded(imageUrl(item)) }"
+        :style="{ aspectRatio: imageAspectRatio(item) }"
+      >
+        <div class="plaza-image-placeholder">加载中</div>
+        <picture>
+          <source media="(max-width: 640px)" :srcset="previewImageUrl(item)" />
+          <img
+            :src="imageUrl(item)"
+            alt="广场作品"
+            loading="lazy"
+            decoding="async"
+            fetchpriority="low"
+            @load="markImageLoaded(imageUrl(item))"
+          />
+        </picture>
+        <div v-if="referenceImageUrl(item)" class="plaza-reference-overlay" title="参考图">
+          <div class="plaza-reference-badge">参考图</div>
+          <img :src="referenceImageUrl(item)" alt="参考图" loading="lazy" decoding="async" />
+          <span v-if="referenceMoreCount(item)">+{{ referenceMoreCount(item) }}</span>
+        </div>
+        <div v-if="item.prompt" class="plaza-prompt-hover">
+          <span>提示词</span>
+          <p>{{ item.prompt }}</p>
+        </div>
+      </div>
       <div v-else class="plaza-card-empty">暂无图片</div>
       <div class="plaza-card-actions" @click.stop>
         <button type="button" title="复用配置" aria-label="复用配置" @click="emit('reuse', item)">
