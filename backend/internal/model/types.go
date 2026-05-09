@@ -13,6 +13,7 @@ const (
 
 type UploadedImage struct {
 	URL              string  `json:"url"`
+	ThumbnailURL     string  `json:"thumbnail_url,omitempty"`
 	Filename         string  `json:"filename,omitempty"`
 	OriginalSize     int64   `json:"original_size,omitempty"`
 	CompressedSize   int64   `json:"compressed_size,omitempty"`
@@ -35,6 +36,7 @@ type Task struct {
 	Background          string          `json:"background"`
 	Moderation          string          `json:"moderation"`
 	N                   int             `json:"n"`
+	Stream              bool            `json:"stream"`
 	Style               string          `json:"style,omitempty"`
 	ResponseFormat      string          `json:"response_format,omitempty"`
 	ReferenceImagesJSON string          `json:"-"`
@@ -81,6 +83,7 @@ type PlazaItem struct {
 	Background          string          `json:"background"`
 	Moderation          string          `json:"moderation"`
 	N                   int             `json:"n"`
+	Stream              bool            `json:"stream"`
 	Style               string          `json:"style,omitempty"`
 	ResponseFormat      string          `json:"response_format,omitempty"`
 	ReferenceImagesJSON string          `json:"-"`
@@ -104,6 +107,7 @@ type CreateTaskRequest struct {
 	Background        string          `json:"background"`
 	Moderation        string          `json:"moderation"`
 	N                 int             `json:"n"`
+	Stream            bool            `json:"stream"`
 	Style             string          `json:"style"`
 	ResponseFormat    string          `json:"response_format"`
 	ReferenceImages   []UploadedImage `json:"reference_images"`

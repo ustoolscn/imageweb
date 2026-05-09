@@ -2,6 +2,7 @@ export type TaskStatus = 'pending' | 'running' | 'succeeded' | 'failed'
 
 export interface UploadedImage {
   url: string
+  thumbnail_url?: string
   filename?: string
   original_size?: number
   compressed_size?: number
@@ -23,6 +24,7 @@ export interface Task {
   background: string
   moderation: string
   n: number
+  stream: boolean
   style?: string
   response_format?: string
   reference_images: UploadedImage[]
@@ -71,6 +73,7 @@ export interface PlazaItem {
   background: string
   moderation: string
   n: number
+  stream: boolean
   style?: string
   response_format?: string
   reference_images: UploadedImage[]

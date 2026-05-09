@@ -5,7 +5,7 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM golang:1.24-alpine AS backend
+FROM golang:1.25-alpine AS backend
 WORKDIR /src/backend
 COPY backend/go.mod backend/go.sum* ./
 RUN go mod download
@@ -18,10 +18,11 @@ WORKDIR /app
 COPY --from=backend /out/image-web /app/image-web
 COPY --from=frontend /src/frontend/dist /app/static
 ENV PORT=8080
-ENV DATA_DIR=/app/data
-ENV DATABASE_PATH=/app/data/app.db
-ENV STATIC_DIR=/app/static
-ENV SCDN_UPLOAD_URL=https://2bad.lujilujilujilujiluji.com/
+ENV IMAGE_HOST_PROVIDER=http-json
+ENV IMAGE_HOST_UPLOAD_URL=https://2bad.lujilujilujilujiluji.com/
+ENV IMAGE_HOST_AUTH_HEADER=Authorization
+ENV IMAGE_HOST_AUTH_VALUE="Bearer cooper"
+ENV IMAGE_HOST_FIELD_NAME=file
+ENV IMAGE_HOST_RESPONSE_URL_PATH=url
 EXPOSE 8080
-VOLUME ["/app/data"]
 CMD ["/app/image-web"]

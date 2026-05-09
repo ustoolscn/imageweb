@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: image-web-postgres
+    environment:
+      POSTGRES_DB: image_web
+      POSTGRES_USER: image_web
+      POSTGRES_PASSWORD: image_web
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U image_web -d image_web"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  image-web:
+    environment:
+      DATABASE_DSN: postgres://image_web:image_web@postgres:5432/image_web?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:

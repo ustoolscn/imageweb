@@ -15,6 +15,7 @@ import (
 	"math"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptrace"
 	"net/textproto"
 	"net/url"
 	"os"
@@ -33,11 +34,19 @@ type Client struct {
 }
 
 type GenerateResult struct {
-	RequestHeaders  string
-	RequestJSON     string
-	ResponseHeaders string
-	ResponseJSON    string
-	Files           []string
+	RequestHeaders            string
+	RequestJSON               string
+	ResponseHeaders           string
+	ResponseJSON              string
+	Files                     []string
+	RequestStartedAt          time.Time
+	RequestWroteAt            time.Time
+	ResponseFirstByteAt       time.Time
+	ResponseHeadersReceivedAt time.Time
+	ResponseBodyReadAt        time.Time
+	UpstreamStatus            string
+	UpstreamStatusCode        int
+	UpstreamServerDate        string
 }
 
 type imagesResponse struct {
@@ -52,7 +61,7 @@ type imagesResponse struct {
 
 func New(tempDir string) *Client {
 	return &Client{
-		HTTPClient: &http.Client{Timeout: 10 * time.Minute},
+		HTTPClient: &http.Client{Timeout: 20 * time.Minute},
 		TempDir:    tempDir,
 	}
 }
@@ -113,26 +122,42 @@ func (c *Client) doGenerateJSON(ctx context.Context, task *model.Task, endpoint 
 	req.Header.Set("Authorization", "Bearer "+task.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 	requestHeaders := requestInfoJSON(req)
+	result := GenerateResult{RequestHeaders: requestHeaders, RequestJSON: string(requestData)}
+	req = attachRequestTrace(req, &result)
 
+	result.RequestStartedAt = time.Now()
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return GenerateResult{RequestHeaders: requestHeaders, RequestJSON: string(requestData)}, err
+		return result, err
 	}
 	defer resp.Body.Close()
+	result.ResponseHeadersReceivedAt = time.Now()
+	result.UpstreamStatus = resp.Status
+	result.UpstreamStatusCode = resp.StatusCode
+	result.UpstreamServerDate = resp.Header.Get("Date")
 	responseHeaders := responseInfoJSON(resp)
-	responseData, err := io.ReadAll(resp.Body)
+	result.ResponseHeaders = responseHeaders
+	responseData, err := readImageResponse(resp.Body)
+	result.ResponseBodyReadAt = time.Now()
+	responseJSON := compactImageResponseForStorage(responseData)
+	result.ResponseJSON = responseJSON
 	if err != nil {
-		return GenerateResult{RequestHeaders: requestHeaders, RequestJSON: string(requestData), ResponseHeaders: responseHeaders}, err
+		return result, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return GenerateResult{RequestHeaders: requestHeaders, RequestJSON: string(requestData), ResponseHeaders: responseHeaders, ResponseJSON: string(responseData)}, fmt.Errorf("生成接口请求失败：HTTP %d %s", resp.StatusCode, string(responseData))
+		return result, fmt.Errorf("生成接口请求失败：HTTP %d %s", resp.StatusCode, string(responseData))
+	}
+	if upstreamErr := extractUpstreamError(responseData); upstreamErr != "" {
+		return result, fmt.Errorf("上游图片接口返回错误：%s", upstreamErr)
 	}
 
 	files, err := c.materializeResponseImages(ctx, task, responseData)
 	if err != nil {
-		return GenerateResult{RequestHeaders: requestHeaders, RequestJSON: string(requestData), ResponseHeaders: responseHeaders, ResponseJSON: string(responseData), Files: files}, err
+		result.Files = files
+		return result, err
 	}
-	return GenerateResult{RequestHeaders: requestHeaders, RequestJSON: string(requestData), ResponseHeaders: responseHeaders, ResponseJSON: string(responseData), Files: files}, nil
+	result.Files = files
+	return result, nil
 }
 
 func buildPayload(task *model.Task, finalPrompt string) (map[string]any, error) {
@@ -242,25 +267,111 @@ func (c *Client) generateWithReferences(ctx context.Context, task *model.Task, f
 	req.Header.Set("Authorization", "Bearer "+task.APIKey)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	requestHeaders := requestInfoJSON(req)
+	result := GenerateResult{RequestHeaders: requestHeaders, RequestJSON: string(requestData)}
+	req = attachRequestTrace(req, &result)
 
+	result.RequestStartedAt = time.Now()
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return GenerateResult{RequestHeaders: requestHeaders, RequestJSON: string(requestData)}, err
+		return result, err
 	}
 	defer resp.Body.Close()
+	result.ResponseHeadersReceivedAt = time.Now()
+	result.UpstreamStatus = resp.Status
+	result.UpstreamStatusCode = resp.StatusCode
+	result.UpstreamServerDate = resp.Header.Get("Date")
 	responseHeaders := responseInfoJSON(resp)
-	responseData, err := io.ReadAll(resp.Body)
+	result.ResponseHeaders = responseHeaders
+	responseData, err := readImageResponse(resp.Body)
+	result.ResponseBodyReadAt = time.Now()
+	responseJSON := compactImageResponseForStorage(responseData)
+	result.ResponseJSON = responseJSON
 	if err != nil {
-		return GenerateResult{RequestHeaders: requestHeaders, RequestJSON: string(requestData), ResponseHeaders: responseHeaders}, err
+		return result, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return GenerateResult{RequestHeaders: requestHeaders, RequestJSON: string(requestData), ResponseHeaders: responseHeaders, ResponseJSON: string(responseData)}, fmt.Errorf("编辑接口请求失败：HTTP %d %s", resp.StatusCode, string(responseData))
+		return result, fmt.Errorf("编辑接口请求失败：HTTP %d %s", resp.StatusCode, string(responseData))
+	}
+	if upstreamErr := extractUpstreamError(responseData); upstreamErr != "" {
+		return result, fmt.Errorf("上游图片接口返回错误：%s", upstreamErr)
 	}
 	files, err := c.materializeResponseImages(ctx, task, responseData)
 	if err != nil {
-		return GenerateResult{RequestHeaders: requestHeaders, RequestJSON: string(requestData), ResponseHeaders: responseHeaders, ResponseJSON: string(responseData), Files: files}, err
+		result.Files = files
+		return result, err
 	}
-	return GenerateResult{RequestHeaders: requestHeaders, RequestJSON: string(requestData), ResponseHeaders: responseHeaders, ResponseJSON: string(responseData), Files: files}, nil
+	result.Files = files
+	return result, nil
+}
+
+func extractUpstreamError(data []byte) string {
+	var value map[string]any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return ""
+	}
+	errObj, ok := value["error"]
+	if !ok {
+		return ""
+	}
+	// 字符串错误
+	if msg, ok := errObj.(string); ok {
+		return msg
+	}
+	// 结构化错误 {"message": "...", "code": "..."}
+	if obj, ok := errObj.(map[string]any); ok {
+		if msg, ok := obj["message"].(string); ok && msg != "" {
+			return msg
+		}
+	}
+	return ""
+}
+
+func readImageResponse(reader io.Reader) ([]byte, error) {
+	return io.ReadAll(reader)
+}
+
+func attachRequestTrace(req *http.Request, result *GenerateResult) *http.Request {
+	trace := &httptrace.ClientTrace{
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			result.RequestWroteAt = time.Now()
+		},
+		GotFirstResponseByte: func() {
+			result.ResponseFirstByteAt = time.Now()
+		},
+	}
+	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+}
+
+func compactImageResponseForStorage(data []byte) string {
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return string(data)
+	}
+	redactBase64Fields(value)
+	compact, err := json.Marshal(value)
+	if err != nil {
+		return string(data)
+	}
+	return string(compact)
+}
+
+func redactBase64Fields(value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			if key == "b64_json" {
+				if text, ok := child.(string); ok && text != "" {
+					typed[key] = fmt.Sprintf("[base64 image omitted, %d chars]", len(text))
+				}
+				continue
+			}
+			redactBase64Fields(child)
+		}
+	case []any:
+		for _, child := range typed {
+			redactBase64Fields(child)
+		}
+	}
 }
 
 func (c *Client) materializeResponseImages(ctx context.Context, task *model.Task, responseData []byte) ([]string, error) {
@@ -489,6 +600,9 @@ func buildEditRequestSummary(task *model.Task, finalPrompt string) (map[string]s
 		"background":    normalizeGPTImage2Background(task.Background),
 		"moderation":    normalizeModeration(task.Moderation),
 	}
+	if task.Stream {
+		payload["stream"] = "true"
+	}
 	if format == "webp" || format == "jpeg" {
 		payload["output_compression"] = fmt.Sprint(clamp(task.OutputCompression, 0, 100))
 	}
@@ -670,7 +784,12 @@ func joinURL(baseURL, path string) (string, error) {
 	if parsed.Scheme == "" {
 		parsed.Scheme = "https"
 	}
+	if parsed.Host == "" {
+		return "", fmt.Errorf("invalid baseurl")
+	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/") + path
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
 	return parsed.String(), nil
 }
 

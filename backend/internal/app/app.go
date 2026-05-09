@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"image-web/backend/internal/config"
 	"image-web/backend/internal/db"
@@ -22,16 +23,17 @@ type App struct {
 }
 
 func New(ctx context.Context, cfg config.Config) (*App, error) {
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
-		return nil, err
-	}
-	store, err := db.Open(cfg.DatabasePath)
+	store, err := db.Open(cfg.DatabaseDSN)
 	if err != nil {
 		return nil, err
 	}
+	if err := store.ResetStaleRunningTasks(ctx, 30*time.Minute); err != nil {
+		store.Close()
+		return nil, err
+	}
 	gen := generator.New(filepath.Join(cfg.DataDir, "tmp"))
-	host := imagehost.New(cfg.ScdnUploadURL)
-	h := &handler.Handler{Store: store, Generator: gen}
+	host := imagehost.New(cfg)
+	h := &handler.Handler{Store: store, Generator: gen, ImageHost: host}
 	mux := http.NewServeMux()
 	h.Register(mux)
 	mux.HandleFunc("/", staticHandler(cfg.StaticDir))

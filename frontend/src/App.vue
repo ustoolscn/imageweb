@@ -1,16 +1,32 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { APIError, createTask, deleteTask, fetchModels, fetchSiteBrand, fetchTaskUpdates, getTask, listPlazaItems, listTasks, retryTask, setPlazaLike, setTaskFavorite, shareTask, unshareTask, uploadImage } from './api'
+import AdminContactModal from './components/AdminContactModal.vue'
+import AppToolbar from './components/AppToolbar.vue'
+import Composer from './components/Composer.vue'
+import ImageViewer from './components/ImageViewer.vue'
+import PlazaDetailModal from './components/PlazaDetailModal.vue'
+import PlazaGrid from './components/PlazaGrid.vue'
+import SettingsModal from './components/SettingsModal.vue'
+import SizeModal from './components/SizeModal.vue'
+import SourceModal from './components/SourceModal.vue'
+import TaskDetailModal from './components/TaskDetailModal.vue'
+import TaskGrid from './components/TaskGrid.vue'
+import { ratioOptions, sizeFromRatio } from './lib/sizes'
+import { canOpenSource, canShareTask, maskBaseURL } from './lib/view'
 import type { PlazaItem, Task, UploadedImage } from './types'
+import type { ImageForm, PendingReferenceImage, PreviewImage, SettingsPayload, ThemeMode, ViewMode } from './uiTypes'
 
 const savedModel = localStorage.getItem('image_web_model') || 'gpt-image-2'
+const savedTheme = localStorage.getItem('image_web_theme') === 'light' ? 'light' : 'dark'
 const baseurl = ref(localStorage.getItem('image_web_baseurl') || '')
 const apikey = ref(localStorage.getItem('image_web_apikey') || '')
 const tasks = ref<Task[]>([])
 const totalTasks = ref(0)
 const plazaItems = ref<PlazaItem[]>([])
 const totalPlazaItems = ref(0)
-const viewMode = ref<'tasks' | 'plaza'>('tasks')
+const viewMode = ref<ViewMode>('tasks')
+const themeMode = ref<ThemeMode>(savedTheme)
 const plazaSort = ref<'time' | 'likes'>('time')
 const plazaClientID = ref(localStorage.getItem('image_web_plaza_client_id') || '')
 const models = ref<string[]>(['gpt-image-2'])
@@ -34,12 +50,12 @@ const adminContactImage = ref('')
 const showAdminContact = ref(false)
 const message = ref('')
 const clock = ref(Date.now())
+const showSettingsModal = ref(false)
+const settingsDraft = reactive({ baseurl: baseurl.value, apikey: apikey.value })
 const showSizeModal = ref(false)
 const selectedTask = ref<Task | null>(null)
 const selectedPlazaItem = ref<PlazaItem | null>(null)
 const sourceTask = ref<Task | null>(null)
-type PreviewImage = { url: string; label: string; maskUrl?: string; editable?: boolean; source?: 'reused' | 'new'; index?: number }
-type PendingReferenceImage = UploadedImage & { preview_url: string; uploading?: boolean; upload_error?: string }
 const previewImage = ref<PreviewImage | null>(null)
 const maskCanvas = ref<HTMLCanvasElement | null>(null)
 const maskBaseImage = ref<HTMLImageElement | null>(null)
@@ -51,10 +67,10 @@ const referenceMaskPreviews = ref<Array<string | null>>([])
 let pollTimer: number | undefined
 let clockTimer: number | undefined
 
-const form = reactive({
+const form = reactive<ImageForm>({
   prompt: '',
   model: savedModel === 'gpt-image-2' ? savedModel : 'gpt-image-2',
-  size: 'auto',
+  size: '1024x1024',
   quality: 'auto',
   output_format: 'png',
   output_compression: 100,
@@ -64,11 +80,8 @@ const form = reactive({
 })
 
 const sizeDraft = reactive({
-  mode: 'ratio',
   base: '1K',
   ratio: '1:1',
-  width: 1024,
-  height: 1024,
 })
 
 const referenceImages = ref<PendingReferenceImage[]>([])
@@ -77,33 +90,61 @@ const reusedReferenceImages = ref<UploadedImage[]>([])
 const hasConfig = computed(() => Boolean(baseurl.value && apikey.value))
 const runningCount = computed(() => tasks.value.filter((task) => task.status === 'pending' || task.status === 'running').length)
 const visibleSubtitle = computed(() => viewMode.value === 'plaza' ? `公开广场 · 已加载 ${plazaItems.value.length} 条 · 总计 ${totalPlazaItems.value} 条` : (hasConfig.value ? `${maskBaseURL(baseurl.value)} · 已加载 ${tasks.value.length} 条 · 总计 ${totalTasks.value} 条` : '通过 URL 传入 baseurl 和 apikey 后开始使用'))
-const ratioSizePresets = {
-  '1:1': { '1K': '1024x1024', '2K': '2024x2048', '4K': '2880x2880' },
-  '3:2': { '1K': '1536x1024', '2K': '2048x1360', '4K': '3520x2336' },
-  '2:3': { '1K': '1024x1536', '2K': '1360x2048', '4K': '2336x3520' },
-  '16:9': { '1K': '1824x1024', '2K': '2048x1152', '4K': '3840x2160' },
-  '9:16': { '1K': '1024x1824', '2K': '1152x2048', '4K': '2160x3840' },
-  '4:3': { '1K': '1360x1024', '2K': '2048x1536', '4K': '3328x2496' },
-  '3:4': { '1K': '1024x1360', '2K': '1536x2048', '4K': '2496x3328' },
-  '21:9': { '1K': '2384x1024', '2K': '2048x880', '4K': '3840x1648' },
-} as const
-const ratioOptions = Object.keys(ratioSizePresets)
-const baseSizeOptions = ['1K', '2K', '4K']
-const gptImage2SizeRules = {
-  maxEdge: 3840,
-  maxRatio: 3,
-  minPixels: 655360,
-  maxPixels: 8294400,
-}
-const draftSize = computed(() => {
-  if (sizeDraft.mode === 'auto') return 'auto'
-  if (sizeDraft.mode === 'custom') return `${toMultipleOf16(sizeDraft.width)}x${toMultipleOf16(sizeDraft.height)}`
-  return sizeFromRatio(sizeDraft.base, sizeDraft.ratio)
-})
+const draftSize = computed(() => sizeFromRatio(sizeDraft.base, sizeDraft.ratio))
 
 watch(() => form.model, (model) => {
   localStorage.setItem('image_web_model', model)
 })
+
+watch(themeMode, (theme) => {
+  localStorage.setItem('image_web_theme', theme)
+}, { immediate: true })
+
+function openSettings() {
+  settingsDraft.baseurl = baseurl.value
+  settingsDraft.apikey = apikey.value
+  showSettingsModal.value = true
+}
+
+async function saveSettings(settings?: SettingsPayload) {
+  if (settings) {
+    settingsDraft.baseurl = settings.baseurl
+    settingsDraft.apikey = settings.apikey
+  }
+  baseurl.value = settingsDraft.baseurl.trim()
+  apikey.value = settingsDraft.apikey.trim()
+  localStorage.setItem('image_web_baseurl', baseurl.value)
+  localStorage.setItem('image_web_apikey', apikey.value)
+  baseURLBlocked.value = false
+  adminContactImage.value = ''
+  showAdminContact.value = false
+  showSettingsModal.value = false
+  await refreshSiteBrand()
+  if (hasConfig.value) {
+    await loadModels()
+    await resetTasks()
+    startPolling()
+    startClock()
+  }
+  showMessage('配置已保存')
+}
+
+function toggleTheme() {
+  themeMode.value = themeMode.value === 'dark' ? 'light' : 'dark'
+}
+
+function toggleFavoriteOnly() {
+  favoriteOnly.value = !favoriteOnly.value
+  resetTasks()
+}
+
+function updateFormField(field: keyof ImageForm, value: string | number) {
+  if (field === 'output_compression' || field === 'n') {
+    form[field] = Number(value)
+    return
+  }
+  form[field] = String(value)
+}
 
 function ensurePlazaClientID() {
   if (!plazaClientID.value) {
@@ -124,14 +165,6 @@ function createClientID() {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
-function isFavorite(task: Task) {
-  return Boolean(task.favorite)
-}
-
-function canShareTask(task: Task) {
-  return task.status === 'succeeded' && Boolean(task.result_images?.[0]?.url)
-}
-
 async function toggleFavorite(task: Task, event?: Event) {
   event?.stopPropagation()
   try {
@@ -147,18 +180,9 @@ async function toggleFavorite(task: Task, event?: Event) {
 
 function patchTask(updated: Partial<Task> & { id: string }) {
   const index = tasks.value.findIndex((task) => task.id === updated.id)
-  if (index >= 0) tasks.value[index] = { ...tasks.value[index], ...updated }
-}
-
-function taskReferenceImages(task: Task | PlazaItem) {
-  return [...(task.reference_images || [])]
-}
-
-function inputReferenceItems() {
-  return [
-    ...reusedReferenceImages.value.map((image, index) => ({ url: image.url, label: image.filename || `参考 ${index + 1}`, reused: true })),
-    ...referenceImages.value.map((image, index) => ({ url: image.preview_url, label: image.filename || `参考 ${reusedReferenceImages.value.length + index + 1}`, reused: false, index })),
-  ]
+  const patched = index >= 0 ? { ...tasks.value[index], ...updated } : selectedTask.value?.id === updated.id ? { ...selectedTask.value, ...updated } : null
+  if (index >= 0 && patched) tasks.value[index] = patched
+  if (selectedTask.value?.id === updated.id && patched) selectedTask.value = patched
 }
 
 function openPreviewImage(url: string, label: string, event?: Event, maskUrl = '') {
@@ -178,26 +202,16 @@ function closePreviewImage() {
   previewImage.value = null
 }
 
-function hasMask(source: 'reused' | 'new', index: number) {
-  if (source === 'reused') return Boolean(reusedReferenceImages.value[index]?.mask_url)
-  return Boolean(referenceMaskFiles.value[index])
+function setMaskBaseImage(element: HTMLImageElement | null) {
+  maskBaseImage.value = element
+}
+
+function setMaskCanvas(element: HTMLCanvasElement | null) {
+  maskCanvas.value = element
 }
 
 function maskPreviewURL(maskUrl: string) {
   return `/api/mask-preview?${new URLSearchParams({ url: maskUrl })}`
-}
-
-function prettySource(value: string) {
-  if (!value) return '暂无数据'
-  try {
-    return JSON.stringify(JSON.parse(value), null, 2)
-  } catch {
-    return value
-  }
-}
-
-function canOpenSource(task: Task) {
-  return task.status === 'succeeded' || task.status === 'failed'
 }
 
 async function openSourceTask(task: Task, event?: Event) {
@@ -819,106 +833,18 @@ function openSizeModal() {
 }
 
 function applySize() {
-  if (sizeDraft.mode === 'custom') {
-    const normalized = normalizeGPTImage2Size(sizeDraft.width, sizeDraft.height)
-    sizeDraft.width = normalized.width
-    sizeDraft.height = normalized.height
-  }
   form.size = draftSize.value
   showSizeModal.value = false
 }
 
 function syncSizeDraft(size: string) {
-  if (size === 'auto') {
-    sizeDraft.mode = 'auto'
-    return
-  }
-  const match = size.match(/^(\d+)x(\d+)$/)
-  if (match) {
-    sizeDraft.width = Number(match[1])
-    sizeDraft.height = Number(match[2])
-    sizeDraft.mode = 'custom'
-    const ratio = closestRatio(sizeDraft.width, sizeDraft.height)
-    if (ratio) {
-      sizeDraft.mode = 'ratio'
-      sizeDraft.ratio = ratio
-      sizeDraft.base = closestBase(sizeDraft.width, sizeDraft.height)
-    }
-  }
-}
-
-function toMultipleOf16(value: number) {
-  return Math.max(16, Math.round(Number(value || 16) / 16) * 16)
-}
-
-function sizeFromRatio(base: string, ratio: string) {
-  return ratioSizePresets[ratio as keyof typeof ratioSizePresets]?.[base as keyof typeof ratioSizePresets[keyof typeof ratioSizePresets]] || '1024x1024'
-}
-
-function normalizeGPTImage2Size(widthValue: number, heightValue: number) {
-  let width = toMultipleOf16(widthValue)
-  let height = toMultipleOf16(heightValue)
-  ;({ width, height } = fitMaxEdge(width, height, gptImage2SizeRules.maxEdge))
-  ;({ width, height } = fitAspectRatio(width, height, gptImage2SizeRules.maxRatio))
-  ;({ width, height } = fitPixelRange(width, height, gptImage2SizeRules.minPixels, gptImage2SizeRules.maxPixels))
-  return { width: toMultipleOf16(width), height: toMultipleOf16(height) }
-}
-
-function fitMaxEdge(width: number, height: number, maxEdge: number) {
-  const longSide = Math.max(width, height)
-  if (longSide <= maxEdge) return { width, height }
-  const scale = maxEdge / longSide
-  return { width: toMultipleOf16(Math.floor(width * scale)), height: toMultipleOf16(Math.floor(height * scale)) }
-}
-
-function fitAspectRatio(width: number, height: number, maxRatio: number) {
-  if (width >= height && width / height > maxRatio) return { width: toMultipleOf16(height * maxRatio), height }
-  if (height > width && height / width > maxRatio) return { width, height: toMultipleOf16(width * maxRatio) }
-  return { width, height }
-}
-
-function fitPixelRange(width: number, height: number, minPixels: number, maxPixels: number) {
-  const pixels = width * height
-  if (pixels > maxPixels) {
-    const scale = Math.sqrt(maxPixels / pixels)
-    return { width: toMultipleOf16(Math.floor(width * scale)), height: toMultipleOf16(Math.floor(height * scale)) }
-  }
-  if (pixels < minPixels) {
-    const scale = Math.sqrt(minPixels / pixels)
-    return { width: toMultipleOf16(Math.ceil(width * scale)), height: toMultipleOf16(Math.ceil(height * scale)) }
-  }
-  return { width, height }
-}
-
-function ratioPreviewStyle(ratio: string) {
-  const [a, b] = ratio.split(':').map(Number)
-  const scale = 24 / Math.max(a, b)
-  return {
-    width: `${Math.max(6, Math.round(a * scale))}px`,
-    height: `${Math.max(6, Math.round(b * scale))}px`,
-  }
-}
-
-function closestRatio(width: number, height: number) {
-  const value = width / height
-  let best = ratioOptions[0]
-  let diff = Infinity
   for (const ratio of ratioOptions) {
-    const [a, b] = ratio.split(':').map(Number)
-    const nextDiff = Math.abs(value - a / b)
-    if (nextDiff < diff) {
-      diff = nextDiff
-      best = ratio
+    if (sizeFromRatio('1K', ratio) === size) {
+      sizeDraft.base = '1K'
+      sizeDraft.ratio = ratio
+      return
     }
   }
-  return diff < 0.02 ? best : ''
-}
-
-function closestBase(width: number, height: number) {
-  const side = Math.min(width, height)
-  if (side > 3000) return '4K'
-  if (side > 1400) return '2K'
-  return '1K'
 }
 
 function showMessage(text: string) {
@@ -928,468 +854,144 @@ function showMessage(text: string) {
   }, 3600)
 }
 
-function statusText(value: string) {
-  return ({ pending: '排队中', running: '生成中', succeeded: '成功', failed: '失败' } as Record<string, string>)[value] || value
-}
-
-function queueText(task: Task) {
-  if (task.status !== 'pending') return ''
-  return task.queue_position > 0 ? `前面还有 ${task.queue_position} 个` : '即将开始'
-}
-
-function statusClass(value: string) {
-  return `status-${value}`
-}
-
-function elapsed(task: Task) {
-  if (task.elapsed_ms) return formatMs(task.elapsed_ms)
-  const start = new Date(task.started_at || task.created_at).getTime()
-  return formatMs(clock.value - start)
-}
-
-function timeText(task: Task) {
-  if (task.status === 'pending') return `等待 ${formatMs(clock.value - new Date(task.created_at).getTime())}`
-  if (task.status === 'running') return `生成 ${elapsed(task)}`
-  return `耗时 ${elapsed(task)}`
-}
-
-function formatMs(ms: number) {
-  const total = Math.max(0, Math.round(ms / 1000))
-  const minutes = Math.floor(total / 60)
-  const seconds = total % 60
-  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
-}
-
-function formatTime(value: string) {
-  return new Date(value).toLocaleString('zh-CN', { hour12: false })
-}
-
-function maskBaseURL(value: string) {
-  try {
-    return new URL(value).host || value
-  } catch {
-    return value
-  }
-}
 </script>
 
 <template>
-  <main class="page">
-    <header class="toolbar glass-panel">
-      <div class="brand">
-        <div class="brand-logo">
-          <img v-if="siteIcon.startsWith('http://') || siteIcon.startsWith('https://')" :src="siteIcon" alt="站点图标" />
-          <span v-else>{{ siteIcon }}</span>
-        </div>
-        <div>
-          <h1>{{ siteTitle }}</h1>
-          <p>{{ visibleSubtitle }}</p>
-        </div>
-      </div>
-      <div class="toolbar-controls" :class="{ plaza: viewMode === 'plaza' }">
-        <div class="view-tabs">
-          <button :class="{ active: viewMode === 'tasks' }" @click="switchView('tasks')">我的任务</button>
-          <button :class="{ active: viewMode === 'plaza' }" @click="switchView('plaza')">广场</button>
-        </div>
-        <template v-if="viewMode === 'tasks'">
-          <select v-model="status" @change="resetTasks">
-            <option value="all">全部状态</option>
-            <option value="pending">排队中</option>
-            <option value="running">生成中</option>
-            <option value="succeeded">成功</option>
-            <option value="failed">失败</option>
-          </select>
-          <div class="search-wrap">
-            <span>⌕</span>
-            <input v-model="keyword" class="search" placeholder="搜索提示词、参数..." @keyup.enter="resetTasks" />
-          </div>
-          <button class="ghost" :class="{ active: favoriteOnly }" @click="favoriteOnly = !favoriteOnly; resetTasks()">{{ favoriteOnly ? '看全部' : '只看收藏' }}</button>
-          <button class="ghost" @click="() => refreshTasks()">刷新</button>
-        </template>
-        <template v-else>
-          <div class="plaza-sort">
-            <button :class="{ active: plazaSort === 'time' }" @click="switchPlazaSort('time')">最新发布</button>
-            <button :class="{ active: plazaSort === 'likes' }" @click="switchPlazaSort('likes')">点赞最多</button>
-          </div>
-          <button class="ghost" @click="() => refreshPlazaItems()">刷新</button>
-        </template>
-      </div>
-    </header>
+  <main class="page" :class="`theme-${themeMode}`">
+    <AppToolbar
+      v-model:status="status"
+      v-model:keyword="keyword"
+      :site-title="siteTitle"
+      :site-icon="siteIcon"
+      :visible-subtitle="visibleSubtitle"
+      :view-mode="viewMode"
+      :favorite-only="favoriteOnly"
+      :plaza-sort="plazaSort"
+      :theme-mode="themeMode"
+      @open-settings="openSettings"
+      @switch-view="switchView"
+      @refresh-tasks="refreshTasks"
+      @reset-tasks="resetTasks"
+      @refresh-plaza-items="refreshPlazaItems"
+      @switch-plaza-sort="switchPlazaSort"
+      @toggle-theme="toggleTheme"
+      @toggle-favorite-only="toggleFavoriteOnly"
+    />
 
-    <template v-if="viewMode === 'tasks'">
-      <section v-if="!hasConfig" class="empty-state glass-panel">
-        <h2>缺少连接配置</h2>
-        <p>请使用 URL 传入 baseurl 和 apikey，例如：?baseurl=https://api.example.com&apikey=sk-xxx。页面会保存到本地并自动清理地址栏。</p>
-      </section>
+    <TaskGrid
+      v-if="viewMode === 'tasks'"
+      :tasks="tasks"
+      :has-config="hasConfig"
+      :base-url-blocked="baseURLBlocked"
+      :admin-contact-image="adminContactImage"
+      :loading-more="loadingMore"
+      :has-more-tasks="hasMoreTasks"
+      :clock="clock"
+      @show-admin-contact="showAdminContact = true"
+      @select-task="selectedTask = $event"
+      @open-preview="openPreviewImage"
+      @open-source="openSourceTask"
+      @rerun="rerunTask"
+      @toggle-favorite="toggleFavorite"
+      @reuse="reuseTask"
+      @toggle-share="toggleTaskShare"
+      @load-more="loadMoreTasks"
+    />
 
-      <section v-else-if="baseURLBlocked" class="empty-state glass-panel blocked-state">
-        <h2>该 BASEURL 未授权</h2>
-        <p>当前 BASEURL 未在网站白名单内，请联系管理员授权后再使用。</p>
-        <button type="button" :disabled="!adminContactImage" @click="showAdminContact = true">联系管理员</button>
-      </section>
+    <PlazaGrid
+      v-else
+      :items="plazaItems"
+      :loading-more="loadingMore"
+      :has-more-plaza-items="hasMorePlazaItems"
+      @select-item="selectedPlazaItem = $event"
+      @open-preview="openPreviewImage"
+      @reuse="reuseTask"
+      @toggle-like="togglePlazaLike"
+      @load-more="loadMorePlazaItems"
+    />
 
-      <section v-else-if="tasks.length === 0" class="empty-state glass-panel soft">
-        <h2>还没有生成记录</h2>
-        <p>在底部输入提示词并提交，任务会在后端异步执行。关闭页面后再次打开，也可以继续查看历史。</p>
-      </section>
+    <Composer
+      v-if="viewMode === 'tasks'"
+      :form="form"
+      :models="models"
+      :submitting="submitting"
+      :has-config="hasConfig"
+      :reused-reference-images="reusedReferenceImages"
+      :reference-images="referenceImages"
+      @submit="submitTask"
+      @update-field="updateFormField"
+      @prompt-paste="onPromptPaste"
+      @open-editable-preview="openEditablePreview"
+      @remove-reused-reference="removeReusedReference"
+      @remove-reference="removeReference"
+      @open-size-modal="openSizeModal"
+      @reference-change="onReferenceChange"
+    />
 
-      <section class="grid">
-        <article v-for="task in tasks" :key="task.id" class="task-card" :class="statusClass(task.status)" @click="selectedTask = task">
-        <div class="preview" :class="task.status">
-          <img v-if="task.result_images?.[0]?.url" :src="task.result_images[0].url" alt="生成结果" />
-          <div v-else class="state-mark">
-            <span v-if="task.status === 'running'" class="spinner"></span>
-            <span v-else class="state-icon">{{ task.status === 'failed' ? '!' : '…' }}</span>
-            <strong>{{ statusText(task.status) }}</strong>
-            <small v-if="queueText(task)">{{ queueText(task) }}</small>
-          </div>
-          <span class="time">◷ {{ timeText(task) }}</span>
-        </div>
-        <div class="card-body">
-          <div class="card-head">
-            <span class="status-pill">{{ queueText(task) || statusText(task.status) }}</span>
-            <span class="model-pill">{{ task.model }}</span>
-          </div>
-          <p class="prompt">{{ task.prompt }}</p>
-          <div v-if="taskReferenceImages(task).length" class="card-references">
-            <span class="ref-label">参考图</span>
-            <button v-for="(image, index) in taskReferenceImages(task).slice(0, 2)" :key="`${image.url}-${index}`" type="button" class="ref-thumb" @click="openPreviewImage(image.url, image.filename || `参考图 ${index + 1}`, $event, image.mask_url)">
-              <img :src="image.url" :alt="image.filename || '参考图'" />
-            </button>
-            <span v-if="taskReferenceImages(task).length > 2" class="ref-more">+{{ taskReferenceImages(task).length - 2 }}</span>
-          </div>
-          <div class="chips">
-            <span>{{ task.quality }}</span>
-            <span>{{ task.size }}</span>
-            <span>{{ task.output_format }}</span>
-          </div>
-          <div class="actions" @click.stop>
-            <button title="查看源数据" aria-label="查看源数据" :disabled="!canOpenSource(task)" @click="openSourceTask(task, $event)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7h8M8 12h8M8 17h5"/><rect x="5" y="3" width="14" height="18" rx="2"/></svg>
-            </button>
-            <button title="重新生成" aria-label="重新生成" @click="rerunTask(task)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v6h-6"/></svg>
-            </button>
-            <button :title="isFavorite(task) ? '取消收藏' : '收藏'" :aria-label="isFavorite(task) ? '取消收藏' : '收藏'" :class="{ favorite: isFavorite(task) }" @click="toggleFavorite(task, $event)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.8 5.67 6.26.91-4.53 4.42 1.07 6.23L12 17.28l-5.6 2.95 1.07-6.23-4.53-4.42 6.26-.91L12 3Z"/></svg>
-            </button>
-            <button title="复用配置" aria-label="复用配置" @click="reuseTask(task)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M5 16V7a2 2 0 0 1 2-2h9"/></svg>
-            </button>
-            <button :title="task.shared_to_plaza ? '取消广场分享' : '分享到广场'" :aria-label="task.shared_to_plaza ? '取消广场分享' : '分享到广场'" :class="{ favorite: task.shared_to_plaza }" :disabled="!canShareTask(task)" @click="toggleTaskShare(task, $event)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12v7a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-7"/><path d="M16 6l-4-4-4 4"/><path d="M12 2v13"/></svg>
-            </button>
-          </div>
-        </div>
-      </article>
-      </section>
+    <SettingsModal
+      v-if="showSettingsModal"
+      :baseurl="settingsDraft.baseurl"
+      :apikey="settingsDraft.apikey"
+      @close="showSettingsModal = false"
+      @save="saveSettings"
+    />
 
-      <div v-if="hasConfig && !baseURLBlocked && tasks.length" class="load-more-state">
-        <span v-if="loadingMore">正在加载更多...</span>
-        <button v-else-if="hasMoreTasks" type="button" @click="loadMoreTasks">加载更多</button>
-        <span v-else>没有更多任务了</span>
-      </div>
-    </template>
+    <SizeModal
+      v-if="showSizeModal"
+      :current-size="form.size"
+      :draft-size="draftSize"
+      :selected-ratio="sizeDraft.ratio"
+      :ratio-options="ratioOptions"
+      @close="showSizeModal = false"
+      @select-ratio="sizeDraft.ratio = $event"
+      @apply="applySize"
+    />
 
-    <template v-else>
-      <section v-if="plazaItems.length === 0" class="empty-state glass-panel soft">
-        <h2>广场还没有作品</h2>
-        <p>成功任务可以点击分享发布到广场，所有访问者都可以看到、复用配置和点赞。</p>
-      </section>
-      <section class="grid">
-        <article v-for="item in plazaItems" :key="item.id" class="task-card status-succeeded plaza-card" @click="selectedPlazaItem = item">
-          <div class="preview succeeded">
-            <img v-if="item.result_images?.[0]?.url" :src="item.result_images[0].url" alt="广场作品" />
-            <span class="time">{{ formatTime(item.created_at) }}</span>
-          </div>
-          <div class="card-body">
-            <div class="card-head">
-              <span class="status-pill">广场</span>
-              <span class="model-pill">{{ item.model }}</span>
-              <span class="like-count">♥ {{ item.like_count }}</span>
-            </div>
-            <p class="prompt">{{ item.prompt }}</p>
-            <div v-if="taskReferenceImages(item).length" class="card-references">
-              <span class="ref-label">参考图</span>
-              <button v-for="(image, index) in taskReferenceImages(item).slice(0, 2)" :key="`${image.url}-${index}`" type="button" class="ref-thumb" @click="openPreviewImage(image.url, image.filename || `参考图 ${index + 1}`, $event, image.mask_url)">
-                <img :src="image.url" :alt="image.filename || '参考图'" />
-              </button>
-              <span v-if="taskReferenceImages(item).length > 2" class="ref-more">+{{ taskReferenceImages(item).length - 2 }}</span>
-            </div>
-            <div class="chips">
-              <span>{{ item.quality }}</span>
-              <span>{{ item.size }}</span>
-              <span>{{ item.output_format }}</span>
-            </div>
-            <div class="actions" @click.stop>
-              <button title="复用配置" aria-label="复用配置" @click="reuseTask(item)">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M5 16V7a2 2 0 0 1 2-2h9"/></svg>
-              </button>
-              <button :title="item.liked ? '取消点赞' : '点赞'" :aria-label="item.liked ? '取消点赞' : '点赞'" :class="{ favorite: item.liked }" @click="togglePlazaLike(item, $event)">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7-4.35-9.33-8.77C.87 8.82 2.8 5 6.55 5c2.06 0 3.3 1.1 4.05 2.1C11.35 6.1 12.59 5 14.65 5c3.75 0 5.68 3.82 3.88 7.23C16.2 16.65 12 21 12 21Z"/></svg>
-              </button>
-            </div>
-          </div>
-        </article>
-      </section>
-      <div v-if="plazaItems.length" class="load-more-state">
-        <span v-if="loadingMore">正在加载更多...</span>
-        <button v-else-if="hasMorePlazaItems" type="button" @click="loadMorePlazaItems">加载更多</button>
-        <span v-else>没有更多作品了</span>
-      </div>
-    </template>
+    <TaskDetailModal
+      v-if="selectedTask"
+      :task="selectedTask"
+      :clock="clock"
+      @close="selectedTask = null"
+      @open-preview="openPreviewImage"
+      @reuse="reuseTask"
+      @rerun="rerunTask"
+      @open-result="openResultImage"
+      @add-result-to-references="addResultToReferences"
+      @toggle-share="toggleTaskShare"
+      @remove="removeTask"
+      @toggle-favorite="toggleFavorite"
+    />
 
-    <form v-if="viewMode === 'tasks'" class="composer glass-panel" @submit.prevent="submitTask">
-      <div class="prompt-row">
-        <textarea v-model="form.prompt" placeholder="描述你想生成的图片..." rows="2" @paste="onPromptPaste" />
-        <button class="submit" :disabled="submitting || !hasConfig">{{ submitting ? '提交中' : '生成' }}</button>
-      </div>
+    <PlazaDetailModal
+      v-if="selectedPlazaItem"
+      :item="selectedPlazaItem"
+      @close="selectedPlazaItem = null"
+      @open-preview="openPreviewImage"
+      @reuse="reuseTask"
+      @open-result="openResultImage"
+      @toggle-like="togglePlazaLike"
+    />
 
-      <div v-if="reusedReferenceImages.length || referenceImages.length" class="preview-strip">
-        <div v-for="(image, index) in reusedReferenceImages" :key="image.url" class="input-thumb reused">
-          <img :src="image.url" alt="参考图" @click="openEditablePreview('reused', index, image.url, `参考 ${index + 1}`)" />
-          <span>参考 {{ index + 1 }}{{ hasMask('reused', index) ? ' · 蒙板' : '' }}</span>
-          <button type="button" @click="removeReusedReference(index)">×</button>
-        </div>
-        <div v-for="(image, index) in referenceImages" :key="image.preview_url" class="input-thumb" :class="{ uploading: image.uploading, failed: image.upload_error }">
-          <img :src="image.preview_url" alt="参考图" @click="openEditablePreview('new', index, image.preview_url, image.filename || `参考 ${reusedReferenceImages.length + index + 1}`)" />
-          <span>{{ image.filename || `参考 ${reusedReferenceImages.length + index + 1}` }}{{ hasMask('new', index) ? ' · 蒙板' : '' }}{{ image.uploading ? ' · 上传中' : '' }}{{ image.upload_error ? ' · 上传失败' : '' }}</span>
-          <button type="button" @click="removeReference(index)">×</button>
-        </div>
-      </div>
+    <SourceModal v-if="sourceTask" :task="sourceTask" @close="sourceTask = null" />
 
-      <div class="form-row">
-        <label>模型<select v-model="form.model"><option v-for="item in models" :key="item" :value="item">{{ item }}</option></select></label>
-        <div class="field"><span>尺寸</span><button type="button" class="size-trigger" @click.stop.prevent="openSizeModal">{{ form.size }}</button></div>
-        <label>质量<select v-model="form.quality"><option>auto</option><option>low</option><option>medium</option><option>high</option></select></label>
-        <label>格式<select v-model="form.output_format"><option>png</option><option>jpeg</option><option>webp</option></select></label>
-        <label>压缩<input v-model.number="form.output_compression" type="number" min="0" max="100" /></label>
-        <label>背景<select v-model="form.background"><option>auto</option><option>opaque</option></select></label>
-        <label>审核<select v-model="form.moderation"><option>low</option><option>auto</option></select></label>
-        <label>数量<input v-model.number="form.n" type="number" min="1" max="10" /></label>
-      </div>
-      <div class="upload-row single-upload">
-        <label class="upload">＋ 参考图<input type="file" multiple accept="image/*" @change="onReferenceChange" /></label>
-        <span class="hint">所有上传图和生成结果都会转存到图床后保存。</span>
-      </div>
-    </form>
+    <AdminContactModal v-if="showAdminContact" :image="adminContactImage" @close="showAdminContact = false" />
 
-    <div v-if="showSizeModal" class="modal-backdrop" @click.self="showSizeModal = false">
-      <section class="size-modal light-modal">
-        <button class="modal-close" @click="showSizeModal = false">×</button>
-        <h2>设置图像尺寸</h2>
-        <p class="current-size">当前：{{ form.size }}</p>
-        <div class="segmented">
-          <button :class="{ active: sizeDraft.mode === 'auto' }" @click="sizeDraft.mode = 'auto'">自动</button>
-          <button :class="{ active: sizeDraft.mode === 'ratio' }" @click="sizeDraft.mode = 'ratio'">按比例</button>
-          <button :class="{ active: sizeDraft.mode === 'custom' }" @click="sizeDraft.mode = 'custom'">自定义宽高</button>
-        </div>
-        <template v-if="sizeDraft.mode === 'ratio'">
-          <h3>基准分辨率</h3>
-          <div class="option-grid three">
-            <button v-for="item in baseSizeOptions" :key="item" :class="{ active: sizeDraft.base === item }" @click="sizeDraft.base = item">{{ item }}</button>
-          </div>
-          <h3>图像比例</h3>
-          <div class="option-grid four ratios">
-            <button v-for="item in ratioOptions" :key="item" :class="{ active: sizeDraft.ratio === item }" @click="sizeDraft.ratio = item">
-              <span class="ratio-preview"><i :style="ratioPreviewStyle(item)"></i></span>
-              <span>{{ item }}</span>
-            </button>
-          </div>
-        </template>
-        <div v-if="sizeDraft.mode === 'custom'" class="custom-size">
-          <label>宽度<input v-model.number="sizeDraft.width" type="number" min="16" max="3840" step="16" @change="sizeDraft.width = normalizeGPTImage2Size(sizeDraft.width, sizeDraft.height).width" /></label>
-          <label>高度<input v-model.number="sizeDraft.height" type="number" min="16" max="3840" step="16" @change="sizeDraft.height = normalizeGPTImage2Size(sizeDraft.width, sizeDraft.height).height" /></label>
-        </div>
-        <div class="will-use">
-          <span>将使用</span>
-          <strong>{{ draftSize }}</strong>
-          <em>GPT Image 2：最大边 3840，宽高为 16 倍数，比例不超过 3:1，总像素 65.5 万到 829.4 万。</em>
-        </div>
-        <div class="modal-actions-row">
-          <button class="cancel" @click="showSizeModal = false">取消</button>
-          <button class="confirm" @click="applySize">确定</button>
-        </div>
-      </section>
-    </div>
-
-    <div v-if="selectedTask" class="modal-backdrop" @click.self="selectedTask = null">
-      <section class="detail-modal light-modal">
-        <button class="modal-close" @click="selectedTask = null">×</button>
-        <div class="detail-preview">
-          <img v-if="selectedTask.result_images?.[0]?.url" :src="selectedTask.result_images[0].url" alt="生成结果" title="点击查看大图" @click="openPreviewImage(selectedTask.result_images[0].url, '生成结果', $event)" />
-          <div v-else class="detail-state">
-            <span>{{ selectedTask.status === 'failed' ? '!' : '…' }}</span>
-            <p>{{ selectedTask.error_message || statusText(selectedTask.status) }}</p>
-          </div>
-        </div>
-        <div class="detail-info">
-          <div class="detail-section detail-input-section">
-            <div class="section-title">输入内容</div>
-            <p class="detail-prompt">{{ selectedTask.prompt }}</p>
-          </div>
-          <div v-if="taskReferenceImages(selectedTask).length" class="detail-section">
-            <div class="section-title">参考图片</div>
-            <div class="detail-references">
-              <button v-for="(image, index) in taskReferenceImages(selectedTask)" :key="`${image.url}-${index}`" type="button" @click="openPreviewImage(image.url, image.filename || `参考图 ${index + 1}`, $event, image.mask_url)">
-                <img :src="image.url" :alt="image.filename || '参考图'" />
-                <span>{{ image.filename || `参考 ${index + 1}` }}{{ image.mask_url ? ' · 蒙板' : '' }}</span>
-              </button>
-            </div>
-          </div>
-          <div class="detail-section">
-            <div class="section-title">参数配置</div>
-            <div class="detail-source">来源 <strong>{{ maskBaseURL(selectedTask.baseurl) }}</strong> · {{ selectedTask.model }}</div>
-            <div class="detail-params">
-              <div><span>尺寸</span><strong>{{ selectedTask.size }}</strong></div>
-              <div><span>质量</span><strong>{{ selectedTask.quality }}</strong></div>
-              <div><span>格式</span><strong>{{ selectedTask.output_format }}</strong></div>
-              <div><span>审核</span><strong>{{ selectedTask.moderation }}</strong></div>
-              <div><span>时间</span><strong>{{ timeText(selectedTask) }}</strong></div>
-              <div v-if="queueText(selectedTask)"><span>排队</span><strong>{{ queueText(selectedTask) }}</strong></div>
-            </div>
-          </div>
-          <p class="detail-time">创建于 {{ formatTime(selectedTask.created_at) }} · 状态 {{ queueText(selectedTask) || statusText(selectedTask.status) }}</p>
-          <div class="detail-buttons">
-            <button class="blue" @click="reuseTask(selectedTask); selectedTask = null">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M5 16V7a2 2 0 0 1 2-2h9"/></svg>
-              <span>复用配置</span>
-            </button>
-            <button class="green" @click="rerunTask(selectedTask); selectedTask = null">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v6h-6"/></svg>
-              <span>重新生成</span>
-            </button>
-            <button class="purple" :disabled="!selectedTask.result_images?.[0]?.url" @click="openResultImage(selectedTask)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
-              <span>下载图片</span>
-            </button>
-            <button class="cyan" :disabled="!selectedTask.result_images?.[0]?.url" @click="addResultToReferences(selectedTask)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/><rect x="3" y="3" width="18" height="18" rx="3"/></svg>
-              <span>加入参考</span>
-            </button>
-            <button class="orange" :class="{ favorite: selectedTask.shared_to_plaza }" :disabled="!canShareTask(selectedTask)" @click="toggleTaskShare(selectedTask, $event)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12v7a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-7"/><path d="M16 6l-4-4-4 4"/><path d="M12 2v13"/></svg>
-              <span>{{ selectedTask.shared_to_plaza ? '取消分享' : '分享广场' }}</span>
-            </button>
-            <button class="red" @click="removeTask(selectedTask)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 14h10l1-14M9 7V4h6v3"/></svg>
-              <span>删除记录</span>
-            </button>
-            <button class="star" :class="{ favorite: isFavorite(selectedTask) }" :title="isFavorite(selectedTask) ? '取消收藏' : '收藏'" :aria-label="isFavorite(selectedTask) ? '取消收藏' : '收藏'" @click="toggleFavorite(selectedTask, $event)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.8 5.67 6.26.91-4.53 4.42 1.07 6.23L12 17.28l-5.6 2.95 1.07-6.23-4.53-4.42 6.26-.91L12 3Z"/></svg>
-            </button>
-          </div>
-        </div>
-      </section>
-    </div>
-
-    <div v-if="selectedPlazaItem" class="modal-backdrop" @click.self="selectedPlazaItem = null">
-      <section class="detail-modal light-modal">
-        <button class="modal-close" @click="selectedPlazaItem = null">×</button>
-        <div class="detail-preview">
-          <img v-if="selectedPlazaItem.result_images?.[0]?.url" :src="selectedPlazaItem.result_images[0].url" alt="广场作品" title="点击查看大图" @click="openPreviewImage(selectedPlazaItem.result_images[0].url, '广场作品', $event)" />
-        </div>
-        <div class="detail-info">
-          <div class="detail-section detail-input-section">
-            <div class="section-title">输入内容</div>
-            <p class="detail-prompt">{{ selectedPlazaItem.prompt }}</p>
-          </div>
-          <div v-if="taskReferenceImages(selectedPlazaItem).length" class="detail-section">
-            <div class="section-title">参考图片</div>
-            <div class="detail-references">
-              <button v-for="(image, index) in taskReferenceImages(selectedPlazaItem)" :key="`${image.url}-${index}`" type="button" @click="openPreviewImage(image.url, image.filename || `参考图 ${index + 1}`, $event, image.mask_url)">
-                <img :src="image.url" :alt="image.filename || '参考图'" />
-                <span>{{ image.filename || `参考 ${index + 1}` }}{{ image.mask_url ? ' · 蒙板' : '' }}</span>
-              </button>
-            </div>
-          </div>
-          <div class="detail-section">
-            <div class="section-title">参数配置</div>
-            <div class="detail-source">广场作品 · {{ selectedPlazaItem.model }} · ♥ {{ selectedPlazaItem.like_count }}</div>
-            <div class="detail-params">
-              <div><span>尺寸</span><strong>{{ selectedPlazaItem.size }}</strong></div>
-              <div><span>质量</span><strong>{{ selectedPlazaItem.quality }}</strong></div>
-              <div><span>格式</span><strong>{{ selectedPlazaItem.output_format }}</strong></div>
-              <div><span>审核</span><strong>{{ selectedPlazaItem.moderation }}</strong></div>
-            </div>
-          </div>
-          <p class="detail-time">发布于 {{ formatTime(selectedPlazaItem.created_at) }}</p>
-          <div class="detail-buttons plaza-detail-buttons">
-            <button class="blue" @click="reuseTask(selectedPlazaItem); selectedPlazaItem = null">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M5 16V7a2 2 0 0 1 2-2h9"/></svg>
-              <span>复用配置</span>
-            </button>
-            <button class="purple" :disabled="!selectedPlazaItem.result_images?.[0]?.url" @click="openResultImage(selectedPlazaItem)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
-              <span>下载图片</span>
-            </button>
-            <button class="star" :class="{ favorite: selectedPlazaItem.liked }" @click="togglePlazaLike(selectedPlazaItem, $event)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7-4.35-9.33-8.77C.87 8.82 2.8 5 6.55 5c2.06 0 3.3 1.1 4.05 2.1C11.35 6.1 12.59 5 14.65 5c3.75 0 5.68 3.82 3.88 7.23C16.2 16.65 12 21 12 21Z"/></svg>
-              <span>{{ selectedPlazaItem.liked ? '取消点赞' : '点赞' }} {{ selectedPlazaItem.like_count }}</span>
-            </button>
-          </div>
-        </div>
-      </section>
-    </div>
-
-    <div v-if="sourceTask" class="modal-backdrop" @click.self="sourceTask = null">
-      <section class="source-modal light-modal">
-        <button class="modal-close" @click="sourceTask = null">×</button>
-        <h2>源数据</h2>
-        <div class="source-grid">
-          <section>
-            <h3>请求头</h3>
-            <pre>{{ prettySource(sourceTask.request_headers) }}</pre>
-          </section>
-          <section>
-            <h3>请求内容</h3>
-            <pre>{{ prettySource(sourceTask.request_json) }}</pre>
-          </section>
-          <section>
-            <h3>响应头</h3>
-            <pre>{{ prettySource(sourceTask.response_headers) }}</pre>
-          </section>
-          <section>
-            <h3>响应内容</h3>
-            <pre>{{ prettySource(sourceTask.response_json) }}</pre>
-          </section>
-        </div>
-      </section>
-    </div>
-
-    <div v-if="showAdminContact" class="modal-backdrop" @click.self="showAdminContact = false">
-      <section class="admin-contact-modal light-modal">
-        <button class="modal-close" @click="showAdminContact = false">×</button>
-        <h2>联系管理员</h2>
-        <p>请扫码联系管理员授权当前 BASEURL。</p>
-        <img v-if="adminContactImage" :src="adminContactImage" alt="管理员联系方式" />
-      </section>
-    </div>
-
-    <div v-if="previewImage" class="modal-backdrop image-viewer" @click.self="closePreviewImage">
-      <section class="image-viewer-panel" :class="{ editable: previewImage.editable }">
-        <button class="modal-close" @click="closePreviewImage">×</button>
-        <template v-if="previewImage.editable">
-          <div class="mask-stage">
-            <img ref="maskBaseImage" :src="previewImage.url" :alt="previewImage.label" @load="loadMaskCanvas" />
-            <canvas ref="maskCanvas" @pointerdown="startMaskDraw" @pointermove="moveMaskDraw" @pointerup="stopMaskDraw" @pointercancel="stopMaskDraw" />
-          </div>
-          <div class="mask-tools">
-            <button :class="{ active: maskTool === 'brush' }" @click="maskTool = 'brush'">涂抹蒙板</button>
-            <button :class="{ active: maskTool === 'eraser' }" @click="maskTool = 'eraser'">橡皮擦</button>
-            <label>画笔 <input v-model.number="maskBrushSize" type="range" min="8" max="120" /></label>
-            <button @click="clearMaskCanvas">清空蒙板</button>
-            <button class="primary" @click="saveMaskCanvas">保存蒙板</button>
-          </div>
-        </template>
-        <div v-else-if="previewImage.maskUrl" class="mask-stage readonly-mask">
-          <img :src="previewImage.url" :alt="previewImage.label" />
-          <img class="readonly-mask-overlay" :src="maskPreviewURL(previewImage.maskUrl)" alt="蒙板" />
-        </div>
-        <img v-else :src="previewImage.url" :alt="previewImage.label" />
-        <div>{{ previewImage.label }}{{ previewImage.maskUrl ? ' · 蒙板' : '' }}</div>
-      </section>
-    </div>
+    <ImageViewer
+      v-if="previewImage"
+      v-model:mask-tool="maskTool"
+      v-model:mask-brush-size="maskBrushSize"
+      :image="previewImage"
+      :mask-preview-url="maskPreviewURL"
+      @close="closePreviewImage"
+      @set-base-image="setMaskBaseImage"
+      @set-canvas="setMaskCanvas"
+      @image-load="loadMaskCanvas"
+      @start-draw="startMaskDraw"
+      @move-draw="moveMaskDraw"
+      @stop-draw="stopMaskDraw"
+      @clear-mask="clearMaskCanvas"
+      @save-mask="saveMaskCanvas"
+    />
 
     <div v-if="message" class="toast">{{ message }}</div>
   </main>

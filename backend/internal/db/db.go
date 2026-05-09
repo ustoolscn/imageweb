@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -14,19 +13,27 @@ import (
 	"image-web/backend/internal/model"
 
 	"github.com/google/uuid"
-	_ "modernc.org/sqlite"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 type Store struct {
 	db *sql.DB
 }
 
-func Open(path string) (*Store, error) {
-	if err := os.MkdirAll(dir(path), 0o755); err != nil {
+func Open(dsn string) (*Store, error) {
+	if strings.TrimSpace(dsn) == "" {
+		return nil, fmt.Errorf("database dsn is required")
+	}
+	database, err := sql.Open("pgx", dsn)
+	if err != nil {
 		return nil, err
 	}
-	database, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
-	if err != nil {
+	database.SetConnMaxIdleTime(30 * time.Second)
+	database.SetConnMaxLifetime(5 * time.Minute)
+	database.SetMaxIdleConns(0)
+	database.SetMaxOpenConns(10)
+	if err := database.Ping(); err != nil {
+		database.Close()
 		return nil, err
 	}
 	store := &Store{db: database}
@@ -54,25 +61,26 @@ CREATE TABLE IF NOT EXISTS tasks (
   size TEXT NOT NULL,
   quality TEXT NOT NULL,
   output_format TEXT NOT NULL,
-  output_compression INTEGER NOT NULL,
+  output_compression INT NOT NULL,
   background TEXT NOT NULL,
   moderation TEXT NOT NULL,
-  n INTEGER NOT NULL,
+  n INT NOT NULL,
+  stream BOOLEAN NOT NULL DEFAULT FALSE,
   style TEXT NOT NULL DEFAULT '',
   response_format TEXT NOT NULL DEFAULT '',
-  reference_images_json TEXT NOT NULL DEFAULT '[]',
-  favorite INTEGER NOT NULL DEFAULT 0,
+  reference_images_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  favorite BOOLEAN NOT NULL DEFAULT FALSE,
   request_headers TEXT NOT NULL DEFAULT '',
   request_json TEXT NOT NULL DEFAULT '',
   response_headers TEXT NOT NULL DEFAULT '',
   response_json TEXT NOT NULL DEFAULT '',
-  result_images_json TEXT NOT NULL DEFAULT '[]',
+  result_images_json JSONB NOT NULL DEFAULT '[]'::jsonb,
   error_message TEXT NOT NULL DEFAULT '',
-  elapsed_ms INTEGER NOT NULL DEFAULT 0,
-  created_at DATETIME NOT NULL,
-  updated_at DATETIME NOT NULL,
-  started_at DATETIME,
-  completed_at DATETIME
+  elapsed_ms BIGINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  started_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_api_key_created ON tasks(api_key, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_status_created ON tasks(status, created_at ASC);
@@ -84,47 +92,76 @@ CREATE TABLE IF NOT EXISTS plaza_items (
   size TEXT NOT NULL,
   quality TEXT NOT NULL,
   output_format TEXT NOT NULL,
-  output_compression INTEGER NOT NULL,
+  output_compression INT NOT NULL,
   background TEXT NOT NULL,
   moderation TEXT NOT NULL,
-  n INTEGER NOT NULL,
+  n INT NOT NULL,
+  stream BOOLEAN NOT NULL DEFAULT FALSE,
   style TEXT NOT NULL DEFAULT '',
   response_format TEXT NOT NULL DEFAULT '',
-  reference_images_json TEXT NOT NULL DEFAULT '[]',
-  result_images_json TEXT NOT NULL DEFAULT '[]',
-  like_count INTEGER NOT NULL DEFAULT 0,
-  created_at DATETIME NOT NULL,
-  updated_at DATETIME NOT NULL
+  reference_images_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  result_images_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  like_count INT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_plaza_created ON plaza_items(created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_plaza_likes ON plaza_items(like_count DESC, created_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS plaza_likes (
   plaza_id TEXT NOT NULL,
   client_id TEXT NOT NULL,
-  created_at DATETIME NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (plaza_id, client_id)
 );
 CREATE TABLE IF NOT EXISTS site_config (
-  key TEXT PRIMARY KEY,
+  config_key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO site_config (key, value) VALUES ('baseurl_whitelist_enabled', 'false');
-INSERT OR IGNORE INTO site_config (key, value) VALUES ('baseurl_whitelist', '[]');
-INSERT OR IGNORE INTO site_config (key, value) VALUES ('admin_contact_image', '');
-INSERT OR IGNORE INTO site_config (key, value) VALUES ('site_title', '图片生成工作台');
-INSERT OR IGNORE INTO site_config (key, value) VALUES ('site_icon', 'AI');
-	INSERT OR IGNORE INTO site_config (key, value) VALUES ('worker_concurrency', '1');
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS request_headers TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS response_headers TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS favorite BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS stream BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE plaza_items ADD COLUMN IF NOT EXISTS stream BOOLEAN NOT NULL DEFAULT FALSE;
 `)
 	if err != nil {
 		return err
 	}
-	for _, statement := range []string{
-		`ALTER TABLE tasks ADD COLUMN request_headers TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE tasks ADD COLUMN response_headers TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE tasks ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0`,
+	if err := s.migrateSiteConfigKey(); err != nil {
+		return err
+	}
+	return s.ensureSiteConfig()
+}
+
+func (s *Store) migrateSiteConfigKey() error {
+	legacyExists := false
+	if err := s.db.QueryRow(`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'site_config' AND column_name = 'key')`).Scan(&legacyExists); err != nil {
+		return err
+	}
+	newExists := false
+	if err := s.db.QueryRow(`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'site_config' AND column_name = 'config_key')`).Scan(&newExists); err != nil {
+		return err
+	}
+	if legacyExists && !newExists {
+		_, err := s.db.Exec(`ALTER TABLE site_config RENAME COLUMN key TO config_key`)
+		return err
+	}
+	return nil
+}
+
+func (s *Store) ensureSiteConfig() error {
+	for _, entry := range []struct {
+		key   string
+		value string
+	}{
+		{"baseurl_whitelist_enabled", "false"},
+		{"baseurl_whitelist", "[]"},
+		{"admin_contact_image", ""},
+		{"site_title", "图片生成工作台"},
+		{"site_icon", "AI"},
+		{"worker_concurrency", "1"},
 	} {
-		if _, alterErr := s.db.Exec(statement); alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column") {
-			return alterErr
+		if _, err := s.db.Exec(`INSERT INTO site_config (config_key, value) VALUES ($1, $2) ON CONFLICT (config_key) DO NOTHING`, entry.key, entry.value); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -132,7 +169,7 @@ INSERT OR IGNORE INTO site_config (key, value) VALUES ('site_icon', 'AI');
 
 func (s *Store) SiteConfig(ctx context.Context) (model.SiteConfig, error) {
 	config := model.SiteConfig{}
-	rows, err := s.db.QueryContext(ctx, `SELECT key, value FROM site_config WHERE key IN ('baseurl_whitelist_enabled', 'baseurl_whitelist', 'admin_contact_image', 'site_title', 'site_icon', 'worker_concurrency')`)
+	rows, err := s.db.QueryContext(ctx, `SELECT config_key, value FROM site_config WHERE config_key IN ('baseurl_whitelist_enabled', 'baseurl_whitelist', 'admin_contact_image', 'site_title', 'site_icon', 'worker_concurrency')`)
 	if err != nil {
 		return config, err
 	}
@@ -184,53 +221,54 @@ func (s *Store) CreateTask(ctx context.Context, task *model.Task) error {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO tasks (
- id, api_key, base_url, status, prompt, final_prompt, model, size, quality, output_format,
- output_compression, background, moderation, n, style, response_format, reference_images_json,
- request_headers, request_json, response_headers, response_json, result_images_json,
- error_message, elapsed_ms, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	 id, api_key, base_url, status, prompt, final_prompt, model, size, quality, output_format,
+	 output_compression, background, moderation, n, stream, style, response_format, reference_images_json,
+	 favorite, request_headers, request_json, response_headers, response_json, result_images_json,
+	 error_message, elapsed_ms, created_at, updated_at
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb, $19, $20, $21, $22, $23, $24::jsonb, $25, $26, $27, $28)`,
 		task.ID, task.APIKey, task.BaseURL, task.Status, task.Prompt, task.FinalPrompt, task.Model,
 		task.Size, task.Quality, task.OutputFormat, task.OutputCompression, task.Background,
-		task.Moderation, task.N, task.Style, task.ResponseFormat, string(refs), task.RequestHeaders,
-		task.RequestJSON, task.ResponseHeaders, task.ResponseJSON, "[]", task.ErrorMessage,
+		task.Moderation, task.N, task.Stream, task.Style, task.ResponseFormat, string(refs), task.Favorite,
+		task.RequestHeaders, task.RequestJSON, task.ResponseHeaders, task.ResponseJSON, "[]", task.ErrorMessage,
 		task.ElapsedMS, task.CreatedAt, task.UpdatedAt)
 	return err
 }
 
 func (s *Store) ListTasks(ctx context.Context, apiKey, baseURL, status, query, beforeCreatedAt, beforeID string, favoriteOnly bool, limit int) ([]model.Task, int, error) {
-	baseArgs := []any{apiKey, baseURL}
-	baseWhere := []string{"api_key = ?", "base_url = ?"}
+	baseURLPattern := baseURLMatchPattern(baseURL)
+	args := []any{apiKey, baseURLPattern}
+	where := []string{"api_key = $1", "regexp_replace(base_url, '^https?://', '') = $2"}
 	if status != "" && status != "all" {
-		baseWhere = append(baseWhere, "status = ?")
-		baseArgs = append(baseArgs, status)
+		args = append(args, status)
+		where = append(where, "status = "+placeholder(len(args)))
 	}
 	if query != "" {
-		baseWhere = append(baseWhere, "prompt LIKE ?")
-		baseArgs = append(baseArgs, "%"+query+"%")
+		args = append(args, "%"+query+"%")
+		where = append(where, "prompt LIKE "+placeholder(len(args)))
 	}
 	if favoriteOnly {
-		baseWhere = append(baseWhere, "favorite = 1")
+		where = append(where, "favorite = TRUE")
 	}
-	whereClause := strings.Join(baseWhere, " AND ")
+	whereClause := strings.Join(where, " AND ")
 	total := 0
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE `+whereClause, baseArgs...).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE `+whereClause, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	args := append([]any{}, baseArgs...)
-	where := append([]string{}, baseWhere...)
+	listArgs := append([]any{}, args...)
+	listWhere := append([]string{}, where...)
 	if beforeCreatedAt != "" && beforeID != "" {
 		beforeTime, err := time.Parse(time.RFC3339Nano, beforeCreatedAt)
 		if err != nil {
 			return nil, 0, err
 		}
-		where = append(where, "(created_at < ? OR (created_at = ? AND id < ?))")
-		args = append(args, beforeTime, beforeTime, beforeID)
+		listArgs = append(listArgs, beforeTime, beforeTime, beforeID)
+		listWhere = append(listWhere, fmt.Sprintf("(created_at < %s OR (created_at = %s AND id < %s))", placeholder(len(listArgs)-2), placeholder(len(listArgs)-1), placeholder(len(listArgs))))
 	}
 	if limit <= 0 || limit > 60 {
 		limit = 30
 	}
-	args = append(args, limit+1)
-	rows, err := s.db.QueryContext(ctx, `SELECT `+taskColumns()+` FROM tasks WHERE `+strings.Join(where, " AND ")+` ORDER BY created_at DESC, id DESC LIMIT ?`, args...)
+	listArgs = append(listArgs, limit+1)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+taskColumns()+` FROM tasks WHERE `+strings.Join(listWhere, " AND ")+` ORDER BY created_at DESC, id DESC LIMIT `+placeholder(len(listArgs)), listArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -240,12 +278,12 @@ func (s *Store) ListTasks(ctx context.Context, apiKey, baseURL, status, query, b
 }
 
 func (s *Store) GetTask(ctx context.Context, id, apiKey, baseURL string) (*model.Task, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+taskDetailColumns()+` FROM tasks WHERE id = ? AND api_key = ? AND base_url = ?`, id, apiKey, baseURL)
+	row := s.db.QueryRowContext(ctx, `SELECT `+taskDetailColumns()+` FROM tasks WHERE id = $1 AND api_key = $2 AND regexp_replace(base_url, '^https?://', '') = $3`, id, apiKey, baseURLMatchPattern(baseURL))
 	return scanTask(row)
 }
 
 func (s *Store) GetAnyTask(ctx context.Context, id string) (*model.Task, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+taskDetailColumns()+` FROM tasks WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT `+taskDetailColumns()+` FROM tasks WHERE id = $1`, id)
 	return scanTask(row)
 }
 
@@ -259,7 +297,7 @@ func (s *Store) ShareTaskToPlaza(ctx context.Context, id, apiKey, baseURL string
 	}
 	now := time.Now().UTC()
 	plazaID := ""
-	if err := s.db.QueryRowContext(ctx, `SELECT id FROM plaza_items WHERE task_id = ?`, id).Scan(&plazaID); err == nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT id FROM plaza_items WHERE task_id = $1`, id).Scan(&plazaID); err == nil {
 		return s.PlazaItem(ctx, plazaID, "")
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
@@ -275,11 +313,11 @@ func (s *Store) ShareTaskToPlaza(ctx context.Context, id, apiKey, baseURL string
 	plazaID = uuid.NewString()
 	_, err = s.db.ExecContext(ctx, `INSERT INTO plaza_items (
 	 id, task_id, prompt, model, size, quality, output_format, output_compression,
-	 background, moderation, n, style, response_format, reference_images_json,
+	 background, moderation, n, stream, style, response_format, reference_images_json,
 	 result_images_json, like_count, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb, 0, $17, $18)`,
 		plazaID, task.ID, task.Prompt, task.Model, task.Size, task.Quality, task.OutputFormat,
-		task.OutputCompression, task.Background, task.Moderation, task.N, task.Style,
+		task.OutputCompression, task.Background, task.Moderation, task.N, task.Stream, task.Style,
 		task.ResponseFormat, string(refs), string(results), now, now)
 	if err != nil {
 		return nil, err
@@ -297,13 +335,13 @@ func (s *Store) UnshareTaskFromPlaza(ctx context.Context, id, apiKey, baseURL st
 	}
 	defer tx.Rollback()
 	var plazaID string
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM plaza_items WHERE task_id = ?`, id).Scan(&plazaID); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM plaza_items WHERE task_id = $1`, id).Scan(&plazaID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM plaza_likes WHERE plaza_id = ?`, plazaID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM plaza_likes WHERE plaza_id = $1`, plazaID); err != nil {
 		return err
 	}
-	result, err := tx.ExecContext(ctx, `DELETE FROM plaza_items WHERE id = ?`, plazaID)
+	result, err := tx.ExecContext(ctx, `DELETE FROM plaza_items WHERE id = $1`, plazaID)
 	if err != nil {
 		return err
 	}
@@ -318,13 +356,13 @@ func (s *Store) TaskUpdates(ctx context.Context, apiKey, baseURL string, ids []s
 	if len(ids) == 0 {
 		return []model.TaskUpdate{}, nil
 	}
+	args := []any{apiKey, baseURLMatchPattern(baseURL)}
 	placeholders := make([]string, 0, len(ids))
-	args := []any{apiKey, baseURL}
 	for _, id := range ids {
-		placeholders = append(placeholders, "?")
 		args = append(args, id)
+		placeholders = append(placeholders, placeholder(len(args)))
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, status, result_images_json, error_message, elapsed_ms, updated_at, started_at, completed_at, CASE WHEN status = 'pending' THEN (SELECT COUNT(*) FROM tasks queued WHERE queued.status = 'pending' AND queued.created_at < tasks.created_at) ELSE 0 END FROM tasks WHERE api_key = ? AND base_url = ? AND id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, status, result_images_json::text, error_message, elapsed_ms, updated_at, started_at, completed_at, CASE WHEN status = 'pending' THEN (SELECT COUNT(*) FROM tasks queued WHERE queued.status = 'pending' AND queued.created_at < tasks.created_at) ELSE 0 END FROM tasks WHERE api_key = $1 AND regexp_replace(base_url, '^https?://', '') = $2 AND id IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -355,8 +393,8 @@ func (s *Store) ListPlazaItems(ctx context.Context, sort, beforeCreatedAt, befor
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM plaza_items`).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	where := []string{"1 = 1"}
 	args := []any{clientID}
+	where := []string{"1 = 1"}
 	orderBy := "created_at DESC, id DESC"
 	if sort == "likes" {
 		orderBy = "like_count DESC, created_at DESC, id DESC"
@@ -365,22 +403,22 @@ func (s *Store) ListPlazaItems(ctx context.Context, sort, beforeCreatedAt, befor
 			if err != nil {
 				return nil, 0, err
 			}
-			where = append(where, "(like_count < ? OR (like_count = ? AND (created_at < ? OR (created_at = ? AND id < ?))))")
 			args = append(args, beforeLikeCount, beforeLikeCount, beforeTime, beforeTime, beforeID)
+			where = append(where, fmt.Sprintf("(like_count < %s OR (like_count = %s AND (created_at < %s OR (created_at = %s AND id < %s))))", placeholder(len(args)-4), placeholder(len(args)-3), placeholder(len(args)-2), placeholder(len(args)-1), placeholder(len(args))))
 		}
 	} else if beforeCreatedAt != "" && beforeID != "" {
 		beforeTime, err := time.Parse(time.RFC3339Nano, beforeCreatedAt)
 		if err != nil {
 			return nil, 0, err
 		}
-		where = append(where, "(created_at < ? OR (created_at = ? AND id < ?))")
 		args = append(args, beforeTime, beforeTime, beforeID)
+		where = append(where, fmt.Sprintf("(created_at < %s OR (created_at = %s AND id < %s))", placeholder(len(args)-2), placeholder(len(args)-1), placeholder(len(args))))
 	}
 	if limit <= 0 || limit > 60 {
 		limit = 30
 	}
 	args = append(args, limit+1)
-	rows, err := s.db.QueryContext(ctx, `SELECT `+plazaColumns()+` FROM plaza_items WHERE `+strings.Join(where, " AND ")+` ORDER BY `+orderBy+` LIMIT ?`, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+plazaColumns()+` FROM plaza_items WHERE `+strings.Join(where, " AND ")+` ORDER BY `+orderBy+` LIMIT `+placeholder(len(args)), args...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -390,7 +428,7 @@ func (s *Store) ListPlazaItems(ctx context.Context, sort, beforeCreatedAt, befor
 }
 
 func (s *Store) PlazaItem(ctx context.Context, id, clientID string) (*model.PlazaItem, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+plazaColumns()+` FROM plaza_items WHERE id = ?`, clientID, id)
+	row := s.db.QueryRowContext(ctx, `SELECT `+plazaColumns()+` FROM plaza_items WHERE id = $2`, clientID, id)
 	return scanPlazaItem(row)
 }
 
@@ -404,22 +442,22 @@ func (s *Store) SetPlazaLike(ctx context.Context, id, clientID string, liked boo
 	}
 	defer tx.Rollback()
 	if liked {
-		result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO plaza_likes (plaza_id, client_id, created_at) VALUES (?, ?, ?)`, id, clientID, time.Now().UTC())
+		result, err := tx.ExecContext(ctx, `INSERT INTO plaza_likes (plaza_id, client_id, created_at) VALUES ($1, $2, $3) ON CONFLICT (plaza_id, client_id) DO NOTHING`, id, clientID, time.Now().UTC())
 		if err != nil {
 			return nil, err
 		}
 		if count, _ := result.RowsAffected(); count > 0 {
-			if _, err := tx.ExecContext(ctx, `UPDATE plaza_items SET like_count = like_count + 1, updated_at = ? WHERE id = ?`, time.Now().UTC(), id); err != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE plaza_items SET like_count = like_count + 1, updated_at = $1 WHERE id = $2`, time.Now().UTC(), id); err != nil {
 				return nil, err
 			}
 		}
 	} else {
-		result, err := tx.ExecContext(ctx, `DELETE FROM plaza_likes WHERE plaza_id = ? AND client_id = ?`, id, clientID)
+		result, err := tx.ExecContext(ctx, `DELETE FROM plaza_likes WHERE plaza_id = $1 AND client_id = $2`, id, clientID)
 		if err != nil {
 			return nil, err
 		}
 		if count, _ := result.RowsAffected(); count > 0 {
-			if _, err := tx.ExecContext(ctx, `UPDATE plaza_items SET like_count = MAX(like_count - 1, 0), updated_at = ? WHERE id = ?`, time.Now().UTC(), id); err != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE plaza_items SET like_count = GREATEST(like_count - 1, 0), updated_at = $1 WHERE id = $2`, time.Now().UTC(), id); err != nil {
 				return nil, err
 			}
 		}
@@ -431,7 +469,7 @@ func (s *Store) SetPlazaLike(ctx context.Context, id, clientID string, liked boo
 }
 
 func (s *Store) DeleteTask(ctx context.Context, id, apiKey, baseURL string) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM tasks WHERE id = ? AND api_key = ? AND base_url = ?`, id, apiKey, baseURL)
+	result, err := s.db.ExecContext(ctx, `DELETE FROM tasks WHERE id = $1 AND api_key = $2 AND regexp_replace(base_url, '^https?://', '') = $3`, id, apiKey, baseURLMatchPattern(baseURL))
 	if err != nil {
 		return err
 	}
@@ -443,11 +481,7 @@ func (s *Store) DeleteTask(ctx context.Context, id, apiKey, baseURL string) erro
 }
 
 func (s *Store) SetFavorite(ctx context.Context, id, apiKey, baseURL string, favorite bool) error {
-	value := 0
-	if favorite {
-		value = 1
-	}
-	result, err := s.db.ExecContext(ctx, `UPDATE tasks SET favorite = ?, updated_at = ? WHERE id = ? AND api_key = ? AND base_url = ?`, value, time.Now().UTC(), id, apiKey, baseURL)
+	result, err := s.db.ExecContext(ctx, `UPDATE tasks SET favorite = $1, updated_at = $2 WHERE id = $3 AND api_key = $4 AND regexp_replace(base_url, '^https?://', '') = $5`, favorite, time.Now().UTC(), id, apiKey, baseURLMatchPattern(baseURL))
 	if err != nil {
 		return err
 	}
@@ -458,6 +492,12 @@ func (s *Store) SetFavorite(ctx context.Context, id, apiKey, baseURL string, fav
 	return nil
 }
 
+func (s *Store) ResetStaleRunningTasks(ctx context.Context, maxAge time.Duration) error {
+	cutoff := time.Now().UTC().Add(-maxAge)
+	_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status = $1, updated_at = $2, error_message = '' WHERE status = $3 AND started_at < $4`, model.TaskPending, time.Now().UTC(), model.TaskRunning, cutoff)
+	return err
+}
+
 func (s *Store) NextPendingTask(ctx context.Context) (*model.Task, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -465,13 +505,13 @@ func (s *Store) NextPendingTask(ctx context.Context) (*model.Task, error) {
 	}
 	defer tx.Rollback()
 
-	row := tx.QueryRowContext(ctx, `SELECT `+taskColumns()+` FROM tasks WHERE status = ? ORDER BY created_at ASC LIMIT 1`, model.TaskPending)
+	row := tx.QueryRowContext(ctx, `SELECT `+taskColumns()+` FROM tasks WHERE status = $1 ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`, model.TaskPending)
 	task, err := scanTask(row)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now().UTC()
-	result, err := tx.ExecContext(ctx, `UPDATE tasks SET status = ?, started_at = ?, updated_at = ? WHERE id = ? AND status = ?`, model.TaskRunning, now, now, task.ID, model.TaskPending)
+	result, err := tx.ExecContext(ctx, `UPDATE tasks SET status = $1, started_at = $2, updated_at = $3 WHERE id = $4 AND status = $5`, model.TaskRunning, now, now, task.ID, model.TaskPending)
 	if err != nil {
 		return nil, err
 	}
@@ -491,26 +531,47 @@ func (s *Store) CompleteTask(ctx context.Context, id string, finalPrompt, reques
 		return err
 	}
 	now := time.Now().UTC()
-	_, err = s.db.ExecContext(ctx, `UPDATE tasks SET status = ?, final_prompt = ?, request_headers = ?, request_json = ?, response_headers = ?, response_json = ?, result_images_json = ?, elapsed_ms = ?, completed_at = ?, updated_at = ?, error_message = '' WHERE id = ?`, model.TaskSucceeded, finalPrompt, requestHeaders, requestJSON, responseHeaders, responseJSON, string(payload), elapsedMS, now, now, id)
-	return err
+	result, err := s.db.ExecContext(ctx, `UPDATE tasks SET status = $1, final_prompt = $2, request_headers = $3, request_json = $4, response_headers = $5, response_json = $6, result_images_json = $7::jsonb, elapsed_ms = $8, completed_at = $9, updated_at = $10, error_message = '' WHERE id = $11`, model.TaskSucceeded, finalPrompt, requestHeaders, requestJSON, responseHeaders, responseJSON, string(payload), elapsedMS, now, now, id)
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (s *Store) FailTask(ctx context.Context, id string, finalPrompt, requestHeaders, requestJSON, responseHeaders, responseJSON, message string, elapsedMS int64) error {
 	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status = ?, final_prompt = ?, request_headers = ?, request_json = ?, response_headers = ?, response_json = ?, error_message = ?, elapsed_ms = ?, completed_at = ?, updated_at = ? WHERE id = ?`, model.TaskFailed, finalPrompt, requestHeaders, requestJSON, responseHeaders, responseJSON, message, elapsedMS, now, now, id)
-	return err
+	result, err := s.db.ExecContext(ctx, `UPDATE tasks SET status = $1, final_prompt = $2, request_headers = $3, request_json = $4, response_headers = $5, response_json = $6, error_message = $7, elapsed_ms = $8, completed_at = $9, updated_at = $10 WHERE id = $11`, model.TaskFailed, finalPrompt, requestHeaders, requestJSON, responseHeaders, responseJSON, message, elapsedMS, now, now, id)
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func baseURLMatchPattern(baseURL string) string {
+	baseURL = strings.TrimSpace(baseURL)
+	baseURL = strings.TrimPrefix(baseURL, "http://")
+	baseURL = strings.TrimPrefix(baseURL, "https://")
+	return strings.TrimRight(baseURL, "/")
 }
 
 func taskColumns() string {
-	return `id, api_key, base_url, status, prompt, final_prompt, model, size, quality, output_format, output_compression, background, moderation, n, style, response_format, reference_images_json, favorite, '' AS request_headers, '' AS request_json, '' AS response_headers, '' AS response_json, result_images_json, error_message, elapsed_ms, created_at, updated_at, started_at, completed_at, CASE WHEN status = 'pending' THEN (SELECT COUNT(*) FROM tasks queued WHERE queued.status = 'pending' AND queued.created_at < tasks.created_at) ELSE 0 END, EXISTS(SELECT 1 FROM plaza_items WHERE plaza_items.task_id = tasks.id)`
+	return `id, api_key, base_url, status, prompt, final_prompt, model, size, quality, output_format, output_compression, background, moderation, n, stream, style, response_format, reference_images_json::text, favorite, '' AS request_headers, '' AS request_json, '' AS response_headers, '' AS response_json, result_images_json::text, error_message, elapsed_ms, created_at, updated_at, started_at, completed_at, CASE WHEN status = 'pending' THEN (SELECT COUNT(*) FROM tasks queued WHERE queued.status = 'pending' AND queued.created_at < tasks.created_at) ELSE 0 END, EXISTS(SELECT 1 FROM plaza_items WHERE plaza_items.task_id = tasks.id)`
 }
 
 func plazaColumns() string {
-	return `id, task_id, prompt, model, size, quality, output_format, output_compression, background, moderation, n, style, response_format, reference_images_json, result_images_json, like_count, EXISTS(SELECT 1 FROM plaza_likes WHERE plaza_likes.plaza_id = plaza_items.id AND plaza_likes.client_id = ?), created_at`
+	return `id, task_id, prompt, model, size, quality, output_format, output_compression, background, moderation, n, stream, style, response_format, reference_images_json::text, result_images_json::text, like_count, EXISTS(SELECT 1 FROM plaza_likes WHERE plaza_likes.plaza_id = plaza_items.id AND plaza_likes.client_id = $1), created_at`
 }
 
 func taskDetailColumns() string {
-	return `id, api_key, base_url, status, prompt, final_prompt, model, size, quality, output_format, output_compression, background, moderation, n, style, response_format, reference_images_json, favorite, request_headers, request_json, response_headers, response_json, result_images_json, error_message, elapsed_ms, created_at, updated_at, started_at, completed_at, CASE WHEN status = 'pending' THEN (SELECT COUNT(*) FROM tasks queued WHERE queued.status = 'pending' AND queued.created_at < tasks.created_at) ELSE 0 END, EXISTS(SELECT 1 FROM plaza_items WHERE plaza_items.task_id = tasks.id)`
+	return `id, api_key, base_url, status, prompt, final_prompt, model, size, quality, output_format, output_compression, background, moderation, n, stream, style, response_format, reference_images_json::text, favorite, request_headers, request_json, response_headers, response_json, result_images_json::text, error_message, elapsed_ms, created_at, updated_at, started_at, completed_at, CASE WHEN status = 'pending' THEN (SELECT COUNT(*) FROM tasks queued WHERE queued.status = 'pending' AND queued.created_at < tasks.created_at) ELSE 0 END, EXISTS(SELECT 1 FROM plaza_items WHERE plaza_items.task_id = tasks.id)`
 }
 
 type scanner interface {
@@ -520,7 +581,7 @@ type scanner interface {
 func scanTask(row scanner) (*model.Task, error) {
 	var task model.Task
 	var startedAt, completedAt sql.NullTime
-	if err := row.Scan(&task.ID, &task.APIKey, &task.BaseURL, &task.Status, &task.Prompt, &task.FinalPrompt, &task.Model, &task.Size, &task.Quality, &task.OutputFormat, &task.OutputCompression, &task.Background, &task.Moderation, &task.N, &task.Style, &task.ResponseFormat, &task.ReferenceImagesJSON, &task.Favorite, &task.RequestHeaders, &task.RequestJSON, &task.ResponseHeaders, &task.ResponseJSON, &task.ResultImagesJSON, &task.ErrorMessage, &task.ElapsedMS, &task.CreatedAt, &task.UpdatedAt, &startedAt, &completedAt, &task.QueuePosition, &task.SharedToPlaza); err != nil {
+	if err := row.Scan(&task.ID, &task.APIKey, &task.BaseURL, &task.Status, &task.Prompt, &task.FinalPrompt, &task.Model, &task.Size, &task.Quality, &task.OutputFormat, &task.OutputCompression, &task.Background, &task.Moderation, &task.N, &task.Stream, &task.Style, &task.ResponseFormat, &task.ReferenceImagesJSON, &task.Favorite, &task.RequestHeaders, &task.RequestJSON, &task.ResponseHeaders, &task.ResponseJSON, &task.ResultImagesJSON, &task.ErrorMessage, &task.ElapsedMS, &task.CreatedAt, &task.UpdatedAt, &startedAt, &completedAt, &task.QueuePosition, &task.SharedToPlaza); err != nil {
 		return nil, err
 	}
 	if startedAt.Valid {
@@ -547,7 +608,7 @@ func scanTasks(rows *sql.Rows) ([]model.Task, error) {
 
 func scanPlazaItem(row scanner) (*model.PlazaItem, error) {
 	var item model.PlazaItem
-	if err := row.Scan(&item.ID, &item.TaskID, &item.Prompt, &item.Model, &item.Size, &item.Quality, &item.OutputFormat, &item.OutputCompression, &item.Background, &item.Moderation, &item.N, &item.Style, &item.ResponseFormat, &item.ReferenceImagesJSON, &item.ResultImagesJSON, &item.LikeCount, &item.Liked, &item.CreatedAt); err != nil {
+	if err := row.Scan(&item.ID, &item.TaskID, &item.Prompt, &item.Model, &item.Size, &item.Quality, &item.OutputFormat, &item.OutputCompression, &item.Background, &item.Moderation, &item.N, &item.Stream, &item.Style, &item.ResponseFormat, &item.ReferenceImagesJSON, &item.ResultImagesJSON, &item.LikeCount, &item.Liked, &item.CreatedAt); err != nil {
 		return nil, err
 	}
 	decodePlazaJSON(&item)
@@ -588,18 +649,14 @@ func IsNotFound(err error) bool {
 	return errors.Is(err, sql.ErrNoRows)
 }
 
-func dir(path string) string {
-	idx := strings.LastIndexAny(path, `/\\`)
-	if idx == -1 {
-		return "."
-	}
-	return path[:idx]
-}
-
 func MustJSON(value any) string {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Sprintf(`{"error":%q}`, err.Error())
 	}
 	return string(data)
+}
+
+func placeholder(index int) string {
+	return fmt.Sprintf("$%d", index)
 }

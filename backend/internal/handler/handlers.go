@@ -16,6 +16,7 @@ import (
 
 	"image-web/backend/internal/db"
 	"image-web/backend/internal/generator"
+	"image-web/backend/internal/imagehost"
 	"image-web/backend/internal/model"
 
 	"github.com/google/uuid"
@@ -24,12 +25,14 @@ import (
 type Handler struct {
 	Store     *db.Store
 	Generator *generator.Client
+	ImageHost *imagehost.Client
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/health", h.health)
 	mux.HandleFunc("/api/site-brand", h.siteBrand)
 	mux.HandleFunc("/api/models", h.models)
+	mux.HandleFunc("/api/upload", h.upload)
 	mux.HandleFunc("/api/mask-preview", h.maskPreview)
 	mux.HandleFunc("/api/plaza", h.plaza)
 	mux.HandleFunc("/api/plaza/", h.plazaByID)
@@ -99,6 +102,34 @@ func (h *Handler) tasks(w http.ResponseWriter, r *http.Request) {
 	default:
 		methodNotAllowed(w)
 	}
+}
+
+func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if h.ImageHost == nil {
+		writeError(w, http.StatusInternalServerError, "图床未配置")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "图片上传请求无效")
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "缺少图片文件")
+		return
+	}
+	defer file.Close()
+	image, err := h.ImageHost.UploadReader(r.Context(), header.Filename, file)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "url": image.URL, "data": image})
 }
 
 func (h *Handler) maskPreview(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +242,7 @@ func (h *Handler) createTask(w http.ResponseWriter, r *http.Request) {
 		Background:        defaultString(req.Background, "auto"),
 		Moderation:        defaultString(req.Moderation, "low"),
 		N:                 req.N,
+		Stream:            req.Stream,
 		ReferenceImages:   req.ReferenceImages,
 	}
 	if task.N <= 0 {
@@ -507,6 +539,7 @@ func (h *Handler) retryTask(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	newTask := *oldTask
 	newTask.ID = uuid.NewString()
+	newTask.BaseURL = strings.TrimSpace(baseURL)
 	newTask.Status = model.TaskPending
 	newTask.FinalPrompt = ""
 	newTask.RequestHeaders = ""
@@ -581,10 +614,11 @@ func normalizeBaseURL(value string) (string, error) {
 	if parsed.Host == "" || !slices.Contains([]string{"http", "https"}, parsed.Scheme) {
 		return "", fmt.Errorf("invalid baseurl")
 	}
+	parsed.Scheme = ""
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
 	parsed.RawQuery = ""
 	parsed.Fragment = ""
-	return parsed.String(), nil
+	return strings.TrimPrefix(parsed.String(), "//"), nil
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {

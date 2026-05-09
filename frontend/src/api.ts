@@ -42,6 +42,7 @@ function toUploadedImage(data: unknown): UploadedImage {
   }
   return {
     url,
+    thumbnail_url: response.data?.thumbnail_url,
     filename: response.data?.filename,
     original_size: response.data?.original_size,
     compressed_size: response.data?.compressed_size,
@@ -60,9 +61,8 @@ export async function fetchModels(baseurl: string, apikey: string) {
 export async function uploadImage(file: File): Promise<UploadedImage> {
   const form = new FormData()
   form.append('file', file)
-  const response = await fetch('https://2bad.lujilujilujilujiluji.com/', {
+  const response = await fetch('/api/upload', {
     method: 'POST',
-    headers: { Authorization: 'Bearer cooper' },
     body: form,
   })
   const text = await response.text()

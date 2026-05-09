@@ -3,13 +3,17 @@ services:
     build: .
     container_name: image-web
     ports:
-      - "8080:8080"
+      - "${PORT:-8080}:8080"
+    env_file:
+      - .env
     environment:
-      PORT: "8080"
-      DATA_DIR: /app/data
-      DATABASE_PATH: /app/data/app.db
-      STATIC_DIR: /app/static
-      SCDN_UPLOAD_URL: https://2bad.lujilujilujilujiluji.com/
-    volumes:
-      - ./data:/app/data
+      PORT: ${PORT:-8080}
+      IMAGE_HOST_PROVIDER: ${IMAGE_HOST_PROVIDER:-http-json}
+      IMAGE_HOST_UPLOAD_URL: ${IMAGE_HOST_UPLOAD_URL:-https://2bad.lujilujilujilujiluji.com/}
+      IMAGE_HOST_AUTH_HEADER: ${IMAGE_HOST_AUTH_HEADER:-Authorization}
+      IMAGE_HOST_AUTH_VALUE: ${IMAGE_HOST_AUTH_VALUE:-Bearer cooper}
+      IMAGE_HOST_FIELD_NAME: ${IMAGE_HOST_FIELD_NAME:-file}
+      IMAGE_HOST_RESPONSE_URL_PATH: ${IMAGE_HOST_RESPONSE_URL_PATH:-url}
+      IMAGE_HOST_LOCAL_DIR: ${IMAGE_HOST_LOCAL_DIR:-/app/uploads}
+      IMAGE_HOST_PUBLIC_BASE_URL: ${IMAGE_HOST_PUBLIC_BASE_URL:-}
     restart: unless-stopped
