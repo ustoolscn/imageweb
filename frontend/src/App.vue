@@ -52,6 +52,7 @@ const adminContactImage = ref('')
 const showAdminContact = ref(false)
 const message = ref('')
 const clock = ref(Date.now())
+const showMobileComposer = ref(false)
 const showSettingsModal = ref(false)
 const settingsDraft = reactive({ baseurl: baseurl.value, apikey: apikey.value })
 const showSizeModal = ref(false)
@@ -959,8 +960,20 @@ function showMessage(text: string) {
       @load-more="loadMorePlazaItems"
     />
 
+    <button
+      v-if="viewMode === 'tasks'"
+      type="button"
+      class="mobile-console-toggle"
+      :class="{ active: showMobileComposer }"
+      :aria-expanded="showMobileComposer"
+      @click="showMobileComposer = !showMobileComposer"
+    >
+      {{ showMobileComposer ? '收起控制台' : '生成控制台' }}
+    </button>
+
     <Composer
       v-if="viewMode === 'tasks'"
+      :class="{ 'mobile-hidden': !showMobileComposer }"
       :form="form"
       :models="models"
       :submitting="submitting"
