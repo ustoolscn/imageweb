@@ -12,7 +12,7 @@ import SizeModal from './components/SizeModal.vue'
 import SourceModal from './components/SourceModal.vue'
 import TaskDetailModal from './components/TaskDetailModal.vue'
 import TaskGrid from './components/TaskGrid.vue'
-import { ratioOptions, sizeFromRatio } from './lib/sizes'
+import { ratioOptions, sizeBaseOptions, sizeFromRatio, type SizeBase } from './lib/sizes'
 import { canOpenSource, canShareTask, maskBaseURL } from './lib/view'
 import type { PlazaItem, Task, UploadedImage } from './types'
 import type { ImageForm, PendingReferenceImage, PreviewImage, SettingsPayload, ThemeMode, ViewMode, AppliedThemeMode } from './uiTypes'
@@ -33,6 +33,7 @@ const plazaClientID = ref(localStorage.getItem('image_web_plaza_client_id') || '
 const models = ref<string[]>(['gpt-image-2'])
 const siteTitle = ref('图片生成工作台')
 const siteIcon = ref('AI')
+const sizeAccess = reactive({ allow2K: true, allow4K: true })
 const status = ref('all')
 const keyword = ref('')
 const favoriteOnly = ref(false)
@@ -93,10 +94,11 @@ const form = reactive<ImageForm>({
   n: 1,
 })
 
-const sizeDraft = reactive({
-  base: '1K',
+const sizeDraft = reactive<{ base: SizeBase; ratio: string }>({
+  base: 'auto',
   ratio: '1:1',
 })
+const pendingSizeSync = ref(form.size)
 
 const referenceImages = ref<PendingReferenceImage[]>([])
 const reusedReferenceImages = ref<UploadedImage[]>([])
@@ -105,6 +107,11 @@ const hasConfig = computed(() => Boolean(baseurl.value && apikey.value))
 const runningCount = computed(() => tasks.value.filter((task) => task.status === 'pending' || task.status === 'running').length)
 const visibleSubtitle = computed(() => viewMode.value === 'plaza' ? `公开广场 · 已加载 ${plazaItems.value.length} 条 · 总计 ${totalPlazaItems.value} 条` : (hasConfig.value ? `${maskBaseURL(baseurl.value)} · 已加载 ${tasks.value.length} 条 · 总计 ${totalTasks.value} 条` : '通过 URL 传入 baseurl 和 apikey 后开始使用'))
 const draftSize = computed(() => sizeFromRatio(sizeDraft.base, sizeDraft.ratio))
+const availableSizeBaseOptions = computed(() => sizeBaseOptions.filter((option) => {
+  if (option.value === '2K') return sizeAccess.allow2K
+  if (option.value === '4K') return sizeAccess.allow4K
+  return true
+}))
 const appliedThemeMode = computed<AppliedThemeMode>(() => themeMode.value === 'system' ? systemThemeMode.value : themeMode.value)
 
 watch(() => form.model, (model) => {
@@ -298,9 +305,14 @@ async function refreshSiteBrand() {
     const brand = await fetchSiteBrand(baseurl.value)
     siteTitle.value = brand.title || '图片生成工作台'
     siteIcon.value = brand.icon || 'AI'
+    sizeAccess.allow2K = brand.allow_2k !== false
+    sizeAccess.allow4K = brand.allow_4k !== false
+    syncSizeDraft(pendingSizeSync.value)
   } catch {
     siteTitle.value = '图片生成工作台'
     siteIcon.value = 'AI'
+    sizeAccess.allow2K = true
+    sizeAccess.allow4K = true
   }
   applySiteBrandMeta()
 }
@@ -854,18 +866,34 @@ function openSizeModal() {
 }
 
 function applySize() {
+  ensureAllowedSizeBase()
   form.size = draftSize.value
+  pendingSizeSync.value = form.size
   showSizeModal.value = false
 }
 
+function ensureAllowedSizeBase() {
+  const available = availableSizeBaseOptions.value.some((option) => option.value === sizeDraft.base)
+  if (!available) sizeDraft.base = 'auto'
+}
+
 function syncSizeDraft(size: string) {
-  for (const ratio of ratioOptions) {
-    if (sizeFromRatio('1K', ratio) === size) {
-      sizeDraft.base = '1K'
-      sizeDraft.ratio = ratio
-      return
+  pendingSizeSync.value = size
+  if (size === 'auto') {
+    sizeDraft.base = 'auto'
+    return
+  }
+  for (const base of availableSizeBaseOptions.value) {
+    if (base.value === 'auto') continue
+    for (const ratio of ratioOptions) {
+      if (sizeFromRatio(base.value, ratio) === size) {
+        sizeDraft.base = base.value
+        sizeDraft.ratio = ratio
+        return
+      }
     }
   }
+  ensureAllowedSizeBase()
 }
 
 function showMessage(text: string) {
@@ -961,9 +989,12 @@ function showMessage(text: string) {
       v-if="showSizeModal"
       :current-size="form.size"
       :draft-size="draftSize"
+      :selected-base="sizeDraft.base"
       :selected-ratio="sizeDraft.ratio"
       :ratio-options="ratioOptions"
+      :size-base-options="availableSizeBaseOptions"
       @close="showSizeModal = false"
+      @select-base="sizeDraft.base = $event"
       @select-ratio="sizeDraft.ratio = $event"
       @apply="applySize"
     />

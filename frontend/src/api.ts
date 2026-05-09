@@ -21,10 +21,17 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   return data as T
 }
 
+export type SiteBrand = {
+  title: string
+  icon: string
+  allow_2k?: boolean
+  allow_4k?: boolean
+}
+
 export async function fetchSiteBrand(baseurl: string) {
   const params = new URLSearchParams()
   if (baseurl) params.set('baseurl', baseurl)
-  return request<{ title: string; icon: string }>(`/api/site-brand?${params}`)
+  return request<SiteBrand>(`/api/site-brand?${params}`)
 }
 
 function toUploadedImage(data: unknown): UploadedImage {

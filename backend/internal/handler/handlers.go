@@ -55,13 +55,19 @@ func (h *Handler) siteBrand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	brand := model.SiteBrandResponse{Title: defaultString(config.SiteTitle, "图片生成工作台"), Icon: defaultString(config.SiteIcon, "AI")}
+	brand := model.SiteBrandResponse{Title: defaultString(config.SiteTitle, "图片生成工作台"), Icon: defaultString(config.SiteIcon, "AI"), Allow2K: true, Allow4K: true}
 	if entry, ok := h.matchBaseURL(config, r.URL.Query().Get("baseurl")); ok {
 		if entry.Title != "" {
 			brand.Title = entry.Title
 		}
 		if entry.Icon != "" {
 			brand.Icon = entry.Icon
+		}
+		if entry.Allow2K != nil {
+			brand.Allow2K = *entry.Allow2K
+		}
+		if entry.Allow4K != nil {
+			brand.Allow4K = *entry.Allow4K
 		}
 	}
 	writeJSON(w, http.StatusOK, brand)

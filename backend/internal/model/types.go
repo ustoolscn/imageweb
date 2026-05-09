@@ -138,12 +138,16 @@ type SiteConfig struct {
 }
 
 type BaseURLAllowEntry struct {
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Icon  string `json:"icon,omitempty"`
+	URL     string `json:"url"`
+	Title   string `json:"title,omitempty"`
+	Icon    string `json:"icon,omitempty"`
+	Allow2K *bool  `json:"allow_2k,omitempty"`
+	Allow4K *bool  `json:"allow_4k,omitempty"`
 }
 
 type SiteBrandResponse struct {
-	Title string `json:"title"`
-	Icon  string `json:"icon"`
+	Title   string `json:"title"`
+	Icon    string `json:"icon"`
+	Allow2K bool   `json:"allow_2k"`
+	Allow4K bool   `json:"allow_4k"`
 }

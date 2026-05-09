@@ -37,16 +37,16 @@ const currentKeyword = computed({
   set: (value: string) => emit('update:keyword', value),
 })
 
-const themeLabel = computed(() => {
-  if (props.themeMode === 'system') return '浅色'
-  if (props.themeMode === 'light') return '深色'
-  return '系统'
-})
-
 const currentThemeLabel = computed(() => {
   if (props.themeMode === 'system') return '系统'
   if (props.themeMode === 'light') return '浅色'
   return '深色'
+})
+
+const currentThemeIcon = computed(() => {
+  if (props.themeMode === 'system') return '◐'
+  if (props.themeMode === 'light') return '☀'
+  return '☾'
 })
 </script>
 
@@ -95,7 +95,7 @@ const currentThemeLabel = computed(() => {
         </div>
         <button class="ghost" @click="emit('refreshPlazaItems')">刷新</button>
       </template>
-      <button class="ghost theme-toggle" :title="`当前主题：${currentThemeLabel}`" @click="emit('toggleTheme')">{{ themeLabel }}</button>
+      <button class="ghost theme-toggle" :title="`当前主题：${currentThemeLabel}`" :aria-label="`当前主题：${currentThemeLabel}`" @click="emit('toggleTheme')">{{ currentThemeIcon }}</button>
     </div>
   </header>
 </template>
