@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { PlazaItem } from '../types'
-import { displayImageURL, formatTime, taskReferenceImages } from '../lib/view'
+import { displayImageURL, formatTime, isVideoTask, taskReferenceImages } from '../lib/view'
+import AppIcon from './AppIcon.vue'
 
 defineProps<{
   item: PlazaItem
@@ -18,9 +19,10 @@ const emit = defineEmits<{
 <template>
   <div class="modal-backdrop" @click.self="emit('close')">
     <section class="detail-modal light-modal">
-      <button class="modal-close" @click="emit('close')">×</button>
+      <button class="modal-close" @click="emit('close')"><AppIcon name="close" /></button>
       <div class="detail-preview">
-        <img v-if="item.result_images?.[0]?.url" :src="displayImageURL(item.result_images[0])" alt="广场作品" title="点击查看大图" loading="lazy" decoding="async" @click="emit('openPreview', item.result_images[0].url, '广场作品', $event)" />
+        <video v-if="isVideoTask(item) && item.result_videos?.[0]?.url" :src="item.result_videos[0].url" controls playsinline preload="metadata" />
+        <img v-else-if="item.result_images?.[0]?.url" :src="displayImageURL(item.result_images[0])" alt="广场作品" title="点击查看大图" loading="lazy" decoding="async" @click="emit('openPreview', item.result_images[0].url, '广场作品', $event)" />
       </div>
       <div class="detail-info">
         <div class="detail-section detail-input-section">
@@ -40,9 +42,9 @@ const emit = defineEmits<{
           <div class="section-title">参数配置</div>
           <div class="detail-source">广场作品 · {{ item.model }} · ♥ {{ item.like_count }}</div>
           <div class="detail-params">
-            <div><span>尺寸</span><strong>{{ item.size }}</strong></div>
-            <div><span>质量</span><strong>{{ item.quality }}</strong></div>
-            <div><span>格式</span><strong>{{ item.output_format }}</strong></div>
+            <div><span>{{ isVideoTask(item) ? '分辨率' : '尺寸' }}</span><strong>{{ isVideoTask(item) ? `${item.video_width || 0}x${item.video_height || 0}` : item.size }}</strong></div>
+            <div><span>{{ isVideoTask(item) ? '比例' : '质量' }}</span><strong>{{ isVideoTask(item) ? item.video_ratio : item.quality }}</strong></div>
+            <div><span>{{ isVideoTask(item) ? '时长' : '格式' }}</span><strong>{{ isVideoTask(item) ? `${item.video_duration || 0}s` : item.output_format }}</strong></div>
             <div><span>审核</span><strong>{{ item.moderation }}</strong></div>
             <div><span>请求</span><strong>{{ item.stream ? '流式' : '普通' }}</strong></div>
           </div>
@@ -50,15 +52,15 @@ const emit = defineEmits<{
         <p class="detail-time">发布于 {{ formatTime(item.created_at) }}</p>
         <div class="detail-buttons plaza-detail-buttons">
           <button class="blue" @click="emit('reuse', item); emit('close')">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M5 16V7a2 2 0 0 1 2-2h9"/></svg>
+            <AppIcon name="copy" />
             <span>复用配置</span>
           </button>
-          <button class="purple" :disabled="!item.result_images?.[0]?.url" @click="emit('openResult', item)">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
-            <span>下载图片</span>
+          <button class="purple" :disabled="!(item.result_images?.[0]?.url || item.result_videos?.[0]?.url)" @click="emit('openResult', item)">
+            <AppIcon name="download" />
+            <span>{{ isVideoTask(item) ? '打开视频' : '下载图片' }}</span>
           </button>
           <button class="star" :class="{ favorite: item.liked }" @click="emit('toggleLike', item, $event)">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7-4.35-9.33-8.77C.87 8.82 2.8 5 6.55 5c2.06 0 3.3 1.1 4.05 2.1C11.35 6.1 12.59 5 14.65 5c3.75 0 5.68 3.82 3.88 7.23C16.2 16.65 12 21 12 21Z"/></svg>
+            <AppIcon name="favorite" />
             <span>{{ item.liked ? '取消点赞' : '点赞' }} {{ item.like_count }}</span>
           </button>
         </div>

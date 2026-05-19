@@ -1,4 +1,4 @@
-import type { CreateTaskPayload, PlazaItem, Task, UploadedImage } from './types'
+import type { CreateTaskPayload, MediaAsset, PlazaItem, Task, UploadedImage } from './types'
 
 export class APIError extends Error {
   code?: string
@@ -14,11 +14,60 @@ export class APIError extends Error {
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options)
   const text = await response.text()
-  const data = text ? JSON.parse(text) : null
+  const data = parseResponseBody(text)
   if (!response.ok) {
     throw new APIError(data?.error || `请求失败：${response.status}`, data?.code, data?.admin_contact_image)
   }
   return data as T
+}
+
+function parseResponseBody(text: string): any {
+  const trimmed = text.trim()
+  if (!trimmed) return null
+  try {
+    return JSON.parse(trimmed)
+  } catch {
+    if (trimmed.startsWith('data:')) return { text: parseSSEText(trimmed) }
+    return { text: trimmed }
+  }
+}
+
+function parseSSEText(text: string) {
+  const parts: string[] = []
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('data:')) continue
+    const payload = trimmed.slice(5).trim()
+    if (!payload || payload === '[DONE]') continue
+    try {
+      const event = JSON.parse(payload) as {
+        choices?: Array<{ delta?: { content?: unknown }; message?: { content?: unknown } }>
+        output_text?: string
+        text?: string
+      }
+      if (event.output_text) parts.push(event.output_text)
+      if (event.text) parts.push(event.text)
+      for (const choice of event.choices || []) {
+        appendContentPart(parts, choice.delta?.content)
+        appendContentPart(parts, choice.message?.content)
+      }
+    } catch {
+      parts.push(payload)
+    }
+  }
+  return parts.join('').trim()
+}
+
+function appendContentPart(parts: string[], content: unknown) {
+  if (typeof content === 'string') {
+    parts.push(content)
+    return
+  }
+  if (Array.isArray(content)) {
+    for (const item of content) {
+      if (item && typeof item === 'object' && 'text' in item && typeof item.text === 'string') parts.push(item.text)
+    }
+  }
 }
 
 export type SiteBrand = {
@@ -65,6 +114,23 @@ export async function fetchModels(baseurl: string, apikey: string) {
   })
 }
 
+export async function runLLM(payload: {
+  apikey: string
+  baseurl: string
+  model: string
+  reasoning_effort: string
+  prompt: string
+  reference_images: UploadedImage[]
+  reference_videos: MediaAsset[]
+  reference_audios: MediaAsset[]
+}) {
+  return request<{ text: string }>('/api/llm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
 export async function uploadImage(file: File): Promise<UploadedImage> {
   const form = new FormData()
   form.append('file', file)
@@ -100,7 +166,7 @@ export async function listTasks(apikey: string, baseurl: string, status: string,
   return request<{ data: Task[]; has_more: boolean; next_before_created_at: string; next_before_id: string; total: number }>(`/api/tasks?${params}`)
 }
 
-export type TaskUpdate = Pick<Task, 'id' | 'status' | 'result_images' | 'error_message' | 'elapsed_ms' | 'updated_at' | 'started_at' | 'completed_at' | 'queue_position'>
+export type TaskUpdate = Pick<Task, 'id' | 'status' | 'result_images' | 'result_videos' | 'error_message' | 'elapsed_ms' | 'updated_at' | 'started_at' | 'completed_at' | 'queue_position' | 'upstream_status' | 'upstream_progress'>
 
 export async function fetchTaskUpdates(apikey: string, baseurl: string, ids: string[]): Promise<TaskUpdate[]> {
   if (!ids.length) return []

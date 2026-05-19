@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { Task } from '../types'
 import { prettySource } from '../lib/view'
+import AppIcon from './AppIcon.vue'
 
 defineProps<{
   task: Task
@@ -14,7 +15,7 @@ const emit = defineEmits<{
 <template>
   <div class="modal-backdrop" @click.self="emit('close')">
     <section class="source-modal light-modal">
-      <button class="modal-close" @click="emit('close')">×</button>
+      <button class="modal-close" @click="emit('close')"><AppIcon name="close" /></button>
       <h2>源数据</h2>
       <div class="source-grid">
         <section>

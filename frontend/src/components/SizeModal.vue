@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { ratioPreviewStyle, type SizeBase } from '../lib/sizes'
+import AppIcon from './AppIcon.vue'
 
 type SizeBaseOption = {
   value: SizeBase
@@ -33,7 +34,7 @@ const sizeHint = computed(() => {
 <template>
   <div class="modal-backdrop" @click.self="emit('close')">
     <section class="size-modal light-modal">
-      <button class="modal-close" @click="emit('close')">×</button>
+      <button class="modal-close" @click="emit('close')"><AppIcon name="close" /></button>
       <h2>设置图像尺寸</h2>
       <p class="current-size">当前：{{ currentSize }}</p>
       <h3>清晰度</h3>
@@ -56,8 +57,8 @@ const sizeHint = computed(() => {
         <em>{{ sizeHint }}</em>
       </div>
       <div class="modal-actions-row">
-        <button class="cancel" @click="emit('close')">取消</button>
-        <button class="confirm" @click="emit('apply')">确定</button>
+        <button class="cancel" @click="emit('close')"><AppIcon name="close" />取消</button>
+        <button class="confirm" @click="emit('apply')"><AppIcon name="check" />确定</button>
       </div>
     </section>
   </div>

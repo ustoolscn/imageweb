@@ -22,6 +22,8 @@ import (
 
 	"image-web/backend/internal/config"
 	"image-web/backend/internal/model"
+
+	_ "golang.org/x/image/webp"
 )
 
 type uploader interface {
@@ -84,7 +86,7 @@ func (c *Client) UploadReader(ctx context.Context, filename string, reader io.Re
 	if c == nil || c.uploader == nil {
 		return model.UploadedImage{}, fmt.Errorf("图床未配置")
 	}
-	data, err := io.ReadAll(io.LimitReader(reader, 64<<20))
+	data, err := io.ReadAll(io.LimitReader(reader, 512<<20))
 	if err != nil {
 		return model.UploadedImage{}, err
 	}

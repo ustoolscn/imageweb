@@ -4,8 +4,8 @@ export function isFavorite(task: Pick<Task, 'favorite'>) {
   return Boolean(task.favorite)
 }
 
-export function canShareTask(task: Pick<Task, 'status' | 'result_images'>) {
-  return task.status === 'succeeded' && Boolean(task.result_images?.[0]?.url)
+export function canShareTask(task: Pick<Task, 'status' | 'result_images' | 'result_videos'>) {
+  return task.status === 'succeeded' && Boolean(task.result_images?.[0]?.url || task.result_videos?.[0]?.url)
 }
 
 export function canOpenSource(task: Pick<Task, 'status'>) {
@@ -18,6 +18,14 @@ export function taskReferenceImages(task: Pick<Task | PlazaItem, 'reference_imag
 
 export function displayImageURL(image?: UploadedImage) {
   return image?.thumbnail_url || image?.url || ''
+}
+
+export function taskResultURL(task: Pick<Task, 'result_images' | 'result_videos'>) {
+  return task.result_videos?.[0]?.url || task.result_images?.[0]?.url || ''
+}
+
+export function isVideoTask(task: Pick<Task | PlazaItem, 'task_type'>) {
+  return task.task_type === 'video_generation'
 }
 
 export function prettySource(value: string) {

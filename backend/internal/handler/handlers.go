@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	_ "image/jpeg"
 	"image/png"
 	"io"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"image-web/backend/internal/model"
 
 	"github.com/google/uuid"
+	_ "golang.org/x/image/webp"
 )
 
 type Handler struct {
@@ -32,6 +34,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/health", h.health)
 	mux.HandleFunc("/api/site-brand", h.siteBrand)
 	mux.HandleFunc("/api/models", h.models)
+	mux.HandleFunc("/api/llm", h.llm)
 	mux.HandleFunc("/api/upload", h.upload)
 	mux.HandleFunc("/api/mask-preview", h.maskPreview)
 	mux.HandleFunc("/api/plaza", h.plaza)
@@ -99,6 +102,34 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+func (h *Handler) llm(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	var req model.LLMRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.APIKey == "" || req.BaseURL == "" {
+		writeError(w, http.StatusBadRequest, "缺少 baseurl 或 apikey")
+		return
+	}
+	if strings.TrimSpace(req.Prompt) == "" && len(req.ReferenceImages) == 0 && len(req.ReferenceVideos) == 0 && len(req.ReferenceAudios) == 0 {
+		writeError(w, http.StatusBadRequest, "LLM 请求缺少输入参数")
+		return
+	}
+	if !h.allowBaseURL(w, r, req.BaseURL) {
+		return
+	}
+	text, err := h.Generator.GenerateText(r.Context(), req)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"text": text})
+}
+
 func (h *Handler) tasks(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -119,8 +150,8 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "图床未配置")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, 512<<20)
+	if err := r.ParseMultipartForm(512 << 20); err != nil {
 		writeError(w, http.StatusBadRequest, "图片上传请求无效")
 		return
 	}
@@ -227,40 +258,101 @@ func (h *Handler) createTask(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.APIKey == "" || req.BaseURL == "" || strings.TrimSpace(req.Prompt) == "" || req.Model == "" {
+	if req.APIKey == "" || req.BaseURL == "" || strings.TrimSpace(req.Prompt) == "" {
 		writeError(w, http.StatusBadRequest, "缺少必要参数")
 		return
 	}
 	if !h.allowBaseURL(w, r, req.BaseURL) {
 		return
 	}
+	taskType := inferCreateTaskType(req)
+	fmt.Println("handler create_task request:",
+		"node_kind=", req.NodeKind,
+		"req_task_type=", req.TaskType,
+		"inferred_task_type=", taskType,
+		"baseurl=", maskBaseURL(req.BaseURL),
+		"model=", req.Model,
+		"image_size=", req.Size,
+		"image_quality=", req.Quality,
+		"image_output_format=", req.OutputFormat,
+		"video_ratio=", req.VideoRatio,
+		"video_width=", req.VideoWidth,
+		"video_height=", req.VideoHeight,
+		"video_duration=", req.VideoDuration,
+		"generate_audio=", req.GenerateAudio,
+		"watermark=", req.Watermark,
+		"ref_images=", len(req.ReferenceImages),
+		"ref_videos=", len(req.ReferenceVideos),
+		"ref_audios=", len(req.ReferenceAudios),
+	)
 	task := &model.Task{
 		ID:                uuid.NewString(),
 		APIKey:            req.APIKey,
 		BaseURL:           req.BaseURL,
+		TaskType:          taskType,
 		Status:            model.TaskPending,
 		Prompt:            strings.TrimSpace(req.Prompt),
-		Model:             "gpt-image-2",
+		Model:             defaultString(req.Model, "gpt-image-2"),
 		Size:              defaultString(req.Size, "1024x1024"),
 		Quality:           defaultString(req.Quality, "auto"),
 		OutputFormat:      defaultString(req.OutputFormat, "png"),
 		OutputCompression: req.OutputCompression,
 		Background:        defaultString(req.Background, "auto"),
 		Moderation:        defaultString(req.Moderation, "low"),
+		InputFidelity:     defaultString(req.InputFidelity, "high"),
 		N:                 req.N,
 		Stream:            req.Stream,
 		ReferenceImages:   req.ReferenceImages,
+		ReferenceVideos:   cleanMediaAssets(req.ReferenceVideos, "video"),
+		ReferenceAudios:   cleanMediaAssets(req.ReferenceAudios, "audio"),
+		VideoRatio:        defaultString(req.VideoRatio, "16:9"),
+		VideoWidth:        req.VideoWidth,
+		VideoHeight:       req.VideoHeight,
+		VideoDuration:     req.VideoDuration,
+		GenerateAudio:     req.GenerateAudio,
+		Watermark:         req.Watermark,
+	}
+	if task.TaskType == model.TaskTypeVideoGeneration {
+		if task.Model == "" || isImageModel(task.Model) {
+			task.Model = "doubao-seedance-2.0"
+		}
+		normalizeVideoTaskOptions(task)
 	}
 	if task.N <= 0 {
+		task.N = 1
+	}
+	if task.TaskType == model.TaskTypeImageGeneration && task.Model == "gpt-image-2" {
 		task.N = 1
 	}
 	if task.OutputCompression < 0 || task.OutputCompression > 100 {
 		task.OutputCompression = 100
 	}
+	fmt.Println("handler create_task normalized:",
+		"id=", task.ID,
+		"task_type=", task.TaskType,
+		"status=", task.Status,
+		"baseurl=", maskBaseURL(task.BaseURL),
+		"model=", task.Model,
+		"image_size=", task.Size,
+		"image_quality=", task.Quality,
+		"image_output_format=", task.OutputFormat,
+		"image_n=", task.N,
+		"video_ratio=", task.VideoRatio,
+		"video_width=", task.VideoWidth,
+		"video_height=", task.VideoHeight,
+		"video_duration=", task.VideoDuration,
+		"generate_audio=", task.GenerateAudio,
+		"watermark=", task.Watermark,
+		"ref_images=", len(task.ReferenceImages),
+		"ref_videos=", len(task.ReferenceVideos),
+		"ref_audios=", len(task.ReferenceAudios),
+	)
 	if err := h.Store.CreateTask(r.Context(), task); err != nil {
+		fmt.Println("handler create_task store_failed:", "id=", task.ID, "task_type=", task.TaskType, "error=", err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	fmt.Println("handler create_task response:", "id=", task.ID, "task_type=", task.TaskType, "status=", task.Status)
 	writeJSON(w, http.StatusCreated, task)
 }
 
@@ -556,6 +648,13 @@ func (h *Handler) retryTask(w http.ResponseWriter, r *http.Request, id string) {
 	newTask.SharedToPlaza = false
 	newTask.ResultImages = nil
 	newTask.ResultImagesJSON = "[]"
+	newTask.ResultVideos = nil
+	newTask.ResultVideosJSON = "[]"
+	newTask.UpstreamTaskID = ""
+	newTask.UpstreamStatus = ""
+	newTask.UpstreamProgress = 0
+	newTask.NextPollAt = nil
+	newTask.PollCount = 0
 	newTask.ErrorMessage = ""
 	newTask.ElapsedMS = 0
 	newTask.StartedAt = nil
@@ -627,6 +726,20 @@ func normalizeBaseURL(value string) (string, error) {
 	return strings.TrimPrefix(parsed.String(), "//"), nil
 }
 
+func maskBaseURL(value string) string {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Host == "" {
+		return strings.TrimSpace(value)
+	}
+	if parsed.Scheme == "" {
+		parsed.Scheme = "https"
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return strings.TrimRight(parsed.String(), "/")
+}
+
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 	defer r.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
@@ -660,4 +773,148 @@ func defaultString(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func cleanMediaAssets(items []model.MediaAsset, assetType string) []model.MediaAsset {
+	clean := []model.MediaAsset{}
+	for _, item := range items {
+		item.URL = strings.TrimSpace(item.URL)
+		if item.URL == "" {
+			continue
+		}
+		if item.Type == "" {
+			item.Type = assetType
+		}
+		clean = append(clean, item)
+	}
+	return clean
+}
+
+func isImageModel(value string) bool {
+	modelName := strings.ToLower(strings.TrimSpace(value))
+	return strings.HasPrefix(modelName, "gpt-image") || strings.Contains(modelName, "image")
+}
+
+type videoCapability struct {
+	ratios            []string
+	resolutions       []string
+	minDuration       int
+	maxDuration       int
+	defaultDuration   int
+	defaultRatio      string
+	defaultResolution string
+}
+
+func normalizeVideoTaskOptions(task *model.Task) {
+	capability := videoModelCapability(task.Model)
+	if !stringIn(task.VideoRatio, capability.ratios) {
+		fmt.Println("handler video_options adjusted_ratio:", "id=", task.ID, "model=", task.Model, "from=", task.VideoRatio, "to=", capability.defaultRatio)
+		task.VideoRatio = capability.defaultRatio
+	}
+	resolution := videoResolutionFromSize(task.VideoWidth, task.VideoHeight)
+	if !stringIn(resolution, capability.resolutions) {
+		fmt.Println("handler video_options adjusted_resolution:", "id=", task.ID, "model=", task.Model, "from=", resolution, "to=", capability.defaultResolution)
+		resolution = capability.defaultResolution
+	}
+	if task.VideoDuration <= 0 {
+		task.VideoDuration = capability.defaultDuration
+	}
+	if task.VideoDuration < capability.minDuration {
+		fmt.Println("handler video_options adjusted_duration:", "id=", task.ID, "model=", task.Model, "from=", task.VideoDuration, "to=", capability.minDuration)
+		task.VideoDuration = capability.minDuration
+	}
+	if task.VideoDuration > capability.maxDuration {
+		fmt.Println("handler video_options adjusted_duration:", "id=", task.ID, "model=", task.Model, "from=", task.VideoDuration, "to=", capability.maxDuration)
+		task.VideoDuration = capability.maxDuration
+	}
+	size := videoSizeFor(task.VideoRatio, resolution)
+	task.VideoWidth = size.Width
+	task.VideoHeight = size.Height
+}
+
+func videoModelCapability(modelName string) videoCapability {
+	normalized := strings.ToLower(strings.TrimSpace(modelName))
+	if normalized == "doubao-seedance-2.0" || normalized == "doubao-seedance-2-0" {
+		return videoCapability{
+			ratios:            []string{"21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "adaptive"},
+			resolutions:       []string{"480p", "720p", "1080p"},
+			minDuration:       4,
+			maxDuration:       15,
+			defaultDuration:   5,
+			defaultRatio:      "16:9",
+			defaultResolution: "720p",
+		}
+	}
+	return videoCapability{
+		ratios:            []string{"16:9", "9:16", "1:1", "4:3", "3:4"},
+		resolutions:       []string{"480p", "720p", "1080p"},
+		minDuration:       1,
+		maxDuration:       30,
+		defaultDuration:   5,
+		defaultRatio:      "16:9",
+		defaultResolution: "720p",
+	}
+}
+
+func videoResolutionFromSize(width, height int) string {
+	shortSide := width
+	if height < shortSide || shortSide <= 0 {
+		shortSide = height
+	}
+	if shortSide >= 1000 {
+		return "1080p"
+	}
+	if shortSide >= 700 {
+		return "720p"
+	}
+	return "480p"
+}
+
+func videoSizeFor(ratio, resolution string) model.MediaAsset {
+	shortSide := 720
+	switch resolution {
+	case "480p":
+		shortSide = 480
+	case "1080p":
+		shortSide = 1080
+	}
+	switch ratio {
+	case "21:9":
+		return model.MediaAsset{Width: shortSide * 7 / 3, Height: shortSide}
+	case "9:16":
+		return model.MediaAsset{Width: shortSide, Height: shortSide * 16 / 9}
+	case "1:1":
+		return model.MediaAsset{Width: shortSide, Height: shortSide}
+	case "4:3":
+		return model.MediaAsset{Width: shortSide * 4 / 3, Height: shortSide}
+	case "3:4":
+		return model.MediaAsset{Width: shortSide, Height: shortSide * 4 / 3}
+	default:
+		return model.MediaAsset{Width: shortSide * 16 / 9, Height: shortSide}
+	}
+}
+
+func stringIn(value string, items []string) bool {
+	for _, item := range items {
+		if value == item {
+			return true
+		}
+	}
+	return false
+}
+
+func inferCreateTaskType(req model.CreateTaskRequest) model.TaskType {
+	if strings.EqualFold(strings.TrimSpace(req.NodeKind), "video") {
+		return model.TaskTypeVideoGeneration
+	}
+	if strings.EqualFold(strings.TrimSpace(req.NodeKind), "image") {
+		return model.TaskTypeImageGeneration
+	}
+	if req.TaskType == model.TaskTypeVideoGeneration {
+		return model.TaskTypeVideoGeneration
+	}
+	if req.TaskType == model.TaskTypeImageGeneration {
+		return model.TaskTypeImageGeneration
+	}
+	return model.TaskTypeImageGeneration
 }

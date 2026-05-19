@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import type { PlazaItem } from '../types'
+import { isVideoTask } from '../lib/view'
+import AppIcon from './AppIcon.vue'
 
 const loadedImages = ref(new Set<string>())
 
@@ -12,6 +14,7 @@ defineProps<{
 
 const emit = defineEmits<{
   selectItem: [item: PlazaItem]
+  openPreview: [url: string, label: string, event?: Event, maskUrl?: string]
   reuse: [item: PlazaItem]
   toggleLike: [item: PlazaItem, event: Event]
   loadMore: []
@@ -21,6 +24,10 @@ function imageUrl(item: PlazaItem) {
   return item.result_images?.[0]?.url || ''
 }
 
+function videoUrl(item: PlazaItem) {
+  return item.result_videos?.[0]?.url || ''
+}
+
 function previewImageUrl(item: PlazaItem) {
   const image = item.result_images?.[0]
   return image?.thumbnail_url || image?.url || ''
@@ -28,6 +35,10 @@ function previewImageUrl(item: PlazaItem) {
 
 function cardImageUrl(item: PlazaItem) {
   return previewImageUrl(item) || imageUrl(item)
+}
+
+function cardMediaUrl(item: PlazaItem) {
+  return isVideoTask(item) ? videoUrl(item) : cardImageUrl(item)
 }
 
 function referenceImageUrl(item: PlazaItem) {
@@ -48,6 +59,11 @@ function isImageLoaded(url?: string) {
 }
 
 function imageAspectRatio(item: PlazaItem) {
+  if (isVideoTask(item)) {
+    const width = item.video_width || item.result_videos?.[0]?.width || 16
+    const height = item.video_height || item.result_videos?.[0]?.height || 9
+    return width > 0 && height > 0 ? `${width} / ${height}` : '16 / 9'
+  }
   const match = item.size?.toLowerCase().match(/^(\d+)x(\d+)$/)
   if (!match) return '1 / 1'
   const width = Number(match[1])
@@ -62,16 +78,23 @@ function imageAspectRatio(item: PlazaItem) {
     <p>成功任务可以点击分享发布到广场，所有访问者都可以看到、复用配置和点赞。</p>
   </section>
 
-  <section class="plaza-grid">
+  <section v-if="items.length" class="plaza-grid">
     <article v-for="item in items" :key="item.id" class="plaza-card" @click="emit('selectItem', item)">
       <div
-        v-if="cardImageUrl(item)"
+        v-if="cardMediaUrl(item)"
         class="plaza-image-wrap"
-        :class="{ loaded: isImageLoaded(cardImageUrl(item)) }"
+        :class="{ loaded: isVideoTask(item) || isImageLoaded(cardImageUrl(item)) }"
         :style="{ aspectRatio: imageAspectRatio(item) }"
       >
         <div class="plaza-image-placeholder">加载中</div>
+        <template v-if="isVideoTask(item)">
+          <video class="preview-video" :src="videoUrl(item)" muted playsinline preload="metadata" />
+          <span class="preview-play-indicator" aria-hidden="true">
+            <span></span>
+          </span>
+        </template>
         <img
+          v-else
           :src="cardImageUrl(item)"
           alt="广场作品"
           loading="lazy"
@@ -92,11 +115,11 @@ function imageAspectRatio(item: PlazaItem) {
       <div v-else class="plaza-card-empty">暂无图片</div>
       <div class="plaza-card-actions" @click.stop>
         <button type="button" title="复用配置" aria-label="复用配置" @click="emit('reuse', item)">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M5 16V7a2 2 0 0 1 2-2h9"/></svg>
+          <AppIcon name="copy" />
           <span>复用</span>
         </button>
         <button type="button" :title="item.liked ? '取消点赞' : '点赞'" :aria-label="item.liked ? '取消点赞' : '点赞'" :class="{ favorite: item.liked }" @click="emit('toggleLike', item, $event)">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7-4.35-9.33-8.77C.87 8.82 2.8 5 6.55 5c2.06 0 3.3 1.1 4.05 2.1C11.35 6.1 12.59 5 14.65 5c3.75 0 5.68 3.82 3.88 7.23C16.2 16.65 12 21 12 21Z"/></svg>
+          <AppIcon name="favorite" />
           <span>{{ item.like_count }}</span>
         </button>
       </div>

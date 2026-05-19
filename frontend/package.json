@@ -5,11 +5,15 @@
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
+    "@lucide/vue": "^1.16.0",
     "@vitejs/plugin-vue": "latest",
+    "@vue-flow/core": "^1.48.2",
+    "@vue-flow/minimap": "^1.5.4",
+    "@vue-flow/node-resizer": "^1.5.1",
     "typescript": "latest",
+    "video.js": "^8.23.7",
     "vite": "latest",
     "vue": "latest",
     "vue-tsc": "latest"
-  },
-  "devDependencies": {}
+  }
 }

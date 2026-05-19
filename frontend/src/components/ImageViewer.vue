@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import type { ComponentPublicInstance } from 'vue'
 import type { PreviewImage } from '../uiTypes'
+import AppIcon from './AppIcon.vue'
 
 const props = defineProps<{
   image: PreviewImage
@@ -15,9 +16,6 @@ const emit = defineEmits<{
   setBaseImage: [element: HTMLImageElement | null]
   setCanvas: [element: HTMLCanvasElement | null]
   imageLoad: []
-  startDraw: [event: PointerEvent]
-  moveDraw: [event: PointerEvent]
-  stopDraw: [event: PointerEvent]
   clearMask: []
   saveMask: []
   'update:maskTool': [tool: 'brush' | 'eraser']
@@ -34,6 +32,9 @@ const panSpeed = 1.45
 const pointers = new Map<number, { x: number; y: number }>()
 let dragStart: { pointerId: number; x: number; y: number } | null = null
 let pinchStart: { distance: number; zoom: number; centerX: number; centerY: number; offsetX: number; offsetY: number } | null = null
+let localCanvas: HTMLCanvasElement | null = null
+let maskPaintState: { point: { x: number; y: number } } | null = null
+let activeMaskPointer: { pointerId: number; canvas: HTMLCanvasElement; tool: 'brush' | 'eraser'; brushSize: number } | null = null
 
 const zoomable = computed(() => !props.image.editable)
 const zoomStyle = computed(() => ({
@@ -159,29 +160,135 @@ function setBaseImage(element: TemplateRef) {
 }
 
 function setCanvas(element: TemplateRef) {
-  emit('setCanvas', element instanceof HTMLCanvasElement ? element : null)
+  localCanvas = element instanceof HTMLCanvasElement ? element : null
+  emit('setCanvas', localCanvas)
 }
 
 function updateBrushSize(event: Event) {
   emit('update:maskBrushSize', Number((event.target as HTMLInputElement).value))
 }
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value))
+}
+
+function maskPoint(event: PointerEvent, canvas: HTMLCanvasElement) {
+  const rect = canvas.getBoundingClientRect()
+  const scale = Math.min(rect.width / canvas.width, rect.height / canvas.height)
+  const drawnWidth = canvas.width * scale
+  const drawnHeight = canvas.height * scale
+  const offsetX = (rect.width - drawnWidth) / 2
+  const offsetY = (rect.height - drawnHeight) / 2
+  return {
+    x: clampNumber((event.clientX - rect.left - offsetX) / scale, 0, canvas.width),
+    y: clampNumber((event.clientY - rect.top - offsetY) / scale, 0, canvas.height),
+  }
+}
+
+function drawMask(event: PointerEvent, canvas: HTMLCanvasElement, connectFromLast = true) {
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  const point = maskPoint(event, canvas)
+  const tool = activeMaskPointer?.tool || props.maskTool
+  const brushSize = activeMaskPointer?.brushSize || props.maskBrushSize
+  ctx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over'
+  ctx.strokeStyle = '#fff'
+  ctx.fillStyle = '#fff'
+  ctx.lineWidth = brushSize
+  ctx.lineCap = 'round'
+  ctx.lineJoin = 'round'
+  ctx.beginPath()
+  const last = maskPaintState?.point || null
+  if (connectFromLast && last) {
+    ctx.moveTo(last.x, last.y)
+    ctx.lineTo(point.x, point.y)
+    ctx.stroke()
+  } else {
+    ctx.arc(point.x, point.y, brushSize / 2, 0, Math.PI * 2)
+    ctx.fill()
+  }
+  maskPaintState = { point }
+}
+
+function startMaskPaint(event: PointerEvent) {
+  if (!props.image.editable || event.button !== 0) return
+  event.preventDefault()
+  event.stopPropagation()
+  const canvas = event.currentTarget as HTMLCanvasElement
+  canvas.setPointerCapture(event.pointerId)
+  activeMaskPointer = { pointerId: event.pointerId, canvas, tool: props.maskTool, brushSize: props.maskBrushSize }
+  maskPaintState = null
+  window.addEventListener('pointermove', moveMaskPaintFromWindow, { passive: false })
+  window.addEventListener('pointerup', stopMaskPaintFromWindow, { passive: false })
+  window.addEventListener('pointercancel', stopMaskPaintFromWindow, { passive: false })
+  drawMask(event, canvas, false)
+}
+
+function moveMaskPaint(event: PointerEvent) {
+  event.preventDefault()
+  event.stopPropagation()
+  const canvas = event.currentTarget as HTMLCanvasElement
+  if (!isActiveMaskEvent(event)) return
+  const events = event.getCoalescedEvents?.() || [event]
+  events.forEach((item) => drawMask(item, canvas))
+}
+
+function stopMaskPaint(event: PointerEvent) {
+  event.preventDefault()
+  event.stopPropagation()
+  const canvas = event.currentTarget as HTMLCanvasElement
+  finishMaskPaint(event, canvas)
+}
+
+function moveMaskPaintFromWindow(event: PointerEvent) {
+  if (!activeMaskPointer || !isActiveMaskEvent(event)) return
+  event.preventDefault()
+  const events = event.getCoalescedEvents?.() || [event]
+  events.forEach((item) => drawMask(item, activeMaskPointer!.canvas))
+}
+
+function stopMaskPaintFromWindow(event: PointerEvent) {
+  if (!activeMaskPointer || !isActiveMaskEvent(event)) return
+  event.preventDefault()
+  finishMaskPaint(event, activeMaskPointer.canvas)
+}
+
+function isActiveMaskEvent(event: PointerEvent) {
+  return activeMaskPointer?.pointerId === event.pointerId
+}
+
+function finishMaskPaint(event: PointerEvent, canvas: HTMLCanvasElement) {
+  if (!isActiveMaskEvent(event)) return
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId)
+  window.removeEventListener('pointermove', moveMaskPaintFromWindow)
+  window.removeEventListener('pointerup', stopMaskPaintFromWindow)
+  window.removeEventListener('pointercancel', stopMaskPaintFromWindow)
+  maskPaintState = null
+  activeMaskPointer = null
+}
+
+onUnmounted(() => {
+  window.removeEventListener('pointermove', moveMaskPaintFromWindow)
+  window.removeEventListener('pointerup', stopMaskPaintFromWindow)
+  window.removeEventListener('pointercancel', stopMaskPaintFromWindow)
+})
 </script>
 
 <template>
   <div class="modal-backdrop image-viewer" @click.self="emit('close')">
     <section class="image-viewer-panel" :class="{ editable: image.editable }">
-      <button class="modal-close" @click="emit('close')">×</button>
+      <button class="modal-close" @click="emit('close')"><AppIcon name="close" /></button>
       <template v-if="image.editable">
         <div class="mask-stage">
           <img :ref="setBaseImage" :src="image.url" :alt="image.label" @load="emit('imageLoad')" />
-          <canvas :ref="setCanvas" @pointerdown="emit('startDraw', $event)" @pointermove="emit('moveDraw', $event)" @pointerup="emit('stopDraw', $event)" @pointercancel="emit('stopDraw', $event)" />
+          <canvas :ref="setCanvas" @pointerdown.stop.prevent="startMaskPaint" @pointermove.stop.prevent="moveMaskPaint" @pointerup.stop.prevent="stopMaskPaint" @pointercancel.stop.prevent="stopMaskPaint" />
         </div>
         <div class="mask-tools">
-          <button :class="{ active: maskTool === 'brush' }" @click="emit('update:maskTool', 'brush')">涂抹蒙板</button>
-          <button :class="{ active: maskTool === 'eraser' }" @click="emit('update:maskTool', 'eraser')">橡皮擦</button>
+          <button :class="{ active: maskTool === 'brush' }" @click="emit('update:maskTool', 'brush')"><AppIcon name="brush" />涂抹蒙板</button>
+          <button :class="{ active: maskTool === 'eraser' }" @click="emit('update:maskTool', 'eraser')"><AppIcon name="eraser" />橡皮擦</button>
           <label>画笔 <input :value="maskBrushSize" type="range" min="8" max="120" @input="updateBrushSize" /></label>
-          <button @click="emit('clearMask')">清空蒙板</button>
-          <button class="primary" @click="emit('saveMask')">保存蒙板</button>
+          <button @click="emit('clearMask')"><AppIcon name="trash" />清空蒙板</button>
+          <button class="primary" @click="emit('saveMask')"><AppIcon name="download" />保存蒙板</button>
         </div>
       </template>
       <div
@@ -218,7 +325,7 @@ function updateBrushSize(event: Event) {
       <div v-if="!image.editable" class="zoom-controls" @click.stop>
         <span>{{ Math.round(zoom * 100) }}%</span>
         <input :value="zoom" type="range" min="1" max="6" step="0.05" aria-label="缩放比例" @input="updateZoomFromSlider" />
-        <button type="button" @click="resetZoom">重置</button>
+        <button type="button" @click="resetZoom"><AppIcon name="resetView" />重置</button>
       </div>
       <div>{{ image.label }}{{ image.maskUrl ? ' · 蒙板' : '' }}</div>
     </section>

@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import type { Task } from '../types'
-import { canOpenSource, canShareTask, displayImageURL, isFavorite, queueText, statusClass, statusText, taskReferenceImages, timeText } from '../lib/view'
+import { canOpenSource, canShareTask, displayImageURL, isFavorite, isVideoTask, queueText, statusClass, statusText, taskReferenceImages, timeText } from '../lib/view'
+import AppIcon from './AppIcon.vue'
 
 const loadedImages = ref(new Set<string>())
 
@@ -18,6 +19,7 @@ defineProps<{
 const emit = defineEmits<{
   showAdminContact: []
   selectTask: [task: Task]
+  contextMenu: [task: Task, event: MouseEvent]
   openPreview: [url: string, label: string, event: Event, maskUrl?: string]
   openSource: [task: Task, event: Event]
   rerun: [task: Task]
@@ -59,9 +61,15 @@ function isImageLoaded(url?: string) {
     </section>
 
     <section class="grid">
-      <article v-for="task in tasks" :key="task.id" class="task-card" :class="statusClass(task.status)" @click="emit('selectTask', task)">
+      <article v-for="task in tasks" :key="task.id" class="task-card" :class="statusClass(task.status)" @click="emit('selectTask', task)" @contextmenu.prevent.stop="emit('contextMenu', task, $event)">
         <div class="preview" :class="task.status">
-          <div v-if="task.result_images?.[0]?.url" class="preview-image-wrap" :class="{ loaded: isImageLoaded(displayImageURL(task.result_images[0])) }">
+          <template v-if="isVideoTask(task) && task.result_videos?.[0]?.url">
+            <video class="preview-video" :src="task.result_videos[0].url" muted playsinline preload="metadata" />
+            <span class="preview-play-indicator" aria-hidden="true">
+              <span></span>
+            </span>
+          </template>
+          <div v-else-if="task.result_images?.[0]?.url" class="preview-image-wrap" :class="{ loaded: isImageLoaded(displayImageURL(task.result_images[0])) }">
             <div class="task-image-placeholder">加载中</div>
             <img :src="displayImageURL(task.result_images[0])" alt="生成结果" loading="lazy" decoding="async" @load="markImageLoaded(displayImageURL(task.result_images[0]))" />
           </div>
@@ -69,6 +77,7 @@ function isImageLoaded(url?: string) {
             <span v-if="task.status === 'running'" class="spinner"></span>
             <span v-else class="state-icon">{{ task.status === 'failed' ? '!' : '...' }}</span>
             <strong>{{ statusText(task.status) }}</strong>
+            <small v-if="isVideoTask(task) && task.upstream_progress">{{ task.upstream_progress }}%</small>
             <small v-if="queueText(task)">{{ queueText(task) }}</small>
           </div>
           <span class="time">◷ {{ timeText(task, clock) }}</span>
@@ -93,19 +102,19 @@ function isImageLoaded(url?: string) {
           </div>
           <div class="actions" @click.stop>
             <button title="查看源数据" aria-label="查看源数据" :disabled="!canOpenSource(task)" @click="emit('openSource', task, $event)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7h8M8 12h8M8 17h5"/><rect x="5" y="3" width="14" height="18" rx="2"/></svg>
+              <AppIcon name="file" />
             </button>
             <button title="重新生成" aria-label="重新生成" @click="emit('rerun', task)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v6h-6"/></svg>
+              <AppIcon name="refresh" />
             </button>
             <button :title="isFavorite(task) ? '取消收藏' : '收藏'" :aria-label="isFavorite(task) ? '取消收藏' : '收藏'" :class="{ favorite: isFavorite(task) }" @click="emit('toggleFavorite', task, $event)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.8 5.67 6.26.91-4.53 4.42 1.07 6.23L12 17.28l-5.6 2.95 1.07-6.23-4.53-4.42 6.26-.91L12 3Z"/></svg>
+              <AppIcon name="favorite" />
             </button>
             <button title="复用配置" aria-label="复用配置" @click="emit('reuse', task)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M5 16V7a2 2 0 0 1 2-2h9"/></svg>
+              <AppIcon name="copy" />
             </button>
             <button :title="task.shared_to_plaza ? '取消广场分享' : '分享到广场'" :aria-label="task.shared_to_plaza ? '取消广场分享' : '分享到广场'" :class="{ favorite: task.shared_to_plaza }" :disabled="!canShareTask(task)" @click="emit('toggleShare', task, $event)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12v7a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-7"/><path d="M16 6l-4-4-4 4"/><path d="M12 2v13"/></svg>
+              <AppIcon name="share" />
             </button>
           </div>
         </div>
