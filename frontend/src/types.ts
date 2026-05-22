@@ -6,6 +6,7 @@ export interface UploadedImage {
   filename?: string
   node_id?: string
   reference_label?: string
+  video_frame_role?: 'first_frame' | 'last_frame' | ''
   mask_reference_label?: string
   original_size?: number
   compressed_size?: number
@@ -64,6 +65,7 @@ export interface Task {
   video_height?: number
   video_duration?: number
   generate_audio?: boolean
+  draft?: boolean
   watermark?: boolean
   error_message: string
   elapsed_ms: number
@@ -100,12 +102,16 @@ export interface CreateTaskPayload {
   video_height?: number
   video_duration?: number
   generate_audio?: boolean
+  draft?: boolean
   watermark?: boolean
 }
 
 export interface PlazaItem {
   id: string
+  item_type?: 'task' | 'canvas'
   task_id: string
+  canvas_name?: string
+  canvas?: unknown
   task_type: 'image_generation' | 'video_generation'
   prompt: string
   model: string
@@ -130,6 +136,7 @@ export interface PlazaItem {
   video_height?: number
   video_duration?: number
   generate_audio?: boolean
+  draft?: boolean
   watermark?: boolean
   like_count: number
   liked: boolean

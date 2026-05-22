@@ -39,7 +39,7 @@ func redactBase64Fields(value any) {
 	switch typed := value.(type) {
 	case map[string]any:
 		for key, child := range typed {
-			if key == "b64_json" || key == "data" {
+			if key == "b64_json" || key == "data" || key == "thoughtSignature" {
 				if text, ok := child.(string); ok && text != "" {
 					typed[key] = fmt.Sprintf("[base64 image omitted, %d chars]", len(text))
 				}

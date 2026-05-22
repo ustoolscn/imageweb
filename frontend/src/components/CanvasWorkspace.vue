@@ -1,27 +1,31 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { ConnectionLineType, ConnectionMode, Handle, MarkerType, Position, VueFlow, useVueFlow, type Connection, type Edge, type EdgeChange, type EdgeMouseEvent, type EdgeUpdateEvent, type Node, type NodeChange, type NodeDragEvent, type ViewportTransform } from '@vue-flow/core'
+import { computed, nextTick, onActivated, onMounted, onUnmounted, ref, watch } from 'vue'
+import { ConnectionLineType, ConnectionMode, Handle, Position, VueFlow, useVueFlow, type Connection, type Edge, type EdgeChange, type EdgeMouseEvent, type EdgeUpdateEvent, type Node, type NodeChange, type NodeDragEvent, type ViewportTransform } from '@vue-flow/core'
 import { MiniMap } from '@vue-flow/minimap'
 import '@vue-flow/minimap/dist/style.css'
-import { listTasks, uploadImage } from '../api'
+import { fetchCanvases, listTasks, saveCanvasesCloud, uploadImage } from '../api'
 import type { MediaAsset, Task, UploadedImage } from '../types'
 import type { CanvasLLMPayload, CanvasRunPayload, ImageForm } from '../uiTypes'
-import { normalizeVideoSettings, videoModelCapability, videoRatioOptions, videoResolutionOptions } from '../lib/videoModels'
+import { normalizeVideoSettings, supportsVideoDraft, videoModelCapability, videoRatioLabel, videoRatioOptions, videoResolutionOptions } from '../lib/videoModels'
 import { nanoBananaRatios, nanoBananaSizeBaseOptions, nanoBananaSizeValue, parseNanoBananaSize, parseSeedreamSize, ratioOptions, seedreamRatios, seedreamSizeBaseOptions, seedreamSizeValue, sizeBaseOptions, sizeFromRatio } from '../lib/sizes'
 import { displayImageURL, isVideoTask } from '../lib/view'
+import { ensureVideoCover, videoCoverURL } from '../lib/videoCover'
 import AppIcon from './AppIcon.vue'
 import CanvasVideoPlayer from './CanvasVideoPlayer.vue'
-import RatioPicker from './RatioPicker.vue'
+import InlineSelect from './InlineSelect.vue'
+import ViewControl3D from './ViewControl3D.vue'
 
 type MediaNodeKind = 'image_media' | 'video_media' | 'audio_media'
 type GenerateNodeKind = 'llm' | 'image' | 'video' | 'audio'
-type NodeKind = MediaNodeKind | 'asset' | 'ai' | 'prompt' | 'merge' | GenerateNodeKind | 'mask'
+type NodeKind = MediaNodeKind | 'asset' | 'ai' | 'prompt' | 'merge' | 'view_control' | GenerateNodeKind | 'mask' | 'tail_frame'
 
 type CanvasElement = {
   id: string
   kind: NodeKind
   badge?: string
   task_id?: string
+  task_snapshot?: Task
+  generated_params?: string[]
   media_type?: 'image' | 'video' | 'audio'
   media_url?: string
   media_thumbnail_url?: string
@@ -39,6 +43,10 @@ type CanvasElement = {
   video_ratio?: string
   video_resolution?: ImageForm['video_resolution']
   video_duration?: number
+  video_draft?: boolean
+  video_frame_role?: UploadedImage['video_frame_role']
+  video_first_frame_source_id?: string
+  video_last_frame_source_id?: string
   video_clip_start?: number
   video_clip_end?: number
   reasoning_effort?: string
@@ -52,6 +60,13 @@ type CanvasElement = {
   image_view_scale?: number
   image_view_x?: number
   image_view_y?: number
+  view_azimuth?: number
+  view_elevation?: number
+  view_roll?: number
+  view_distance?: number
+  view_scene_yaw?: number
+  view_scene_pitch?: number
+  view_scene_zoom?: number
   x: number
   y: number
   width: number
@@ -61,11 +76,16 @@ type CanvasElement = {
 type CanvasConnection = { id: string; from: string; to: string }
 type BoardCanvas = { id: string; name: string; elements: CanvasElement[]; connections: CanvasConnection[] }
 type CanvasContextMenuItem = { label: string; icon?: string; action: () => void; disabled?: boolean; danger?: boolean }
+type CanvasContextMenuState = { x: number; y: number; items: CanvasContextMenuItem[] }
 type NodeValueType = 'text' | 'image' | 'video' | 'audio' | 'merge'
 type DragState =
   | { type: 'pan'; startX: number; startY: number; originX: number; originY: number }
   | { type: 'node'; id: string; startX: number; startY: number; originX: number; originY: number }
   | { type: 'resize'; id: string; startX: number; startY: number; originWidth: number; originHeight: number }
+  | null
+type ViewControlDragState =
+  | { type: 'scene'; elementID: string; startX: number; startY: number; originYaw: number; originPitch: number }
+  | { type: 'camera'; elementID: string; target: HTMLElement }
   | null
 
 const props = defineProps<{
@@ -75,6 +95,8 @@ const props = defineProps<{
   defaultForm: ImageForm
   models: string[]
   submitting: boolean
+  sharedCanvasIds?: string[]
+  canvasImport?: { token: number; canvas: unknown } | null
   runNodeAction?: (payload: CanvasRunPayload, applyTask: (task: Task) => void) => Promise<unknown> | void
   runLlmAction?: (payload: CanvasLLMPayload, applyResult: (text: string) => void) => Promise<unknown> | void
 }>()
@@ -83,10 +105,17 @@ const emit = defineEmits<{
   selectTask: [task: Task]
   runNode: [payload: CanvasRunPayload, applyTask: (task: Task) => void]
   runLlm: [payload: CanvasLLMPayload, applyResult: (text: string) => void]
+  shareCanvas: [canvas: BoardCanvas]
+  unshareCanvas: [canvasID: string]
   zenModeChange: [enabled: boolean]
+  closeContextMenu: []
+  ready: []
 }>()
 
 const STORAGE_KEY = 'image_web_canvases'
+const IMAGE_MODEL_OPTIONS = ['gpt-image-2', 'nano-banana-2', 'doubao-seedream-5.0-lite']
+const VIDEO_MODEL_OPTIONS = ['doubao-seedance-2.0', 'doubao-seedance-1.5-pro']
+const ASSET_PAGE_SIZE = 30
 const MIN_ZOOM = 0.2
 const MAX_ZOOM = 3
 const canvases = ref<BoardCanvas[]>(loadCanvases())
@@ -107,7 +136,10 @@ const runningLineIDs = ref<Set<string>>(new Set())
 const nodeRunState = ref<Record<string, { status: 'running' | 'succeeded' | 'failed'; startedAt: number; endedAt?: number; message?: string }>>({})
 const runtimeNow = ref(Date.now())
 const assetSearch = ref('')
+const assetQuery = ref('')
 const assetTasks = ref<Task[]>([])
+const assetPages = ref<Task[][]>([])
+const assetPageIndex = ref(0)
 const assetLoaded = ref(false)
 const assetLoading = ref(false)
 const assetHasMore = ref(false)
@@ -115,39 +147,86 @@ const assetTotal = ref(0)
 const assetNextBeforeCreatedAt = ref('')
 const assetNextBeforeID = ref('')
 const assetError = ref('')
-const canvasContextMenu = ref<{ x: number; y: number; items: CanvasContextMenuItem[] } | null>(null)
+const canvasContextMenu = ref<CanvasContextMenuState | null>(null)
 const canvasNotice = ref('')
 const pendingFlowConnection = ref<{ nodeId: string; handleType: 'source' | 'target' } | null>(null)
 const suppressFlowConnectEnd = ref(false)
+const renameDialog = ref<{ canvasID: string; value: string } | null>(null)
+const renameInput = ref<HTMLInputElement | null>(null)
+const deleteDialog = ref<{ canvasID: string; name: string } | null>(null)
 const mediaUrlEditor = ref<{ elementID: string; value: string } | null>(null)
-const mentionMenu = ref<{ elementID: string; query: string; activeIndex: number } | null>(null)
+const mentionMenu = ref<{ elementID: string; query: string; start: number; end: number; activeIndex: number } | null>(null)
+const suppressCanvasMentionAfterDelete = ref(false)
+const composingEditorIDs = new Set<string>()
 const maskPaintState = ref<{ elementID: string; point: { x: number; y: number } } | null>(null)
 const activeMaskPointer = ref<{ elementID: string; pointerId: number; canvas: HTMLCanvasElement; element: CanvasElement } | null>(null)
+const viewControlDrag = ref<ViewControlDragState>(null)
 const spacePanning = ref(false)
 const selectedNodeIDs = ref<Set<string>>(new Set())
+const hideInspectorDuringDrag = ref(false)
+const modelMenuElementID = ref('')
 const showMiniMap = ref(true)
 const miniMapVisibleBeforeZen = ref(true)
 const imageViewByNodeID = ref<Record<string, { scale: number; x: number; y: number }>>({})
 const loadedCanvasImages = ref<Record<string, 'loaded' | 'error'>>({})
 const imagePanState = ref<{ elementID: string; startX: number; startY: number; originX: number; originY: number } | null>(null)
+const videoFrameTimeByNodeID = ref<Record<string, number>>({})
+const videoDurationByNodeID = ref<Record<string, number>>({})
 const activeMaskElementID = ref('')
 const hoveredMaskElementID = ref('')
 const maskCursor = ref<{ elementID: string; x: number; y: number; size: number; visible: boolean }>({ elementID: '', x: 0, y: 0, size: 0, visible: false })
 const maskResizeObservers = new WeakMap<HTMLElement, ResizeObserver>()
 const activeMaskResizeObservers = new Set<ResizeObserver>()
 const gptImageSizeBaseOptions = computed(() => sizeBaseOptions.filter((option) => option.value !== '512'))
+const inspectedElement = computed(() => {
+  const ids = Array.from(selectedNodeIDs.value).filter((id) => Boolean(elementByID(id)))
+  const id = ids[ids.length - 1]
+  return id ? elementByID(id) : null
+})
+const modelMenuOpen = computed(() => Boolean(inspectedElement.value && modelMenuElementID.value === inspectedElement.value.id))
+const inspectorStyle = computed(() => {
+  const element = inspectedElement.value
+  if (!element || typeof window === 'undefined') return {}
+  const size = renderedNodeSize(element)
+  const panelScale = zoom.value
+  const gap = 12
+  const nodeLeft = element.x * zoom.value + pan.value.x
+  const nodeTop = element.y * zoom.value + pan.value.y
+  const nodeRight = nodeLeft + size.width * zoom.value
+  return {
+    left: `${nodeRight + gap}px`,
+    top: `${nodeTop}px`,
+    transform: `scale(${panelScale})`,
+    transformOrigin: 'top left',
+  }
+})
 let assetRefreshTimer = 0
 let runtimeTimer = 0
 let historyTimer = 0
+let cloudSaveTimer = 0
 let restoringHistory = false
+let loadingCloudCanvases = false
+let lastCloudSavePayload = ''
+let lastCanvasImportToken = 0
+let readySequence = 0
 const handledCtrlWheelEvents = new WeakSet<WheelEvent>()
 const camera = { x: pan.value.x, y: pan.value.y, zoom: zoom.value }
 const flow = useVueFlow('canvas-flow')
 
 const activeCanvas = computed(() => canvases.value.find((canvas) => canvas.id === activeCanvasID.value) || canvases.value[0])
+const activeCanvasShared = computed(() => Boolean(activeCanvas.value && (props.sharedCanvasIds || []).includes(activeCanvas.value.id)))
 const usableTasks = computed(() => props.tasks.filter(hasMediaAsset))
-const visibleAssetTasks = computed(() => assetLoaded.value ? assetTasks.value : usableTasks.value)
+const visibleAssetTasks = computed(() => {
+  if (assetLoaded.value) return assetPages.value[assetPageIndex.value] || assetTasks.value
+  const query = assetQuery.value.trim().toLowerCase()
+  const items = query ? usableTasks.value.filter(assetSearchMatches) : usableTasks.value
+  return items.slice(assetPageIndex.value * ASSET_PAGE_SIZE, (assetPageIndex.value + 1) * ASSET_PAGE_SIZE)
+})
+const assetPageCount = computed(() => Math.max(1, Math.ceil((assetTotal.value || 0) / ASSET_PAGE_SIZE)))
+const canPrevAssetPage = computed(() => assetPageIndex.value > 0)
+const canNextAssetPage = computed(() => assetLoaded.value ? assetHasMore.value || assetPageIndex.value + 1 < assetPages.value.length : assetPageIndex.value + 1 < assetPageCount.value)
 const zoomLabel = computed(() => `${Math.round(zoom.value * 100)}%`)
+const canvasOptions = computed(() => canvases.value.map((canvas) => ({ value: canvas.id, label: canvas.name })))
 const canUndo = computed(() => canvasHistory.value.length > 1 || serializeCanvasStructure(canvases.value) !== latestHistoryStructure())
 const canvasStyle = computed(() => ({
   '--canvas-x': `${pan.value.x}px`,
@@ -187,14 +266,13 @@ const flowEdges = computed<Edge[]>(() => (activeCanvas.value?.connections || [])
     'canvas-flow-edge': true,
     'is-running': isConnectionRunning(connection),
     'is-muted': isConnectionMuted(connection),
+    'is-connected-to-selection': isConnectionConnectedToSelection(connection),
   },
-  markerEnd: { type: MarkerType.ArrowClosed, color: edgeColor(connection) },
   style: { stroke: edgeColor(connection) },
   zIndex: connectionZIndex(connection),
 })))
 const flowDefaultEdgeOptions = {
   type: 'default',
-  markerEnd: { type: MarkerType.ArrowClosed, color: 'rgba(190, 190, 190, .64)' },
   style: { stroke: 'rgba(190, 190, 190, .58)', strokeWidth: 2.5 },
 }
 const flowConnectionLineOptions = {
@@ -203,10 +281,23 @@ const flowConnectionLineOptions = {
 }
 watch(canvases, () => {
   saveCanvases()
+  queueCloudCanvasSave()
   if (!restoringHistory) queueCanvasHistorySnapshot()
 }, { deep: true })
-watch([assetSearch, () => props.apikey, () => props.baseurl], () => queueAssetRefresh(), { immediate: true })
+watch([() => props.apikey, () => props.baseurl], () => loadCloudCanvases(), { immediate: true })
+watch([() => props.apikey, () => props.baseurl], () => queueAssetRefresh(), { immediate: true })
+watch(() => props.canvasImport?.token, (token) => {
+  if (!token || token === lastCanvasImportToken || !props.canvasImport?.canvas) return
+  lastCanvasImportToken = token
+  importCanvasTemplate(props.canvasImport.canvas)
+}, { immediate: true })
 watch(usableTasks, (tasks) => syncUsableTasksToAssets(tasks), { deep: true })
+watch(assetTasks, (tasks) => {
+  tasks.forEach((task) => {
+    const video = task.result_videos?.[0]
+    if (isVideoTask(task) && video?.url && !video.thumbnail_url) ensureVideoCover(video.url).catch(() => {})
+  })
+}, { immediate: true, deep: true })
 watch(showAssets, (visible) => {
   if (visible && !assetTasks.value.length) queueAssetRefresh()
 })
@@ -218,18 +309,54 @@ onMounted(() => {
   window.addEventListener('keydown', onCanvasKeyDown)
   window.addEventListener('keyup', onCanvasKeyUp)
   window.addEventListener('wheel', preventBrowserZoomWheel, { capture: true, passive: false })
+  window.addEventListener('app-context-menu-opened', closeCanvasContextMenu)
+  queueCanvasReady()
+})
+
+onActivated(() => {
+  queueCanvasReady()
 })
 
 onUnmounted(() => {
+  readySequence += 1
   if (runtimeTimer) window.clearInterval(runtimeTimer)
   if (historyTimer) window.clearTimeout(historyTimer)
+  if (cloudSaveTimer) window.clearTimeout(cloudSaveTimer)
   if (zenMode.value) emit('zenModeChange', false)
   activeMaskResizeObservers.forEach((observer) => observer.disconnect())
   activeMaskResizeObservers.clear()
   window.removeEventListener('keydown', onCanvasKeyDown)
   window.removeEventListener('keyup', onCanvasKeyUp)
   window.removeEventListener('wheel', preventBrowserZoomWheel, { capture: true })
+  window.removeEventListener('app-context-menu-opened', closeCanvasContextMenu)
 })
+
+async function queueCanvasReady() {
+  const sequence = ++readySequence
+  await nextTick()
+  await waitForAnimationFrame()
+  await waitForAnimationFrame()
+  await waitForCanvasFrame(sequence)
+  if (sequence === readySequence) emit('ready')
+}
+
+function waitForAnimationFrame() {
+  return new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()))
+}
+
+async function waitForCanvasFrame(sequence: number) {
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    if (sequence !== readySequence) return
+    const frame = document.querySelector<HTMLElement>('.canvas-flow .vue-flow__pane')
+    const rect = frame?.getBoundingClientRect()
+    if (rect && rect.width > 0 && rect.height > 0) return
+    await waitForAnimationFrame()
+  }
+}
+
+function closeCanvasContextMenu() {
+  canvasContextMenu.value = null
+}
 
 function isTextInputTarget(target: EventTarget | null) {
   return target instanceof HTMLElement && Boolean(target.closest('input, textarea, select, [contenteditable="true"]'))
@@ -403,6 +530,7 @@ function normalizeCanvases(raw: unknown): BoardCanvas[] {
 
 
 function normalizeElement(raw: Partial<CanvasElement>, index = 0): CanvasElement {
+  const rawWithLegacy = raw as Partial<CanvasElement> & { draft?: boolean }
   const rawKind = raw.kind || 'media'
   const kind = normalizeNodeKind(rawKind, raw.media_type, raw.task_type)
   const minSize = minNodeSize(kind)
@@ -413,6 +541,8 @@ function normalizeElement(raw: Partial<CanvasElement>, index = 0): CanvasElement
     kind,
     badge: typeof raw.badge === 'string' ? raw.badge : '',
     task_id: raw.task_id,
+    task_snapshot: raw.task_snapshot && typeof raw.task_snapshot === 'object' ? raw.task_snapshot as Task : undefined,
+    generated_params: Array.isArray(raw.generated_params) ? raw.generated_params.filter((item) => typeof item === 'string') : undefined,
     media_type: raw.media_type,
     media_url: raw.media_url || '',
     media_thumbnail_url: raw.media_thumbnail_url || '',
@@ -430,11 +560,15 @@ function normalizeElement(raw: Partial<CanvasElement>, index = 0): CanvasElement
     video_ratio: raw.video_ratio || '',
     video_resolution: raw.video_resolution,
     video_duration: raw.video_duration,
+    video_draft: supportsVideoDraft(raw.model) ? Boolean(raw.video_draft ?? rawWithLegacy.draft) : false,
+    video_frame_role: normalizeVideoFrameRole(raw.video_frame_role),
+    video_first_frame_source_id: raw.video_first_frame_source_id || '',
+    video_last_frame_source_id: raw.video_last_frame_source_id || '',
     video_clip_start: Number(raw.video_clip_start) || 0,
     video_clip_end: Number(raw.video_clip_end) || 0,
     reasoning_effort: raw.reasoning_effort || 'low',
     generate_audio: raw.generate_audio,
-    watermark: raw.watermark,
+    watermark: false,
     mask_data_url: raw.mask_data_url || '',
     mask_tool: raw.mask_tool || 'brush',
     mask_brush_size: raw.mask_brush_size || 32,
@@ -443,6 +577,13 @@ function normalizeElement(raw: Partial<CanvasElement>, index = 0): CanvasElement
     image_view_scale: Number.isFinite(raw.image_view_scale) ? Number(raw.image_view_scale) : 1,
     image_view_x: Number.isFinite(raw.image_view_x) ? Number(raw.image_view_x) : 0,
     image_view_y: Number.isFinite(raw.image_view_y) ? Number(raw.image_view_y) : 0,
+    view_azimuth: Number.isFinite(raw.view_azimuth) ? normalizeAzimuth(Number(raw.view_azimuth)) : 30,
+    view_elevation: Number.isFinite(raw.view_elevation) ? clamp(Number(raw.view_elevation), -60, 60) : 0,
+    view_roll: Number.isFinite(raw.view_roll) ? clamp(Number(raw.view_roll), -45, 45) : 0,
+    view_distance: Number.isFinite(raw.view_distance) ? clamp(Number(raw.view_distance), 0, 100) : 50,
+    view_scene_yaw: Number.isFinite(raw.view_scene_yaw) ? normalizeAzimuth(Number(raw.view_scene_yaw)) : -28,
+    view_scene_pitch: Number.isFinite(raw.view_scene_pitch) ? clamp(Number(raw.view_scene_pitch), -65, 65) : 18,
+    view_scene_zoom: Number.isFinite(raw.view_scene_zoom) ? clamp(Number(raw.view_scene_zoom), 0.72, 1.7) : 1,
     x: Number(raw.x) || 0,
     y: Number(raw.y) || 0,
     width: Math.max(minSize.width, Number(raw.width) || fallbackWidth),
@@ -452,7 +593,7 @@ function normalizeElement(raw: Partial<CanvasElement>, index = 0): CanvasElement
 
 function normalizeNodeKind(rawKind: string, mediaType?: CanvasElement['media_type'], taskType?: ImageForm['task_type']): NodeKind {
   if (rawKind === 'media') return mediaKindFromType(mediaType || 'image')
-  if (rawKind === 'image_media' || rawKind === 'video_media' || rawKind === 'audio_media' || rawKind === 'asset' || rawKind === 'ai' || rawKind === 'image' || rawKind === 'video' || rawKind === 'audio' || rawKind === 'llm' || rawKind === 'mask' || rawKind === 'prompt' || rawKind === 'merge') return rawKind
+  if (rawKind === 'image_media' || rawKind === 'video_media' || rawKind === 'audio_media' || rawKind === 'asset' || rawKind === 'ai' || rawKind === 'image' || rawKind === 'video' || rawKind === 'audio' || rawKind === 'llm' || rawKind === 'mask' || rawKind === 'tail_frame' || rawKind === 'prompt' || rawKind === 'merge' || rawKind === 'view_control') return rawKind
   return taskType === 'video_generation' ? 'video' : 'image'
 }
 
@@ -475,6 +616,45 @@ function isMediaKind(kind: NodeKind) {
 
 function saveCanvases() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(canvases.value))
+}
+
+async function loadCloudCanvases() {
+  if (!props.apikey || !props.baseurl) return
+  try {
+    loadingCloudCanvases = true
+    const result = await fetchCanvases(props.apikey, props.baseurl)
+    const cloudCanvases = normalizeCanvases(result.canvases)
+    if (cloudCanvases.length && cloudCanvases.some((canvas) => canvas.elements.length || canvas.connections.length)) {
+      canvases.value = cloudCanvases
+      if (!cloudCanvases.some((canvas) => canvas.id === activeCanvasID.value)) activeCanvasID.value = cloudCanvases[0]?.id || ''
+      lastCloudSavePayload = serializeCanvases(canvases.value)
+      saveCanvases()
+    } else {
+      queueCloudCanvasSave()
+    }
+  } catch (error) {
+    console.warn('[canvas-cloud] load failed', error)
+  } finally {
+    loadingCloudCanvases = false
+  }
+}
+
+function queueCloudCanvasSave() {
+  if (loadingCloudCanvases || !props.apikey || !props.baseurl) return
+  window.clearTimeout(cloudSaveTimer)
+  cloudSaveTimer = window.setTimeout(() => saveCanvasesToCloud(), 900)
+}
+
+async function saveCanvasesToCloud() {
+  if (!props.apikey || !props.baseurl) return
+  const payload = serializeCanvases(canvases.value)
+  if (payload === lastCloudSavePayload) return
+  try {
+    await saveCanvasesCloud(props.apikey, props.baseurl, canvases.value)
+    lastCloudSavePayload = payload
+  } catch (error) {
+    console.warn('[canvas-cloud] save failed', error)
+  }
 }
 
 function serializeCanvases(value: BoardCanvas[]) {
@@ -541,6 +721,8 @@ function mergeElementStructure(target: CanvasElement, current?: CanvasElement): 
     ...target,
     badge: current.badge,
     task_id: current.task_id,
+    task_snapshot: current.task_snapshot,
+    generated_params: current.generated_params,
     media_type: current.media_type,
     media_url: current.media_url,
     media_thumbnail_url: current.media_thumbnail_url,
@@ -558,11 +740,15 @@ function mergeElementStructure(target: CanvasElement, current?: CanvasElement): 
     video_ratio: current.video_ratio,
     video_resolution: current.video_resolution,
     video_duration: current.video_duration,
+    video_draft: current.video_draft,
+    video_frame_role: current.video_frame_role,
+    video_first_frame_source_id: current.video_first_frame_source_id,
+    video_last_frame_source_id: current.video_last_frame_source_id,
     video_clip_start: current.video_clip_start,
     video_clip_end: current.video_clip_end,
     reasoning_effort: current.reasoning_effort,
     generate_audio: current.generate_audio,
-    watermark: current.watermark,
+    watermark: false,
     mask_data_url: current.mask_data_url,
     mask_tool: current.mask_tool,
     mask_brush_size: current.mask_brush_size,
@@ -617,25 +803,115 @@ function createID() {
   return crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
+function nextCanvasName() {
+  const names = new Set(canvases.value.map((canvas) => canvas.name.trim()))
+  let index = canvases.value.length + 1
+  while (names.has(`画布 ${index}`)) index += 1
+  return `画布 ${index}`
+}
+
 function createCanvas() {
-  const next = { id: createID(), name: `画布 ${canvases.value.length + 1}`, elements: [], connections: [] }
+  const next = { id: createID(), name: nextCanvasName(), elements: [], connections: [] }
   canvases.value.push(next)
   activeCanvasID.value = next.id
   resetView()
 }
 
-function renameCanvas() {
+function shareActiveCanvas() {
   if (!activeCanvas.value) return
-  const name = window.prompt('画布名称', activeCanvas.value.name)
-  if (name?.trim()) activeCanvas.value.name = name.trim()
+  const canvas = JSON.parse(JSON.stringify(activeCanvas.value)) as BoardCanvas
+  canvas.elements = canvas.elements.map((element) => {
+    const task = taskForElement(element)
+    return task ? { ...element, task_snapshot: { ...task } } : element
+  })
+  emit('shareCanvas', canvas)
 }
 
-function deleteCanvas() {
+function toggleActiveCanvasShare() {
+  if (!activeCanvas.value) return
+  if (activeCanvasShared.value) emit('unshareCanvas', activeCanvas.value.id)
+  else shareActiveCanvas()
+}
+
+function importCanvasTemplate(raw: unknown) {
+  const source = normalizeCanvases([raw])[0]
+  if (!source) {
+    showCanvasNotice('画布模板无效')
+    return
+  }
+  const idMap = new Map<string, string>()
+  const elements = source.elements.map((element) => {
+    const id = createID()
+    idMap.set(element.id, id)
+    const next = { ...element, id, task_id: undefined, zIndex: (Number(element.zIndex) || 0) + maxCanvasZIndex() + 1 }
+    return next
+  })
+  const connections = source.connections
+    .map((connection) => ({ id: createID(), from: idMap.get(connection.from) || '', to: idMap.get(connection.to) || '' }))
+    .filter((connection) => connection.from && connection.to)
+  const imported: BoardCanvas = {
+    id: createID(),
+    name: nextImportedCanvasName(source.name),
+    elements,
+    connections,
+  }
+  canvases.value.push(imported)
+  activeCanvasID.value = imported.id
+  showCanvasNotice('已导入广场画布，可直接修改或运行')
+  nextTick(() => resetView())
+}
+
+function nextImportedCanvasName(name: string) {
+  const base = `${(name || '广场画布').trim()} 副本`
+  const names = new Set(canvases.value.map((canvas) => canvas.name.trim()))
+  if (!names.has(base)) return base
+  let index = 2
+  while (names.has(`${base} ${index}`)) index += 1
+  return `${base} ${index}`
+}
+
+function openRenameCanvas() {
+  if (!activeCanvas.value) return
+  renameDialog.value = { canvasID: activeCanvas.value.id, value: activeCanvas.value.name }
+  nextTick(() => {
+    renameInput.value?.focus()
+    renameInput.value?.select()
+  })
+}
+
+function closeRenameCanvas() {
+  renameDialog.value = null
+}
+
+function confirmRenameCanvas() {
+  const dialog = renameDialog.value
+  if (!dialog) return
+  const canvas = canvases.value.find((item) => item.id === dialog.canvasID)
+  const name = dialog.value.trim()
+  if (canvas && name) canvas.name = name
+  closeRenameCanvas()
+}
+
+function openDeleteCanvas() {
   if (!activeCanvas.value || canvases.value.length <= 1) return
-  if (!window.confirm('确定删除当前画布？')) return
-  const index = canvases.value.findIndex((canvas) => canvas.id === activeCanvas.value?.id)
+  deleteDialog.value = { canvasID: activeCanvas.value.id, name: activeCanvas.value.name }
+}
+
+function closeDeleteCanvas() {
+  deleteDialog.value = null
+}
+
+function confirmDeleteCanvas() {
+  const dialog = deleteDialog.value
+  if (!dialog || canvases.value.length <= 1) return
+  const index = canvases.value.findIndex((canvas) => canvas.id === dialog.canvasID)
+  if (index < 0) {
+    closeDeleteCanvas()
+    return
+  }
   canvases.value.splice(index, 1)
   activeCanvasID.value = canvases.value[Math.max(0, index - 1)]?.id || ''
+  closeDeleteCanvas()
 }
 
 function queueAssetRefresh() {
@@ -646,18 +922,23 @@ function queueAssetRefresh() {
 }
 
 async function refreshAssets() {
+  assetQuery.value = assetSearch.value.trim()
+  assetPageIndex.value = 0
+  assetPages.value = []
   if (!props.apikey || !props.baseurl) {
-    assetTasks.value = usableTasks.value
+    assetTasks.value = usableTasks.value.filter(assetSearchMatches)
     assetLoaded.value = false
-    assetHasMore.value = false
-    assetTotal.value = usableTasks.value.length
+    assetHasMore.value = assetTasks.value.length > ASSET_PAGE_SIZE
+    assetTotal.value = assetTasks.value.length
     return
   }
   assetLoading.value = true
   assetError.value = ''
   try {
-    const result = await listTasks(props.apikey, props.baseurl, 'succeeded', assetSearch.value.trim(), false, '', '', 30)
-    assetTasks.value = result.data.filter(hasMediaAsset)
+    const result = await listTasks(props.apikey, props.baseurl, 'succeeded', assetQuery.value, false, '', '', ASSET_PAGE_SIZE)
+    const page = result.data.filter(hasMediaAsset)
+    assetTasks.value = page
+    assetPages.value = [page]
     assetLoaded.value = true
     assetHasMore.value = result.has_more
     assetTotal.value = result.total
@@ -665,23 +946,49 @@ async function refreshAssets() {
     assetNextBeforeID.value = result.next_before_id
   } catch (error) {
     assetError.value = error instanceof Error ? error.message : '素材加载失败'
-    assetTasks.value = usableTasks.value
+    assetTasks.value = usableTasks.value.filter(assetSearchMatches)
     assetLoaded.value = false
-    assetHasMore.value = false
-    assetTotal.value = usableTasks.value.length
+    assetHasMore.value = assetTasks.value.length > ASSET_PAGE_SIZE
+    assetTotal.value = assetTasks.value.length
   } finally {
     assetLoading.value = false
   }
 }
 
-async function loadMoreAssets() {
-  if (!props.apikey || !props.baseurl || assetLoading.value || !assetHasMore.value) return
+function submitAssetSearch() {
+  refreshAssets().catch(() => undefined)
+}
+
+function refreshAssetPage() {
+  refreshAssets().catch(() => undefined)
+}
+
+function previousAssetPage() {
+  if (!canPrevAssetPage.value || assetLoading.value) return
+  assetPageIndex.value -= 1
+  assetTasks.value = assetPages.value[assetPageIndex.value] || assetTasks.value
+}
+
+async function nextAssetPage() {
+  if (assetLoading.value || !canNextAssetPage.value) return
+  if (assetPageIndex.value + 1 < assetPages.value.length) {
+    assetPageIndex.value += 1
+    assetTasks.value = assetPages.value[assetPageIndex.value] || assetTasks.value
+    return
+  }
+  if (!props.apikey || !props.baseurl) {
+    if (assetPageIndex.value + 1 < assetPageCount.value) assetPageIndex.value += 1
+    return
+  }
+  if (!assetHasMore.value) return
   assetLoading.value = true
   assetError.value = ''
   try {
-    const result = await listTasks(props.apikey, props.baseurl, 'succeeded', assetSearch.value.trim(), false, assetNextBeforeCreatedAt.value, assetNextBeforeID.value, 30)
-    const existing = new Set(assetTasks.value.map((task) => task.id))
-    assetTasks.value.push(...result.data.filter((task) => hasMediaAsset(task) && !existing.has(task.id)))
+    const result = await listTasks(props.apikey, props.baseurl, 'succeeded', assetQuery.value, false, assetNextBeforeCreatedAt.value, assetNextBeforeID.value, ASSET_PAGE_SIZE)
+    const page = result.data.filter(hasMediaAsset)
+    assetPageIndex.value += 1
+    assetPages.value = [...assetPages.value, page]
+    assetTasks.value = page
     assetHasMore.value = result.has_more
     assetTotal.value = result.total
     assetNextBeforeCreatedAt.value = result.next_before_created_at
@@ -694,7 +1001,7 @@ async function loadMoreAssets() {
 }
 
 function assetSearchMatches(task: Task) {
-  const query = assetSearch.value.trim().toLowerCase()
+  const query = assetQuery.value.trim().toLowerCase()
   if (!query) return true
   return [
     task.id,
@@ -718,7 +1025,8 @@ function syncUsableTasksToAssets(tasks: Task[]) {
   assetTasks.value = [
     ...added,
     ...assetTasks.value.map((task) => incomingByID.get(task.id) || task),
-  ]
+  ].slice(0, ASSET_PAGE_SIZE)
+  assetPages.value = assetPages.value.map((page, index) => index === assetPageIndex.value ? assetTasks.value : page)
   assetTotal.value = Math.max(assetTotal.value, assetTasks.value.length)
 }
 
@@ -967,6 +1275,28 @@ function addMergeNode(position?: { x: number; y: number }) {
   pushCanvasElement({ id: createID(), kind: 'merge', text: '', x: center.x, y: center.y - minSize.height / 2, width: minSize.width, height: minSize.height, zIndex: maxCanvasZIndex() + 1 }, center)
 }
 
+function addViewControlNode(position?: { x: number; y: number }) {
+  const center = position || screenToWorld(window.innerWidth / 2, window.innerHeight / 2)
+  const minSize = minNodeSize('view_control')
+  pushCanvasElement({
+    id: createID(),
+    kind: 'view_control',
+    text: '',
+    view_azimuth: 30,
+    view_elevation: 0,
+    view_roll: 0,
+    view_distance: 50,
+    view_scene_yaw: -28,
+    view_scene_pitch: 18,
+    view_scene_zoom: 1,
+    x: center.x - minSize.width / 2,
+    y: center.y - minSize.height / 2,
+    width: minSize.width,
+    height: minSize.height,
+    zIndex: maxCanvasZIndex() + 1,
+  }, center)
+}
+
 function addAiNode(position?: { x: number; y: number }) {
   const center = position || screenToWorld(window.innerWidth / 2, window.innerHeight / 2)
   const minSize = minNodeSize('ai')
@@ -1004,6 +1334,7 @@ function createProcessElement(kind: GenerateNodeKind | 'mask', point: { x: numbe
     kind,
     text: '',
     task_type: isVideo ? 'video_generation' : 'image_generation',
+    generated_params: [],
     model: isVideo && !props.defaultForm.model.includes('video') && !props.defaultForm.model.includes('seedance') ? 'doubao-seedance-2.0' : props.defaultForm.model,
     size: props.defaultForm.size,
     quality: props.defaultForm.quality,
@@ -1015,11 +1346,15 @@ function createProcessElement(kind: GenerateNodeKind | 'mask', point: { x: numbe
     video_ratio: props.defaultForm.video_ratio,
     video_resolution: props.defaultForm.video_resolution,
     video_duration: props.defaultForm.video_duration,
+    video_draft: supportsVideoDraft(props.defaultForm.model) ? props.defaultForm.video_draft : false,
+    video_frame_role: '',
+    video_first_frame_source_id: '',
+    video_last_frame_source_id: '',
     video_clip_start: 0,
     video_clip_end: 0,
     reasoning_effort: 'low',
     generate_audio: props.defaultForm.generate_audio,
-    watermark: props.defaultForm.watermark,
+    watermark: false,
     mask_data_url: '',
     mask_tool: 'brush',
     mask_brush_size: 32,
@@ -1035,6 +1370,27 @@ function canvasNodeModel(element: CanvasElement) {
   if (element.kind !== 'video') return element.model || props.defaultForm.model
   const model = (element.model || '').trim()
   return model && (model.toLowerCase().includes('video') || model.toLowerCase().includes('seedance')) ? model : 'doubao-seedance-2.0'
+}
+
+function canvasModelOptions(element: CanvasElement) {
+  if (element.kind === 'video') return VIDEO_MODEL_OPTIONS
+  if (element.kind === 'image') return IMAGE_MODEL_OPTIONS
+  return props.models
+}
+
+function modelOptionLabel(model: string) {
+  return optionLabel(model)
+}
+
+function selectCanvasModel(element: CanvasElement, model: string) {
+  element.model = model
+  if (element.kind === 'video') updateCanvasVideoModel(element)
+  else updateCanvasImageModel(element)
+  modelMenuElementID.value = ''
+}
+
+function toggleModelMenu(element: CanvasElement) {
+  modelMenuElementID.value = modelMenuElementID.value === element.id ? '' : element.id
 }
 
 function isNanoBananaElement(element: CanvasElement) {
@@ -1077,12 +1433,12 @@ function nanoAspectRatio(element: CanvasElement) {
   return parseNanoBananaSize(element.size || '').aspectRatio
 }
 
-function updateNanoImageSize(element: CanvasElement, event: Event) {
-  element.size = nanoBananaSizeValue((event.target as HTMLSelectElement).value, nanoAspectRatio(element))
+function updateNanoImageSize(element: CanvasElement, value: string) {
+  element.size = nanoBananaSizeValue(value, nanoAspectRatio(element))
 }
 
-function updateNanoAspectRatio(element: CanvasElement, event: Event) {
-  element.size = nanoBananaSizeValue(nanoImageSize(element), (event.target as HTMLSelectElement).value)
+function updateNanoAspectRatio(element: CanvasElement, value: string) {
+  element.size = nanoBananaSizeValue(nanoImageSize(element), value)
 }
 
 function seedreamImageSize(element: CanvasElement) {
@@ -1093,12 +1449,12 @@ function seedreamAspectRatio(element: CanvasElement) {
   return parseSeedreamSize(element.size || '').aspectRatio
 }
 
-function updateSeedreamImageSize(element: CanvasElement, event: Event) {
-  element.size = seedreamSizeValue((event.target as HTMLSelectElement).value, seedreamAspectRatio(element))
+function updateSeedreamImageSize(element: CanvasElement, value: string) {
+  element.size = seedreamSizeValue(value, seedreamAspectRatio(element))
 }
 
-function updateSeedreamAspectRatio(element: CanvasElement, event: Event) {
-  element.size = seedreamSizeValue(seedreamImageSize(element), (event.target as HTMLSelectElement).value)
+function updateSeedreamAspectRatio(element: CanvasElement, value: string) {
+  element.size = seedreamSizeValue(seedreamImageSize(element), value)
 }
 
 function gptImageSizeParts(element: CanvasElement) {
@@ -1121,15 +1477,14 @@ function gptImageRatio(element: CanvasElement) {
   return gptImageSizeParts(element).ratio
 }
 
-function updateGptImageSizeBase(element: CanvasElement, event: Event) {
-  const base = (event.target as HTMLSelectElement).value
+function updateGptImageSizeBase(element: CanvasElement, base: string) {
   element.size = base === 'auto' ? 'auto' : sizeFromRatio(base, gptImageRatio(element))
 }
 
-function updateGptImageRatio(element: CanvasElement, event: Event) {
+function updateGptImageRatio(element: CanvasElement, ratio: string) {
   const base = gptImageSizeBase(element)
   if (base === 'auto') return
-  element.size = sizeFromRatio(base, (event.target as HTMLSelectElement).value)
+  element.size = sizeFromRatio(base, ratio)
 }
 
 function supportsTransparentBackground(element: CanvasElement) {
@@ -1141,9 +1496,120 @@ function supportsOutputCompression(element: CanvasElement) {
   return format === 'jpeg' || format === 'webp'
 }
 
-function updateCanvasOutputFormat(element: CanvasElement, event: Event) {
-  element.output_format = (event.target as HTMLSelectElement).value
+function updateCanvasOutputFormat(element: CanvasElement, value: string) {
+  element.output_format = value
   if (element.output_format !== 'png' && element.background === 'transparent') element.background = 'auto'
+}
+
+function canvasOutputFormatOptions(element: CanvasElement) {
+  return isSeedreamElement(element) ? ['png', 'jpeg'] : ['png', 'jpeg', 'webp']
+}
+
+function canvasBackgroundOptions(element: CanvasElement) {
+  return supportsTransparentBackground(element) ? ['auto', 'transparent', 'opaque'] : ['auto', 'opaque']
+}
+
+function canvasVideoResolutionOptions(element: CanvasElement) {
+  return canvasVideoResolutions(element).map((resolution) => ({ value: resolution, label: resolution.toUpperCase() }))
+}
+
+function optionLabel(value: string) {
+  const labels: Record<string, string> = {
+    auto: '自动',
+    high: '高',
+    medium: '中',
+    low: '低',
+    png: 'PNG',
+    jpeg: 'JPEG',
+    webp: 'WebP',
+    transparent: '透明',
+    opaque: '不透明',
+    none: '不检查',
+    'gpt-image-2': 'GPT Image 2',
+    'nano-banana-2': 'Nano Banana 2',
+    'doubao-seedream-5.0-lite': '豆包 Seedream 5 Lite',
+    'doubao-seedance-2.0': '豆包 Seedance 2',
+    'doubao-seedance-1.5-pro': '豆包 Seedance 1.5 Pro',
+  }
+  return labels[value] || value
+}
+
+function optionHint(field: string, value: string) {
+  const hints: Record<string, Record<string, string>> = {
+    model: {
+      'gpt-image-2': '通用生成与编辑',
+      'nano-banana-2': 'Gemini 图片生成',
+      'doubao-seedream-5.0-lite': '轻量图像生成',
+      'doubao-seedance-2.0': '视频生成模型',
+      'doubao-seedance-1.5-pro': '视频生成模型',
+    },
+    size: {
+      auto: '由模型决定',
+      '512': '低成本预览',
+      '1K': '日常清晰度',
+      '2K': '更高细节',
+      '3K': '大图输出',
+      '4K': '最高规格',
+    },
+    quality: {
+      auto: '自动权衡',
+      high: '细节优先',
+      medium: '均衡输出',
+      low: '速度优先',
+    },
+    format: {
+      png: '无损，支持透明',
+      jpeg: '体积小，适合照片',
+      webp: '压缩效率高',
+    },
+    background: {
+      auto: '模型决定',
+      transparent: '透明背景',
+      opaque: '强制不透明',
+    },
+    moderation: {
+      low: '低强度审核',
+      auto: '自动审核',
+    },
+    fidelity: {
+      high: '更贴近输入图',
+      low: '更自由改写',
+    },
+    reasoning: {
+      none: '直接输出',
+      low: '轻量思考',
+      medium: '均衡推理',
+      high: '更深推理',
+    },
+    resolution: {
+      '720p': '快速预览',
+      '1080p': '高清输出',
+      '2k': '更高细节',
+      '4k': '最高规格',
+    },
+  }
+  return hints[field]?.[value] || ''
+}
+
+function ratioHint(ratio: string) {
+  if (ratio === 'auto' || ratio === 'adaptive') return '自动'
+  const [width, height] = ratio.split(':').map((part) => Number(part))
+  if (!width || !height) return '比例'
+  if (width === height) return '方图'
+  return width > height ? '横图' : '竖图'
+}
+
+function ratioPreviewStyle(ratio: string) {
+  if (ratio === 'auto' || ratio === 'adaptive') return {}
+  const [width, height] = ratio.split(':').map((part) => Number(part))
+  if (!width || !height) return {}
+  const maxWidth = 34
+  const maxHeight = 24
+  const scale = Math.min(maxWidth / width, maxHeight / height)
+  return {
+    width: `${Math.max(8, width * scale)}px`,
+    height: `${Math.max(8, height * scale)}px`,
+  }
 }
 
 function canvasVideoRatios(element: CanvasElement) {
@@ -1151,7 +1617,7 @@ function canvasVideoRatios(element: CanvasElement) {
 }
 
 function canvasVideoResolutions(element: CanvasElement) {
-  return videoResolutionOptions(canvasNodeModel(element))
+  return videoResolutionOptions(canvasNodeModel(element), canvasVideoDraft(element))
 }
 
 function canvasVideoCapability(element: CanvasElement) {
@@ -1164,6 +1630,7 @@ function normalizeCanvasVideoSettings(element: CanvasElement) {
     ratio: element.video_ratio || props.defaultForm.video_ratio,
     resolution: element.video_resolution || props.defaultForm.video_resolution,
     duration: element.video_duration ?? props.defaultForm.video_duration,
+    draft: canvasVideoDraft(element),
   })
   element.video_ratio = normalized.ratio
   element.video_resolution = normalized.resolution
@@ -1171,6 +1638,35 @@ function normalizeCanvasVideoSettings(element: CanvasElement) {
 }
 
 function updateCanvasVideoModel(element: CanvasElement) {
+  normalizeCanvasVideoSettings(element)
+}
+
+function canvasVideoSizeLabel(element: CanvasElement) {
+  const normalized = normalizeVideoSettings({
+    model: canvasNodeModel(element),
+    ratio: element.video_ratio || props.defaultForm.video_ratio,
+    resolution: element.video_resolution || props.defaultForm.video_resolution,
+    duration: element.video_duration ?? props.defaultForm.video_duration,
+    draft: canvasVideoDraft(element),
+  })
+  if (normalized.ratio === 'adaptive') return 'auto'
+  return `${normalized.width}x${normalized.height}`
+}
+
+function canvasGenerateAudio(element: CanvasElement) {
+  return element.generate_audio ?? props.defaultForm.generate_audio
+}
+
+function canvasSupportsDraft(element: CanvasElement) {
+  return supportsVideoDraft(canvasNodeModel(element))
+}
+
+function canvasVideoDraft(element: CanvasElement) {
+  return canvasSupportsDraft(element) ? Boolean(element.video_draft) : false
+}
+
+function toggleCanvasVideoDraft(element: CanvasElement) {
+  element.video_draft = !canvasVideoDraft(element)
   normalizeCanvasVideoSettings(element)
 }
 
@@ -1182,6 +1678,25 @@ function addGenerateNode(kind: GenerateNodeKind | 'mask' = props.defaultForm.tas
   pushCanvasElement(element, center)
 }
 
+function estimateContextMenuWidth(items: CanvasContextMenuItem[]) {
+  const labelWidth = Math.max(0, ...items.map((item) => Array.from(item.label).reduce((width, char) => width + (char.charCodeAt(0) <= 0x7f ? 7 : 13), 0)))
+  return Math.min(260, Math.max(168, labelWidth + 18 + 9 + 20 + 14))
+}
+
+function placeContextMenu(clientX: number, clientY: number, items: CanvasContextMenuItem[]): CanvasContextMenuState {
+  emit('closeContextMenu')
+  const margin = 8
+  const width = Math.min(estimateContextMenuWidth(items), window.innerWidth - margin * 2)
+  const height = Math.min(items.length * 34 + 12, window.innerHeight - margin * 2)
+  const x = clientX + width + margin > window.innerWidth ? clientX - width : clientX
+  const y = clientY + height + margin > window.innerHeight ? clientY - height : clientY
+  return {
+    x: clamp(x, margin, window.innerWidth - width - margin),
+    y: clamp(y, margin, window.innerHeight - height - margin),
+    items,
+  }
+}
+
 function removeElement(id: string) {
   if (!activeCanvas.value) return
   activeCanvas.value.elements = activeCanvas.value.elements.filter((element) => element.id !== id)
@@ -1191,19 +1706,14 @@ function removeElement(id: string) {
 function openCanvasContextMenu(event: MouseEvent) {
   event.preventDefault()
   const point = screenToWorld(event.clientX, event.clientY)
-  canvasContextMenu.value = {
-    x: event.clientX,
-    y: event.clientY,
-    items: [
-      { label: '文字提示词', icon: 'text', action: () => addPromptNode(point) },
-      { label: '媒体节点', icon: 'gallery', action: () => addAssetNode(point) },
-      { label: '汇合节点', icon: 'merge', action: () => addMergeNode(point) },
-      { label: '蒙版节点', icon: 'brush', action: () => addGenerateNode('mask', point) },
-      { label: 'AI 生成', icon: 'sparkles', action: () => addAiNode(point) },
-      { label: '自动整理', icon: 'grid', action: () => autoArrangeCanvas() },
-      { label: '复位视图', icon: 'resetView', action: resetView },
-    ],
-  }
+  canvasContextMenu.value = placeContextMenu(event.clientX, event.clientY, [
+    { label: '文字提示词', icon: 'text', action: () => addPromptNode(point) },
+    { label: '媒体节点', icon: 'gallery', action: () => addAssetNode(point) },
+    { label: '汇合节点', icon: 'merge', action: () => addMergeNode(point) },
+    { label: 'AI 生成', icon: 'sparkles', action: () => addAiNode(point) },
+    { label: '自动整理', icon: 'grid', action: () => autoArrangeCanvas() },
+    { label: '复位视图', icon: 'resetView', action: resetView },
+  ])
 }
 
 function openNodeContextMenu(element: CanvasElement, event: MouseEvent) {
@@ -1213,17 +1723,48 @@ function openNodeContextMenu(element: CanvasElement, event: MouseEvent) {
     openSelectionContextMenu({ event, nodes: selectedIDs.map((id) => ({ id })) })
     return
   }
-  canvasContextMenu.value = {
-    x: event.clientX,
-    y: event.clientY,
-    items: [
-      { label: '运行到此节点', icon: 'play', action: () => runToNode(element), disabled: !isRunnableKind(element.kind) || element.frozen || isNodeBusy(element) || isLineBusy(element) },
-      { label: element.frozen ? '取消固化' : '固化节点', icon: 'archive', action: () => toggleFrozen(element), disabled: !isRunnableKind(element.kind) || isNodeBusy(element) || isLineBusy(element) },
-      { label: '复制节点', icon: 'copy', action: () => duplicateElement(element) },
-      { label: '查看任务', icon: 'eye', action: () => taskForElement(element) && emit('selectTask', taskForElement(element)!) , disabled: !taskForElement(element) },
-      { label: '删除节点', icon: 'trash', action: () => removeElement(element.id), danger: true },
-    ],
+  const downloadable = downloadableMediaForElement(element)
+  canvasContextMenu.value = placeContextMenu(event.clientX, event.clientY, [
+    { label: '运行到此节点', icon: 'play', action: () => runToNode(element), disabled: !isRunnableKind(element.kind) || element.frozen || isNodeBusy(element) || isLineBusy(element) },
+    { label: element.frozen ? '取消固化' : '固化节点', icon: 'archive', action: () => toggleFrozen(element), disabled: !isRunnableKind(element.kind) || isNodeBusy(element) || isLineBusy(element) },
+    ...(shouldShowDownloadAction(element) ? [{ label: '下载素材', icon: 'download', action: () => downloadNodeMedia(element), disabled: !downloadable }] : []),
+    { label: '复制节点', icon: 'copy', action: () => duplicateElement(element) },
+    { label: '查看任务', icon: 'eye', action: () => taskForElement(element) && emit('selectTask', taskForElement(element)!) , disabled: !taskForElement(element) },
+    { label: '删除节点', icon: 'trash', action: () => removeElement(element.id), danger: true },
+  ])
+}
+
+function shouldShowDownloadAction(element: CanvasElement) {
+  return isMediaKind(element.kind) || element.kind === 'image' || element.kind === 'video' || element.kind === 'audio' || element.kind === 'tail_frame'
+}
+
+function downloadableMediaForElement(element: CanvasElement): { url: string; filename?: string } | undefined {
+  const localImage = localUploadedImage(element)
+  if (localImage?.url) return { url: localImage.url, filename: localImage.filename }
+  const localAsset = localMediaAsset(element)
+  if (localAsset?.url) return { url: localAsset.url, filename: localAsset.filename }
+  const resultImage = taskResultImage(element)
+  if (resultImage?.url) return { url: resultImage.url, filename: resultImage.filename }
+  const resultVideo = taskResultVideo(element)
+  if (resultVideo?.url) return { url: resultVideo.url, filename: resultVideo.filename }
+  const audio = firstAudioAsset(taskForElement(element))
+  if (audio?.url) return { url: audio.url, filename: audio.filename }
+  return undefined
+}
+
+function downloadNodeMedia(element: CanvasElement) {
+  const media = downloadableMediaForElement(element)
+  if (!media?.url) {
+    showCanvasNotice('当前素材没有可下载地址')
+    return
   }
+  const link = document.createElement('a')
+  link.href = media.url
+  link.download = media.filename || filenameFromURL(media.url) || `${nodeBadge(element) || 'media'}`
+  link.rel = 'noopener'
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
 }
 
 function openSelectionContextMenu(event: { event: MouseEvent; nodes: Array<{ id: string }> }) {
@@ -1233,13 +1774,9 @@ function openSelectionContextMenu(event: { event: MouseEvent; nodes: Array<{ id:
   if (selectedIDs.length < 2) return
   event.event.preventDefault()
   event.event.stopPropagation()
-  canvasContextMenu.value = {
-    x: event.event.clientX,
-    y: event.event.clientY,
-    items: [
-      { label: '删除节点', icon: 'trash', action: () => removeElements(selectedIDs), danger: true },
-    ],
-  }
+  canvasContextMenu.value = placeContextMenu(event.event.clientX, event.event.clientY, [
+    { label: '删除节点', icon: 'trash', action: () => removeElements(selectedIDs), danger: true },
+  ])
 }
 
 function pushCanvasElement(element: CanvasElement, _point?: { x: number; y: number }, _source?: CanvasElement) {
@@ -1284,7 +1821,13 @@ function isConnectionMuted(connection: CanvasConnection) {
   return Boolean(from?.frozen || to?.frozen)
 }
 
+function isConnectionConnectedToSelection(connection: CanvasConnection) {
+  const selected = selectedNodeIDs.value
+  return selected.has(connection.from) || selected.has(connection.to)
+}
+
 function edgeColor(connection: CanvasConnection) {
+  if (isConnectionConnectedToSelection(connection)) return 'rgba(147, 197, 253, .96)'
   if (isConnectionRunning(connection)) return 'rgba(96, 165, 250, .92)'
   if (isConnectionMuted(connection)) return 'rgba(148, 163, 184, .36)'
   const from = elementByID(connection.from)
@@ -1304,24 +1847,111 @@ function autoArrangeCanvas() {
 function autoArrangeElements(ids: string[]) {
   const elements = ids.map((id) => elementByID(id)).filter(Boolean) as CanvasElement[]
   if (!elements.length) return
-  const levels = displayWorkflowLevels()
+  const flows = workflowArrangeFlows(elements)
   const minX = Math.min(...elements.map((element) => element.x))
   const minY = Math.min(...elements.map((element) => element.y))
-  const levelValues = Array.from(new Set(elements.map((element) => levels.get(element.id) || 0))).sort((a, b) => a - b)
-  let x = minX
-  for (const level of levelValues) {
-    const items = elements
-      .filter((element) => (levels.get(element.id) || 0) === level)
-      .sort((a, b) => a.y === b.y ? a.x - b.x : a.y - b.y)
-    const columnWidth = Math.max(...items.map((element) => renderedNodeSize(element).width))
-    let y = minY
-    for (const element of items) {
-      element.x = x
-      element.y = y
-      y += renderedNodeSize(element).height + 64
+  const columnGap = 140
+  const rowGap = 64
+  const flowGap = 140
+  let flowTop = minY
+  for (const flow of flows) {
+    const levels = workflowLevelsForElements(flow)
+    const levelValues = Array.from(new Set(flow.map((element) => levels.get(element.id) || 0))).sort((a, b) => a - b)
+    let x = minX
+    let flowHeight = 0
+    for (const level of levelValues) {
+      const items = flow
+        .filter((element) => (levels.get(element.id) || 0) === level)
+        .sort((a, b) => a.y === b.y ? a.x - b.x : a.y - b.y)
+      const columnWidth = Math.max(...items.map((element) => renderedNodeSize(element).width))
+      let y = flowTop
+      for (const element of items) {
+        element.x = x
+        element.y = y
+        const size = renderedNodeSize(element)
+        y += size.height + rowGap
+      }
+      flowHeight = Math.max(flowHeight, y - flowTop - rowGap)
+      x += columnWidth + columnGap
     }
-    x += columnWidth + 120
+    flowTop += flowHeight + flowGap
   }
+}
+
+function workflowArrangeFlows(elements: CanvasElement[]) {
+  const canvas = activeCanvas.value
+  if (!canvas) return [elements]
+  const selectedIDs = new Set(elements.map((element) => element.id))
+  const byID = new Map(elements.map((element) => [element.id, element]))
+  const seen = new Set<string>()
+  const flows: CanvasElement[][] = []
+  for (const element of elements.sort((a, b) => a.y === b.y ? a.x - b.x : a.y - b.y)) {
+    if (seen.has(element.id)) continue
+    const queue = [element.id]
+    const flowIDs = new Set<string>()
+    while (queue.length) {
+      const id = queue.shift()!
+      if (seen.has(id) || !selectedIDs.has(id)) continue
+      seen.add(id)
+      flowIDs.add(id)
+      for (const connection of canvas.connections) {
+        if (connection.from === id && selectedIDs.has(connection.to)) queue.push(connection.to)
+        if (connection.to === id && selectedIDs.has(connection.from)) queue.push(connection.from)
+      }
+    }
+    flows.push(Array.from(flowIDs).map((id) => byID.get(id)).filter(Boolean) as CanvasElement[])
+  }
+  return flows.sort((a, b) => {
+    const topA = Math.min(...a.map((element) => element.y))
+    const topB = Math.min(...b.map((element) => element.y))
+    if (topA !== topB) return topA - topB
+    return Math.min(...a.map((element) => element.x)) - Math.min(...b.map((element) => element.x))
+  })
+}
+
+function workflowLevelsForElements(elements: CanvasElement[]) {
+  const ids = new Set(elements.map((element) => element.id))
+  const incomingCount = new Map<string, number>(elements.map((element) => [element.id, 0]))
+  const outgoing = new Map<string, string[]>(elements.map((element) => [element.id, []]))
+  const connections = (activeCanvas.value?.connections || []).filter((connection) => ids.has(connection.from) && ids.has(connection.to))
+  for (const connection of connections) {
+    if (!ids.has(connection.from) || !ids.has(connection.to)) continue
+    incomingCount.set(connection.to, (incomingCount.get(connection.to) || 0) + 1)
+    outgoing.get(connection.from)?.push(connection.to)
+  }
+  const levels = new Map<string, number>(elements.map((element) => [element.id, 0]))
+  const queue = elements
+    .filter((element) => (incomingCount.get(element.id) || 0) === 0)
+    .sort((a, b) => a.y === b.y ? a.x - b.x : a.y - b.y)
+    .map((element) => element.id)
+  const visited = new Set<string>()
+  while (queue.length) {
+    const id = queue.shift()!
+    visited.add(id)
+    const nextLevel = (levels.get(id) || 0) + 1
+    for (const targetID of outgoing.get(id) || []) {
+      levels.set(targetID, Math.max(levels.get(targetID) || 0, nextLevel))
+      incomingCount.set(targetID, Math.max(0, (incomingCount.get(targetID) || 0) - 1))
+      if ((incomingCount.get(targetID) || 0) === 0) queue.push(targetID)
+    }
+  }
+  for (const element of elements) {
+    if (!visited.has(element.id)) levels.set(element.id, levels.get(element.id) || 0)
+  }
+  for (let pass = 0; pass < elements.length; pass += 1) {
+    let changed = false
+    for (const connection of connections) {
+      const targetLevel = levels.get(connection.to) || 0
+      const sourceLevel = levels.get(connection.from) || 0
+      const alignedSourceLevel = Math.max(0, targetLevel - 1)
+      if (sourceLevel < alignedSourceLevel) {
+        levels.set(connection.from, alignedSourceLevel)
+        changed = true
+      }
+    }
+    if (!changed) break
+  }
+  return levels
 }
 
 function openEdgeContextMenu(event: EdgeMouseEvent) {
@@ -1330,13 +1960,9 @@ function openEdgeContextMenu(event: EdgeMouseEvent) {
   const sourceEvent = event.event
   const point = 'touches' in sourceEvent ? sourceEvent.touches[0] || sourceEvent.changedTouches[0] : sourceEvent
   if (!point) return
-  canvasContextMenu.value = {
-    x: point.clientX,
-    y: point.clientY,
-    items: [
-      { label: '删除连线', icon: 'trash', action: () => removeConnection(event.edge.id), danger: true },
-    ],
-  }
+  canvasContextMenu.value = placeContextMenu(point.clientX, point.clientY, [
+    { label: '删除连线', icon: 'trash', action: () => removeConnection(event.edge.id), danger: true },
+  ])
 }
 
 function runCanvasContextAction(item: CanvasContextMenuItem) {
@@ -1351,7 +1977,11 @@ function removeConnection(id: string) {
 }
 
 function taskForElement(element: CanvasElement) {
-  return element.task_id ? props.tasks.find((task) => task.id === element.task_id) || assetTasks.value.find((task) => task.id === element.task_id) : undefined
+  if (element.task_id) {
+    const task = props.tasks.find((item) => item.id === element.task_id) || assetTasks.value.find((item) => item.id === element.task_id)
+    if (task) return task
+  }
+  return element.task_snapshot
 }
 
 function generatedTask(element: CanvasElement) {
@@ -1402,6 +2032,7 @@ function hasFrozenResult(element: CanvasElement) {
   if (element.kind === 'llm') return Boolean((element.text || '').trim())
   if (element.kind === 'image') return Boolean(taskResultImage(element)?.url)
   if (element.kind === 'video') return Boolean(taskResultVideo(element)?.url)
+  if (element.kind === 'tail_frame') return Boolean(localUploadedImage(element)?.url)
   return false
 }
 
@@ -1417,6 +2048,48 @@ function nodeProgressLabel(element: CanvasElement) {
   if (runtime?.status === 'succeeded') return `完成 ${formatDuration((runtime.endedAt || runtimeNow.value) - runtime.startedAt)}`
   if (runtime?.status === 'failed') return runtime.message || '失败'
   return ''
+}
+
+function generatedParamChips(element: CanvasElement) {
+  if (isNodeRunning(element)) return []
+  if (Array.isArray(element.generated_params)) return element.generated_params
+  const task = generatedTask(element)
+  return task?.status === 'succeeded' ? taskParamChips(task) : []
+}
+
+function taskParamChips(task: Task) {
+  const chips = [`模型 ${modelOptionLabel(task.model)}`]
+  if (task.task_type === 'video_generation') {
+    if (task.video_ratio) chips.push(`比例 ${videoRatioLabel(task.video_ratio)}`)
+    const resolution = task.video_height ? `${task.video_height}P` : ''
+    if (resolution) chips.push(`分辨率 ${resolution}`)
+    if (task.video_duration) chips.push(`时长 ${task.video_duration}s`)
+    chips.push(`音频 ${task.generate_audio ? '开' : '关'}`)
+    if (task.draft !== undefined) chips.push(`样片 ${task.draft ? '开' : '关'}`)
+    return chips
+  }
+  if (task.size) chips.push(`尺寸 ${task.size}`)
+  if (task.quality) chips.push(`质量 ${optionLabel(task.quality)}`)
+  if (task.output_format) chips.push(`格式 ${optionLabel(task.output_format)}`)
+  if (task.output_format === 'jpeg' || task.output_format === 'webp') chips.push(`压缩 ${task.output_compression}`)
+  if (task.background) chips.push(`背景 ${optionLabel(task.background)}`)
+  if (task.moderation) chips.push(`审核 ${optionLabel(task.moderation)}`)
+  if (task.input_fidelity) chips.push(`保真 ${optionLabel(task.input_fidelity)}`)
+  if (task.n > 1) chips.push(`数量 ${task.n}`)
+  if (task.reference_images?.length) chips.push(`参考图 ${task.reference_images.length}`)
+  if (task.reference_videos?.length) chips.push(`参考视频 ${task.reference_videos.length}`)
+  if (task.reference_audios?.length) chips.push(`参考音频 ${task.reference_audios.length}`)
+  return chips
+}
+
+function llmPayloadParamChips(payload: CanvasLLMPayload) {
+  return [
+    `模型 ${payload.model}`,
+    `推理 ${optionLabel(payload.reasoning_effort)}`,
+    `图片 ${payload.reference_images.length}`,
+    `视频 ${payload.reference_videos.length}`,
+    `音频 ${payload.reference_audios.length}`,
+  ]
 }
 
 function formatTaskElapsed(task: Task) {
@@ -1444,18 +2117,32 @@ function localMediaAsset(element: CanvasElement): MediaAsset | undefined {
     url: element.media_url,
     thumbnail_url: element.media_thumbnail_url,
     filename: element.media_filename,
-    clip_start: cleanClipValue(element.video_clip_start),
-    clip_end: cleanClipValue(element.video_clip_end),
   }
 }
 
 function localUploadedImage(element: CanvasElement): UploadedImage | undefined {
+  if (element.kind === 'view_control') return viewControlSourceImage(element)
   const mediaType = element.media_type || mediaTypeFromKind(element.kind)
   if (!element.media_url || mediaType !== 'image') return undefined
   return {
     url: element.media_url,
+    thumbnail_url: element.media_thumbnail_url,
     filename: element.media_filename,
   }
+}
+
+function viewControlSourceImage(element: CanvasElement): UploadedImage | undefined {
+  const source = connectedInputs(element).find((item) => item.kind !== 'view_control' && outputTypes(item).includes('image'))
+  return source ? localUploadedImage(source) || taskResultImage(source) : undefined
+}
+
+function viewControlSourceElement(element: CanvasElement): CanvasElement | undefined {
+  return connectedInputs(element).find((item) => item.kind !== 'view_control' && outputTypes(item).includes('image'))
+}
+
+function referenceIdentitySource(element: CanvasElement): CanvasElement {
+  if (element.kind !== 'view_control') return element
+  return viewControlSourceElement(element) || element
 }
 
 function taskResultImage(element: CanvasElement): UploadedImage | undefined {
@@ -1467,7 +2154,7 @@ function taskResultVideo(element: CanvasElement): MediaAsset | undefined {
   const task = taskForElement(element)
   const video = task?.result_videos?.[0]
   if (!video?.url) return undefined
-  return withClip({ ...video, type: video.type || 'video' }, element)
+  return { ...video, type: video.type || 'video' }
 }
 
 function originalImageURL(image?: UploadedImage) {
@@ -1488,16 +2175,6 @@ function markCanvasImageLoaded(element: CanvasElement, url?: string) {
 
 function markCanvasImageError(element: CanvasElement, url?: string) {
   loadedCanvasImages.value = { ...loadedCanvasImages.value, [canvasImageKey(element, url)]: 'error' }
-}
-
-function withClip(video: MediaAsset, element: CanvasElement): MediaAsset {
-  const clipStart = cleanClipValue(element.video_clip_start)
-  const clipEnd = cleanClipValue(element.video_clip_end)
-  return {
-    ...video,
-    clip_start: clipStart,
-    clip_end: clipEnd && clipEnd > (clipStart || 0) ? clipEnd : undefined,
-  }
 }
 
 function cleanClipValue(value?: number) {
@@ -1696,6 +2373,11 @@ function assetPromptTitle(task: Task) {
   return task.prompt || task.final_prompt || task.model || '无提示词'
 }
 
+function taskVideoCover(task: Task) {
+  const video = task.result_videos?.[0]
+  return video?.thumbnail_url || videoCoverURL(video?.url)
+}
+
 function mentionCandidates(element: CanvasElement) {
   const query = mentionMenu.value?.elementID === element.id ? mentionMenu.value.query.toLowerCase() : ''
   const downstream = downstreamElementIDs(element.id)
@@ -1790,7 +2472,7 @@ function connectedComponentElements(element: CanvasElement) {
 }
 
 function isMentionableElement(element: CanvasElement) {
-  return isMediaKind(element.kind) || element.kind === 'image' || element.kind === 'video' || element.kind === 'mask'
+  return isMediaKind(element.kind) || element.kind === 'image' || element.kind === 'video' || element.kind === 'mask' || element.kind === 'tail_frame'
 }
 
 function mentionLabel(element: CanvasElement) {
@@ -1809,19 +2491,62 @@ function mentionDetail(element: CanvasElement) {
   return ''
 }
 
-function onPromptTextInput(event: Event, element: CanvasElement) {
-  const before = textBeforeCaret()
-  const match = before.match(/(^|\s)@([^\s@]*)$/)
-  if (!match) {
+function isEditorComposing(event: Event, element: CanvasElement) {
+  return composingEditorIDs.has(element.id) || ('isComposing' in event && Boolean(event.isComposing))
+}
+
+function onEditorCompositionStart(_event: CompositionEvent, element: CanvasElement) {
+  composingEditorIDs.add(element.id)
+  mentionMenu.value = null
+}
+
+function onEditorCompositionEnd(event: CompositionEvent, element: CanvasElement) {
+  composingEditorIDs.delete(element.id)
+  onPromptTextInput(event, element, true)
+}
+
+function onPromptTextInput(event: Event, element: CanvasElement, force = false) {
+  if (!force && isEditorComposing(event, element)) return
+  const target = event.currentTarget as HTMLElement
+  const selection = editorSelectionOffsets(target)
+  if (!force && event instanceof KeyboardEvent && selection.start !== selection.end) {
     mentionMenu.value = null
     return
   }
+  const cursor = selection.end
+  const text = editorPlainText(target)
+  element.text = text
+  if (suppressCanvasMentionAfterDelete.value) {
+    mentionMenu.value = null
+    suppressCanvasMentionAfterDelete.value = false
+    nextTick(() => setEditorCaret(target, cursor))
+    return
+  }
+  if (event instanceof KeyboardEvent && (event.key === 'Backspace' || event.key === 'Delete')) {
+    mentionMenu.value = null
+    nextTick(() => setEditorCaret(target, cursor))
+    return
+  }
+  const before = text.slice(0, cursor)
+  const match = before.match(/(^|\s)@([^\s@]*)$/)
+  if (!match) {
+    mentionMenu.value = null
+    nextTick(() => setEditorCaret(target, cursor))
+    return
+  }
   const query = match[2] || ''
+  const start = cursor - query.length - 1
   const previous = mentionMenu.value?.elementID === element.id && mentionMenu.value.query === query ? mentionMenu.value.activeIndex : 0
-  mentionMenu.value = { elementID: element.id, query, activeIndex: previous }
+  mentionMenu.value = { elementID: element.id, query, start, end: cursor, activeIndex: previous }
+  nextTick(() => setEditorCaret(target, cursor))
 }
 
 function onRichEditorKeydown(event: KeyboardEvent, element: CanvasElement) {
+  if (isEditorComposing(event, element)) return
+  if (event.key === 'Backspace' || event.key === 'Delete') {
+    handleRichEditorDelete(event, element)
+    return
+  }
   const menu = mentionMenu.value
   if (menu?.elementID === element.id) {
     const candidates = mentionCandidates(element)
@@ -1853,6 +2578,54 @@ function onRichEditorKeydown(event: KeyboardEvent, element: CanvasElement) {
     event.preventDefault()
     blurEditable(event, element)
   }
+}
+
+function handleRichEditorDelete(event: KeyboardEvent, element: CanvasElement) {
+  const target = event.currentTarget as HTMLElement
+  const selection = editorSelectionOffsets(target)
+  let start = selection.start
+  let end = selection.end
+  if (start === end) {
+    const mentionRange = editableMentionRangeAt(element.text || editorPlainText(target), event.key === 'Backspace' ? start - 1 : start)
+    if (mentionRange) {
+      start = mentionRange.start
+      end = mentionRange.end
+    } else if (event.key === 'Backspace') {
+      if (start <= 0) {
+        mentionMenu.value = null
+        return
+      }
+      start -= 1
+    } else {
+      const text = element.text || editorPlainText(target)
+      if (end >= text.length) {
+        mentionMenu.value = null
+        return
+      }
+      end += 1
+    }
+  }
+  if (start === end) {
+    mentionMenu.value = null
+    return
+  }
+  event.preventDefault()
+  suppressCanvasMentionAfterDelete.value = true
+  mentionMenu.value = null
+  const text = element.text || editorPlainText(target)
+  element.text = `${text.slice(0, start)}${text.slice(end)}`
+  nextTick(() => setEditorCaret(target, start))
+}
+
+function editableMentionRangeAt(text: string, index: number) {
+  if (index < 0) return null
+  const pattern = /@([A-Z]+\d{2})\b/g
+  for (const match of text.matchAll(pattern)) {
+    const start = match.index ?? 0
+    const end = start + match[0].length
+    if (index >= start && index < end) return { start, end }
+  }
+  return null
 }
 
 function scrollActiveMentionIntoView() {
@@ -1894,23 +2667,111 @@ function setActiveMentionIndex(element: CanvasElement, index: number) {
 
 function insertMention(element: CanvasElement, label: string) {
   const token = `@${mentionBadgeFromLabel(label)} `
-  if (document.activeElement instanceof HTMLTextAreaElement) {
-    replaceCurrentMentionWithToken(label)
-    mentionMenu.value = null
-    return
-  }
-  if (!(document.activeElement instanceof HTMLElement) || !document.activeElement.isContentEditable) {
+  const menu = mentionMenu.value?.elementID === element.id ? mentionMenu.value : null
+  const target = document.activeElement instanceof HTMLElement && document.activeElement.isContentEditable ? document.activeElement : null
+  if (!menu || !target) {
     element.text = `${element.text || ''}${token}`
     mentionMenu.value = null
     return
   }
-  replaceCurrentMentionWithToken(label)
+  const value = element.text || editorPlainText(target)
+  const nextValue = `${value.slice(0, menu.start)}${token}${value.slice(menu.end)}`
+  element.text = nextValue
   mentionMenu.value = null
+  nextTick(() => {
+    target.focus({ preventScroll: true })
+    setEditorCaret(target, menu.start + token.length)
+  })
 }
 
 function editableText(target: HTMLElement) {
   if (target instanceof HTMLTextAreaElement) return target.value.trimEnd()
   return target.innerText.replace(/\u00a0/g, ' ').trimEnd()
+}
+
+function editorPlainText(target: HTMLElement) {
+  return target.innerText.replace(/\u00a0/g, ' ').replace(/\n$/, '')
+}
+
+function editorCaretOffset(target: HTMLElement) {
+  const selection = window.getSelection()
+  if (!selection?.rangeCount) return editorPlainText(target).length
+  const range = selection.getRangeAt(0)
+  if (!target.contains(range.endContainer)) return editorPlainText(target).length
+  const preRange = document.createRange()
+  preRange.selectNodeContents(target)
+  preRange.setEnd(range.endContainer, range.endOffset)
+  return preRange.toString().replace(/\u00a0/g, ' ').length
+}
+
+function editorSelectionOffsets(target: HTMLElement) {
+  const selection = window.getSelection()
+  if (!selection?.rangeCount) {
+    const end = editorPlainText(target).length
+    return { start: end, end }
+  }
+  const range = selection.getRangeAt(0)
+  if (!target.contains(range.startContainer) || !target.contains(range.endContainer)) {
+    const end = editorPlainText(target).length
+    return { start: end, end }
+  }
+  const startRange = document.createRange()
+  startRange.selectNodeContents(target)
+  startRange.setEnd(range.startContainer, range.startOffset)
+  const endRange = document.createRange()
+  endRange.selectNodeContents(target)
+  endRange.setEnd(range.endContainer, range.endOffset)
+  const start = startRange.toString().replace(/\u00a0/g, ' ').length
+  const end = endRange.toString().replace(/\u00a0/g, ' ').length
+  return { start: Math.min(start, end), end: Math.max(start, end) }
+}
+
+function setEditorCaret(target: HTMLElement, offset: number) {
+  target.focus({ preventScroll: true })
+  let remaining = Math.max(0, offset)
+  const placeCaret = (node: globalThis.Node, nodeOffset: number) => {
+    const range = document.createRange()
+    range.setStart(node, nodeOffset)
+    range.collapse(true)
+    const selection = window.getSelection()
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+  }
+  const walk = (node: globalThis.Node): boolean => {
+    for (const child of Array.from(node.childNodes)) {
+      if (child.nodeType === globalThis.Node.TEXT_NODE) {
+        const length = child.textContent?.length || 0
+        if (remaining <= length) {
+          placeCaret(child, remaining)
+          return true
+        }
+        remaining -= length
+        continue
+      }
+      if (child instanceof HTMLElement && child.classList.contains('canvas-mention-token')) {
+        const tokenLength = child.textContent?.length || 0
+        if (remaining <= 0) {
+          placeCaret(node, Array.prototype.indexOf.call(node.childNodes, child))
+          return true
+        }
+        if (remaining <= tokenLength) {
+          placeCaret(node, Array.prototype.indexOf.call(node.childNodes, child) + 1)
+          return true
+        }
+        remaining -= tokenLength
+        continue
+      }
+      if (walk(child)) return true
+    }
+    return false
+  }
+  if (walk(target)) return
+  const range = document.createRange()
+  range.selectNodeContents(target)
+  range.collapse(false)
+  const selection = window.getSelection()
+  selection?.removeAllRanges()
+  selection?.addRange(range)
 }
 
 function textBeforeCaret() {
@@ -2006,11 +2867,15 @@ function upstreamElements(element: CanvasElement, kind?: NodeKind) {
 }
 
 function isProcessKind(kind: NodeKind) {
+  return kind === 'llm' || kind === 'image' || kind === 'video' || kind === 'audio' || kind === 'tail_frame'
+}
+
+function hasInspectorPanel(kind: NodeKind) {
   return kind === 'llm' || kind === 'image' || kind === 'video' || kind === 'audio'
 }
 
 function isRunnableKind(kind: NodeKind) {
-  return kind === 'llm' || kind === 'image' || kind === 'video'
+  return kind === 'llm' || kind === 'image' || kind === 'video' || kind === 'tail_frame'
 }
 
 function acceptsInput(kind: NodeKind) {
@@ -2022,7 +2887,7 @@ function hasOutput(kind: NodeKind) {
 }
 
 function isPromptLike(kind: NodeKind) {
-  return kind === 'prompt' || kind === 'llm' || kind === 'merge'
+  return kind === 'prompt' || kind === 'llm' || kind === 'merge' || kind === 'view_control'
 }
 
 function isTextKind(kind: NodeKind) {
@@ -2031,14 +2896,18 @@ function isTextKind(kind: NodeKind) {
 
 function canConnect(from: CanvasElement, to: CanvasElement) {
   if (from.id === to.id || !hasOutput(from.kind) || !acceptsInput(to.kind)) return false
+  if (from.kind === 'view_control') return to.kind === 'image'
   if (to.kind === 'merge') return true
+  if (to.kind === 'view_control') return outputTypes(from).includes('image')
   if (from.kind === 'image_media') return to.kind === 'image' || to.kind === 'video' || to.kind === 'mask'
+  if (to.kind === 'tail_frame') return outputTypes(from).includes('video')
   return outputTypes(from).some((type) => acceptedInputTypes(to).includes(type))
 }
 
 function outputTypes(element: CanvasElement): NodeValueType[] {
   if (element.kind === 'prompt' || element.kind === 'llm') return ['text']
-  if (element.kind === 'image_media' || element.kind === 'image' || element.kind === 'mask') return ['image']
+  if (element.kind === 'view_control') return ['text', 'image']
+  if (element.kind === 'image_media' || element.kind === 'image' || element.kind === 'mask' || element.kind === 'tail_frame') return ['image']
   if (element.kind === 'video_media' || element.kind === 'video') return ['video']
   if (element.kind === 'audio_media' || element.kind === 'audio') return ['audio']
   if (element.kind === 'merge') return ['merge']
@@ -2052,17 +2921,19 @@ function acceptedInputTypes(element: CanvasElement): NodeValueType[] {
   if (element.kind === 'video') return ['text', 'image', 'video', 'audio', 'merge']
   if (element.kind === 'audio') return ['text', 'audio', 'merge']
   if (element.kind === 'mask') return ['image']
+  if (element.kind === 'tail_frame') return ['video']
+  if (element.kind === 'view_control') return ['image']
   if (element.kind === 'merge') return ['text', 'image', 'video', 'audio', 'merge']
   return []
 }
 
 function connectableTargetKinds(from: CanvasElement): NodeKind[] {
-  const candidates: NodeKind[] = ['prompt', 'llm', 'image', 'video', 'audio', 'merge', 'mask']
+  const candidates: NodeKind[] = ['prompt', 'llm', 'image', 'video', 'audio', 'merge', 'view_control', 'mask', 'tail_frame']
   return candidates.filter((kind) => canConnect(from, { ...from, id: '__target__', kind } as CanvasElement))
 }
 
 function connectableSourceKinds(to: CanvasElement): NodeKind[] {
-  const candidates: NodeKind[] = ['prompt', 'llm', 'image', 'video', 'audio', 'merge', 'mask', 'image_media', 'video_media', 'audio_media']
+  const candidates: NodeKind[] = ['prompt', 'llm', 'image', 'video', 'audio', 'merge', 'view_control', 'mask', 'image_media', 'video_media', 'audio_media']
   return candidates.filter((kind) => canConnect({ ...to, id: '__source__', kind } as CanvasElement, to))
 }
 
@@ -2099,9 +2970,11 @@ function elementTitle(element: CanvasElement) {
   if (element.kind === 'ai') return 'AI 生成'
   if (element.kind === 'prompt') return '文字提示词'
   if (element.kind === 'merge') return '汇合节点'
+  if (element.kind === 'view_control') return '3D 视角控制'
   if (element.kind === 'llm') return '生文字节点'
   if (element.kind === 'image') return '生图节点'
   if (element.kind === 'mask') return '蒙版节点'
+  if (element.kind === 'tail_frame') return '尾帧节点'
   if (element.kind === 'video') return '生视频节点'
   if (element.kind === 'audio') return '生音频节点'
   if (element.kind === 'image_media') return '图片媒体'
@@ -2124,7 +2997,9 @@ function nodeBadgePrefix(kind: NodeKind) {
   if (kind === 'video_media' || kind === 'video') return 'VIDEO'
   if (kind === 'audio_media' || kind === 'audio') return 'AUDIO'
   if (kind === 'merge') return 'MERGE'
+  if (kind === 'view_control') return 'VIEW'
   if (kind === 'mask') return 'MASK'
+  if (kind === 'tail_frame') return 'IMAGE'
   return ''
 }
 
@@ -2156,11 +3031,35 @@ function promptTextFor(element: CanvasElement, visited = new Set<string>()): str
   if (visited.has(element.id)) return ''
   visited.add(element.id)
   if (element.kind === 'llm') return (element.text || '').trim()
+  if (element.kind === 'view_control') return viewControlPrompt(element)
   const upstreamText = connectedInputs(element)
     .filter((item) => isPromptLike(item.kind))
     .map((item) => promptTextFor(item, visited))
   if (element.kind === 'prompt') upstreamText.push(element.text || '')
   return upstreamText.map((text) => text.trim()).filter(Boolean).join('\n')
+}
+
+function viewControlPrompt(element: CanvasElement) {
+  const azimuth = Math.round(element.view_azimuth ?? 0)
+  const elevation = Math.round(element.view_elevation ?? 0)
+  const roll = Math.round(element.view_roll ?? 0)
+  const distance = Math.round(element.view_distance ?? 50)
+  const direction = viewControlDirectionLabel(element)
+  return [
+    `基于参考图生成同一主体的新视角：${direction}。`,
+    `相机方位角 ${azimuth} 度，俯仰角 ${elevation} 度，画面滚转 ${roll} 度，镜头距离 ${distance}%。`,
+    '保持主体身份、材质、颜色和关键细节一致，只改变观察视角；补全新视角中合理可见的结构。',
+    element.text?.trim(),
+  ].filter(Boolean).join('\n')
+}
+
+function viewControlDirectionLabel(element: CanvasElement) {
+  const azimuth = normalizeAzimuth(element.view_azimuth ?? 0)
+  const elevation = element.view_elevation ?? 0
+  const absAzimuth = Math.abs(azimuth)
+  const horizontal = absAzimuth < 8 ? '正面' : absAzimuth > 172 ? '背面' : azimuth > 0 ? `向右旋转 ${Math.round(absAzimuth)} 度` : `向左旋转 ${Math.round(absAzimuth)} 度`
+  const vertical = Math.abs(elevation) < 8 ? '水平视角' : elevation > 0 ? `俯视 ${Math.round(Math.abs(elevation))} 度` : `仰视 ${Math.round(Math.abs(elevation))} 度`
+  return `${horizontal}，${vertical}`
 }
 
 function llmInputPrompt(element: CanvasElement) {
@@ -2181,30 +3080,38 @@ function mediaReferences(element: CanvasElement) {
   const reference_videos: MediaAsset[] = []
   const reference_audios: MediaAsset[] = []
   const sources = referenceSourceElements(element)
+  const selectedFrameSourceIDs = selectedVideoFrameSourceIDs(element)
+  const allowNonImageReferences = !(element.kind === 'video' && canvasSupportsDraft(element))
   for (const source of sources) {
-    const label = nodeBadge(source)
-    const localImage = withReferenceMeta(localUploadedImage(source), source, label)
-    const localAsset = withMediaReferenceMeta(localMediaAsset(source), source, label)
+    const referenceSource = referenceIdentitySource(source)
+    const label = nodeBadge(referenceSource)
+    const frameRole = videoFrameRoleForSource(element, referenceSource)
+    const useImageSource = !selectedFrameSourceIDs.size || selectedFrameSourceIDs.has(source.id)
+    if (source.kind === 'mask') continue
+    const localImage = useImageSource ? withReferenceMeta(localUploadedImage(source), referenceSource, label, frameRole) : undefined
+    const localAsset = allowNonImageReferences ? withMediaReferenceMeta(localMediaAsset(source), source, label) : undefined
     if (localImage?.url) reference_images.push(localImage)
     if (localAsset?.url && localAsset.type === 'video') reference_videos.push(localAsset)
     if (localAsset?.url && localAsset.type === 'audio') reference_audios.push(localAsset)
-    const image = localImage?.url ? undefined : withReferenceMeta(taskResultImage(source), source, label)
-    const video = localAsset?.url ? undefined : withMediaReferenceMeta(taskResultVideo(source), source, label)
+    const image = localImage?.url || !useImageSource ? undefined : withReferenceMeta(taskResultImage(source), referenceSource, label, frameRole)
+    const video = localAsset?.url || !allowNonImageReferences ? undefined : withMediaReferenceMeta(taskResultVideo(source), source, label)
     if (image?.url) reference_images.push(image)
     if (video?.url) reference_videos.push(video)
     for (const audio of taskForElement(source)?.reference_audios || []) {
-      const audioAsset = withMediaReferenceMeta({ ...audio, type: audio.type || 'audio' }, source, label)
+      const audioAsset = allowNonImageReferences ? withMediaReferenceMeta({ ...audio, type: audio.type || 'audio' }, source, label) : undefined
       if (audioAsset?.url) reference_audios.push(audioAsset)
     }
   }
   for (const source of sources.filter((item) => item.kind === 'mask')) {
     const sourceElement = maskSourceElement(source)
+    if (selectedFrameSourceIDs.size && (!sourceElement || !selectedFrameSourceIDs.has(sourceElement.id))) continue
     const image = sourceElement ? localUploadedImage(sourceElement) || taskResultImage(sourceElement) : undefined
+    const frameRole = videoFrameRoleForSource(element, sourceElement || source)
     const maskedImage = image?.url ? withReferenceMeta({
       ...image,
       mask_url: source.mask_data_url || image.mask_url,
       mask_reference_label: nodeBadge(source),
-    }, sourceElement || source, sourceElement ? nodeBadge(sourceElement) : nodeBadge(source)) : undefined
+    }, sourceElement || source, sourceElement ? nodeBadge(sourceElement) : nodeBadge(source), frameRole) : undefined
     if (maskedImage?.url) reference_images.push(maskedImage)
   }
   return {
@@ -2214,13 +3121,45 @@ function mediaReferences(element: CanvasElement) {
   }
 }
 
-function referenceSourceElements(element: CanvasElement) {
-  const prompt = element.kind === 'llm' ? llmInputPrompt(element) : promptTextFor(element)
-  const sources = new Map<string, CanvasElement>()
-  for (const source of connectedInputs(element)) {
-    for (const item of expandedReferenceSources(source)) sources.set(item.id, item)
+function inputSummaryCounts(element: CanvasElement) {
+  const refs = mediaReferences(element)
+  return {
+    prompts: referencePromptElements(element).length,
+    images: refs.reference_images.length,
+    videos: refs.reference_videos.length,
+    audios: refs.reference_audios.length,
   }
-  for (const source of mentionedElements(prompt)) sources.set(source.id, source)
+}
+
+function referencePromptElements(element: CanvasElement) {
+  const prompts = new Map<string, CanvasElement>()
+  for (const source of connectedInputs(element)) {
+    for (const item of expandedPromptSources(source)) {
+      if ((item.kind === 'prompt' || item.kind === 'llm') && promptTextFor(item).trim()) prompts.set(item.id, item)
+    }
+  }
+  return Array.from(prompts.values())
+}
+
+function expandedPromptSources(element: CanvasElement, visited = new Set<string>()): CanvasElement[] {
+  if (visited.has(element.id)) return []
+  visited.add(element.id)
+  if (element.kind === 'merge') return connectedInputs(element).flatMap((source) => expandedPromptSources(source, visited))
+  return element.kind === 'prompt' || element.kind === 'llm' || element.kind === 'view_control' ? [element] : []
+}
+
+function referenceSourceElements(element: CanvasElement) {
+  const sources = new Map<string, CanvasElement>()
+  const chainElements = connectedComponentElements(element)
+  for (const source of connectedInputs(element)) {
+    const directSources = expandedReferenceSources(source)
+    for (const item of directSources) {
+      sources.set(item.id, item)
+      for (const mentioned of mentionedElements(referenceMentionText(item), chainElements)) {
+        sources.set(mentioned.id, mentioned)
+      }
+    }
+  }
   return Array.from(sources.values())
 }
 
@@ -2233,14 +3172,68 @@ function expandedReferenceSources(element: CanvasElement, visited = new Set<stri
   return [element]
 }
 
-function mentionedElements(text: string) {
-  const badges = new Set(Array.from(text.matchAll(/@([A-Z]+\d{2})/g)).map((match) => match[1]))
-  if (!badges.size) return []
-  return (activeCanvas.value?.elements || []).filter((item) => badges.has(nodeBadge(item)) && isMentionableElement(item))
+function referenceMentionText(element: CanvasElement) {
+  if (element.kind === 'prompt' || element.kind === 'llm' || element.kind === 'view_control') return promptTextFor(element)
+  return ''
 }
 
-function withReferenceMeta(image: UploadedImage | undefined, element: CanvasElement, label: string) {
-  return image?.url ? { ...image, node_id: element.id, reference_label: label } : undefined
+function mentionedElements(text: string, scopeElements = activeCanvas.value?.elements || []) {
+  const badges = new Set(Array.from(text.matchAll(/@([A-Z]+\d{2})/g)).map((match) => match[1]))
+  if (!badges.size) return []
+  return scopeElements.filter((item) => badges.has(nodeBadge(item)) && isMentionableElement(item))
+}
+
+function withReferenceMeta(image: UploadedImage | undefined, element: CanvasElement, label: string, videoFrameRole?: UploadedImage['video_frame_role']) {
+  return image?.url ? { ...image, node_id: element.id, reference_label: label, video_frame_role: normalizeVideoFrameRole(videoFrameRole) } : undefined
+}
+
+function normalizeVideoFrameRole(role?: string): UploadedImage['video_frame_role'] {
+  return role === 'first_frame' || role === 'last_frame' ? role : ''
+}
+
+function videoFrameRoleForSource(element: CanvasElement, source: CanvasElement): UploadedImage['video_frame_role'] {
+  if (element.kind !== 'video' || !canvasSupportsDraft(element)) return ''
+  if (source.id && source.id === element.video_first_frame_source_id) return 'first_frame'
+  if (source.id && source.id === element.video_last_frame_source_id) return 'last_frame'
+  return ''
+}
+
+function selectedVideoFrameSourceIDs(element: CanvasElement) {
+  const ids = new Set<string>()
+  if (element.kind !== 'video' || !canvasSupportsDraft(element)) return ids
+  if (element.video_first_frame_source_id) ids.add(element.video_first_frame_source_id)
+  if (element.video_last_frame_source_id) ids.add(element.video_last_frame_source_id)
+  return ids
+}
+
+function videoFrameCandidates(element: CanvasElement) {
+  if (element.kind !== 'video' || !canvasSupportsDraft(element)) return []
+  return referenceSourceElements(element)
+    .filter((source) => source.kind !== 'mask')
+    .map((source) => {
+      const image = localUploadedImage(source) || taskResultImage(source)
+      if (!image?.url) return undefined
+      return { id: source.id, label: nodeBadge(source) || elementTitle(source), image }
+    })
+    .filter(Boolean) as { id: string; label: string; image: UploadedImage }[]
+}
+
+function setVideoNodeFrameSource(element: CanvasElement, role: UploadedImage['video_frame_role'], sourceID: string) {
+  const normalizedRole = normalizeVideoFrameRole(role)
+  if (element.kind !== 'video' || !normalizedRole || !sourceID) return
+  if (normalizedRole === 'first_frame') {
+    element.video_first_frame_source_id = element.video_first_frame_source_id === sourceID ? '' : sourceID
+    if (element.video_last_frame_source_id === element.video_first_frame_source_id) element.video_last_frame_source_id = ''
+    return
+  }
+  element.video_last_frame_source_id = element.video_last_frame_source_id === sourceID ? '' : sourceID
+  if (element.video_first_frame_source_id === element.video_last_frame_source_id) element.video_first_frame_source_id = ''
+}
+
+function videoNodeFrameRoleForCandidate(element: CanvasElement, sourceID: string) {
+  if (sourceID === element.video_first_frame_source_id) return 'first_frame'
+  if (sourceID === element.video_last_frame_source_id) return 'last_frame'
+  return ''
 }
 
 function withMediaReferenceMeta(asset: MediaAsset | undefined, element: CanvasElement, label: string) {
@@ -2279,7 +3272,86 @@ function maskSourceImage(element: CanvasElement) {
 }
 
 function maskSourceElement(element: CanvasElement) {
-  return connectedInputs(element).find((item) => item.kind === 'image_media' || item.kind === 'image')
+  return connectedInputs(element).find((item) => outputTypes(item).includes('image'))
+}
+
+function updateVideoFrameTime(element: CanvasElement, seconds: number) {
+  videoFrameTimeByNodeID.value = { ...videoFrameTimeByNodeID.value, [element.id]: seconds }
+}
+
+function updateVideoDuration(element: CanvasElement, seconds: number) {
+  videoDurationByNodeID.value = { ...videoDurationByNodeID.value, [element.id]: seconds }
+}
+
+function videoFrameFilename(element: CanvasElement, seconds: number) {
+  const time = String(Math.max(0, seconds)).replace(/\./g, '-')
+  return `${nodeBadge(element) || 'VIDEO'}-tail-${time}s.png`
+}
+
+function dataURLToFile(dataURL: string, filename: string) {
+  const [header, data] = dataURL.split(',')
+  const mime = header.match(/^data:(.*?);base64$/)?.[1] || 'image/png'
+  const bytes = atob(data || '')
+  const buffer = new Uint8Array(bytes.length)
+  for (let index = 0; index < bytes.length; index += 1) buffer[index] = bytes.charCodeAt(index)
+  return new File([buffer], filename, { type: mime })
+}
+
+function captureVideoFrame(url: string, seconds: number, fromTail = false) {
+  return new Promise<string>((resolve, reject) => {
+    const video = document.createElement('video')
+    let settled = false
+    const timer = window.setTimeout(() => fail('视频加载或定位超时，请确认视频地址可播放并支持拖动进度'), 15000)
+    const cleanup = () => {
+      window.clearTimeout(timer)
+      video.pause()
+      video.removeAttribute('src')
+      video.load()
+    }
+    const fail = (message = '取帧失败，请确认视频可访问并允许跨域读取') => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(new Error(message))
+    }
+    const finish = () => {
+      if (settled) return
+      try {
+        const width = video.videoWidth || 1280
+        const height = video.videoHeight || 720
+        const canvas = document.createElement('canvas')
+        canvas.width = width
+        canvas.height = height
+        const ctx = canvas.getContext('2d')
+        if (!ctx) throw new Error('无法创建取帧画布')
+        ctx.drawImage(video, 0, 0, width, height)
+        settled = true
+        const dataURL = canvas.toDataURL('image/png')
+        cleanup()
+        resolve(dataURL)
+      } catch (error) {
+        const message = error instanceof DOMException && error.name === 'SecurityError'
+          ? '浏览器禁止导出该视频帧，请检查视频文件 GET/Range 响应和最终跳转地址是否都带有 CORS 头'
+          : error instanceof Error
+            ? error.message
+            : '取帧失败'
+        fail(message)
+      }
+    }
+    video.crossOrigin = 'anonymous'
+    video.muted = true
+    video.playsInline = true
+    video.preload = 'auto'
+    video.addEventListener('error', () => fail('视频加载失败，请确认视频地址可访问且浏览器可播放该编码'), { once: true })
+    video.addEventListener('loadedmetadata', () => {
+      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : seconds
+      const targetTime = fromTail ? Math.max(0, duration - 0.05) : seconds
+      video.currentTime = clamp(targetTime, 0, Math.max(0, duration - 0.05))
+    }, { once: true })
+    video.addEventListener('seeked', finish, { once: true })
+    video.src = url
+    video.load()
+  })
 }
 
 function prepareMaskCanvas(event: Event, element: CanvasElement) {
@@ -2526,8 +3598,14 @@ async function runGenerateNode(element: CanvasElement) {
   syncActiveEditable()
   if (element.kind === 'mask' || element.kind === 'audio' || element.frozen) return
   runningNodeID.value = element.id
+  element.generated_params = []
   nodeRunState.value = { ...nodeRunState.value, [element.id]: { status: 'running', startedAt: Date.now() } }
   try {
+    if (element.kind === 'tail_frame') {
+      await runTailFrameNode(element)
+      nodeRunState.value = { ...nodeRunState.value, [element.id]: { ...nodeRunState.value[element.id], status: 'succeeded', endedAt: Date.now() } }
+      return
+    }
     if (element.kind === 'llm') {
       const refs = mediaReferences(element)
       const payload = {
@@ -2540,6 +3618,7 @@ async function runGenerateNode(element: CanvasElement) {
       }
       const applyResult = (text: string) => {
         element.text = text
+        element.generated_params = llmPayloadParamChips(payload)
       }
       if (props.runLlmAction) await props.runLlmAction(payload, applyResult)
       else emit('runLlm', payload, applyResult)
@@ -2567,12 +3646,15 @@ async function runGenerateNode(element: CanvasElement) {
       video_resolution: element.video_resolution || props.defaultForm.video_resolution,
       video_duration: Number(element.video_duration ?? props.defaultForm.video_duration),
       generate_audio: element.generate_audio ?? props.defaultForm.generate_audio,
-      watermark: element.watermark ?? props.defaultForm.watermark,
+      video_draft: canvasVideoDraft(element),
+      watermark: false,
     }
     let latestTask: Task | undefined
     const applyTask = (task: Task) => {
       latestTask = task
       element.task_id = task.id
+      element.task_snapshot = { ...task }
+      element.generated_params = task.status === 'succeeded' ? taskParamChips(task) : []
     }
     if (props.runNodeAction) await props.runNodeAction(payload, applyTask)
     else emit('runNode', payload, applyTask)
@@ -2604,7 +3686,8 @@ async function runToNode(element: CanvasElement) {
 async function runCanvasWorkflow() {
   if (runningWorkflow.value) return
   runningWorkflow.value = true
-  const workflowIDs = new Set((activeCanvas.value?.elements || []).filter((element) => isRunnableKind(element.kind) && !element.frozen && !isLineBusy(element)).map((element) => element.id))
+  const blockedIDs = frozenUpstreamIDs()
+  const workflowIDs = new Set((activeCanvas.value?.elements || []).filter((element) => isRunnableKind(element.kind) && !element.frozen && !blockedIDs.has(element.id) && !isLineBusy(element)).map((element) => element.id))
   addRunningLine(workflowIDs)
   try {
     const visited = new Set<string>()
@@ -2630,6 +3713,10 @@ function elementsByWorkflowLevel() {
 
 async function runElementWithDependencies(element: CanvasElement, visited: Set<string>, visiting: Set<string>) {
   if (visited.has(element.id) || visiting.has(element.id)) return
+  if (element.frozen) {
+    visited.add(element.id)
+    return
+  }
   visiting.add(element.id)
   for (const source of runnableDependencyInputs(element)) {
     if (isRunnableKind(source.kind)) await runElementWithDependencies(source, visited, visiting)
@@ -2642,6 +3729,7 @@ async function runElementWithDependencies(element: CanvasElement, visited: Set<s
 function collectDependencyIDs(element: CanvasElement, seen = new Set<string>()) {
   if (seen.has(element.id)) return seen
   seen.add(element.id)
+  if (element.frozen) return seen
   for (const source of runnableDependencyInputs(element)) {
     if (isRunnableKind(source.kind)) collectDependencyIDs(source, seen)
   }
@@ -2657,6 +3745,38 @@ function runnableDependencyInputs(element: CanvasElement, visited = new Set<stri
   return connectedInputs(element).flatMap((source) => source.kind === 'merge' ? runnableDependencyInputs(source, visited) : [source])
 }
 
+function frozenUpstreamIDs() {
+  const blocked = new Set<string>()
+  for (const element of activeCanvas.value?.elements || []) {
+    if (element.frozen) collectUpstreamIDs(element, blocked)
+  }
+  return blocked
+}
+
+function collectUpstreamIDs(element: CanvasElement, blocked: Set<string>, seen = new Set<string>()) {
+  if (seen.has(element.id)) return
+  seen.add(element.id)
+  for (const source of connectedInputs(element)) {
+    if (isRunnableKind(source.kind)) blocked.add(source.id)
+    collectUpstreamIDs(source, blocked, seen)
+  }
+}
+
+async function runTailFrameNode(element: CanvasElement) {
+  const sourceElement = connectedInputs(element).find((item) => outputTypes(item).includes('video'))
+  const source = sourceElement ? localMediaAsset(sourceElement) || taskResultVideo(sourceElement) : undefined
+  if (!source?.url) throw new Error('尾帧节点没有可用的上游视频')
+  const duration = source.duration || sourceElement?.video_duration || videoDurationByNodeID.value[sourceElement?.id || ''] || 0
+  const seconds = Math.max(0, Number(duration) - 0.05)
+  const filename = videoFrameFilename(sourceElement || element, seconds)
+  const dataURL = await captureVideoFrame(source.url, seconds, true)
+  const uploaded = await uploadImage(dataURLToFile(dataURL, filename))
+  element.media_type = 'image'
+  element.media_url = uploaded.url
+  element.media_thumbnail_url = uploaded.thumbnail_url || uploaded.url
+  element.media_filename = uploaded.filename || filename
+}
+
 function screenToWorld(clientX: number, clientY: number) {
   const rect = document.querySelector('.canvas-workspace')?.getBoundingClientRect()
   return { x: (clientX - (rect?.left || 0) - camera.x) / camera.zoom, y: (clientY - (rect?.top || 0) - camera.y) / camera.zoom }
@@ -2668,13 +3788,15 @@ function minNodeSize(kind: NodeKind) {
   if (kind === 'image') return { width: 560, height: 260 }
   if (kind === 'video') return { width: 640, height: 270 }
   if (kind === 'audio') return { width: 420, height: 220 }
+  if (kind === 'tail_frame') return { width: 360, height: 260 }
   if (kind === 'image_media') return { width: 260, height: 220 }
   if (kind === 'video_media') return { width: 360, height: 230 }
   if (kind === 'audio_media') return { width: 280, height: 170 }
   if (kind === 'llm') return { width: 380, height: 240 }
   if (kind === 'mask') return { width: 380, height: 260 }
   if (kind === 'prompt') return { width: 260, height: 140 }
-  if (kind === 'merge') return { width: 240, height: 140 }
+  if (kind === 'merge') return { width: 260, height: 190 }
+  if (kind === 'view_control') return { width: 420, height: 470 }
   return { width: 180, height: 140 }
 }
 
@@ -2688,12 +3810,13 @@ function renderedNodeSize(element: CanvasElement) {
 
 function miniMapNodeColor(node: { data?: { element?: CanvasElement } }) {
   const kind = node.data?.element?.kind
-  if (kind === 'video' || kind === 'video_media') return 'rgba(125, 211, 252, .86)'
-  if (kind === 'image' || kind === 'image_media' || kind === 'mask') return 'rgba(167, 243, 208, .82)'
-  if (kind === 'audio' || kind === 'audio_media') return 'rgba(216, 180, 254, .82)'
-  if (kind === 'prompt' || kind === 'llm') return 'rgba(253, 230, 138, .82)'
-  if (kind === 'merge') return 'rgba(248, 250, 252, .72)'
-  return 'rgba(226, 232, 240, .78)'
+  if (kind === 'video' || kind === 'video_media') return 'rgba(2, 132, 199, .92)'
+  if (kind === 'image' || kind === 'image_media' || kind === 'mask' || kind === 'tail_frame') return 'rgba(5, 150, 105, .9)'
+  if (kind === 'audio' || kind === 'audio_media') return 'rgba(124, 58, 237, .9)'
+  if (kind === 'prompt' || kind === 'llm') return 'rgba(180, 83, 9, .9)'
+  if (kind === 'view_control') return 'rgba(109, 40, 217, .9)'
+  if (kind === 'merge') return 'rgba(71, 85, 105, .88)'
+  return 'rgba(51, 65, 85, .88)'
 }
 
 function onFlowConnect(connection: Connection) {
@@ -2809,10 +3932,12 @@ function onFlowEdgesChange(changes: EdgeChange[]) {
 function onFlowPaneClick() {
   selectedNodeIDs.value = new Set()
   canvasContextMenu.value = null
+  modelMenuElementID.value = ''
 }
 
 function onFlowNodeDragStart(_event: NodeDragEvent) {
-  return
+  hideInspectorDuringDrag.value = true
+  modelMenuElementID.value = ''
 }
 
 function syncFlowNodePositions(nodes: Node[]) {
@@ -2831,6 +3956,8 @@ async function onFlowNodeDragStop(_event: NodeDragEvent) {
   syncFlowNodePositions(flow.getNodes.value)
   saveCanvases()
   queueCanvasHistorySnapshot()
+  await nextTick()
+  hideInspectorDuringDrag.value = false
 }
 
 function onFlowViewportChange(viewport: ViewportTransform) {
@@ -2846,6 +3973,7 @@ function startNodeDrag(event: PointerEvent, element: CanvasElement) {
   event.preventDefault()
     ; (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
   const target = event.altKey ? duplicateElement(element) : element
+  hideInspectorDuringDrag.value = true
   dragState.value = { type: 'node', id: target.id, startX: event.clientX, startY: event.clientY, originX: target.x, originY: target.y }
 }
 
@@ -2897,15 +4025,11 @@ function openConnectionTargetMenu(from: CanvasElement, event: { clientX: number;
     showInvalidConnectionNotice(from)
     return
   }
-  canvasContextMenu.value = {
-    x: event.clientX,
-    y: event.clientY,
-    items: targetKinds.map((kind) => ({
+  canvasContextMenu.value = placeContextMenu(event.clientX, event.clientY, targetKinds.map((kind) => ({
       label: elementTitle({ id: '__label__', kind, x: 0, y: 0, width: 0, height: 0 } as CanvasElement),
       icon: contextIconForKind(kind),
       action: () => createConnectedTarget(from, kind, point),
-    })),
-  }
+    })))
 }
 
 function openConnectionSourceMenu(to: CanvasElement, event: { clientX: number; clientY: number }) {
@@ -2915,23 +4039,20 @@ function openConnectionSourceMenu(to: CanvasElement, event: { clientX: number; c
     showInvalidSourceNotice(to)
     return
   }
-  canvasContextMenu.value = {
-    x: event.clientX,
-    y: event.clientY,
-    items: sourceKinds.map((kind) => ({
+  canvasContextMenu.value = placeContextMenu(event.clientX, event.clientY, sourceKinds.map((kind) => ({
       label: elementTitle({ id: '__label__', kind, x: 0, y: 0, width: 0, height: 0 } as CanvasElement),
       icon: contextIconForKind(kind),
       action: () => createConnectedSource(to, kind, point),
-    })),
-  }
+    })))
 }
 
 function contextIconForKind(kind: NodeKind) {
   if (kind === 'prompt' || kind === 'llm') return 'text'
-  if (kind === 'image' || kind === 'image_media') return 'image'
+  if (kind === 'image' || kind === 'image_media' || kind === 'tail_frame') return 'image'
   if (kind === 'video' || kind === 'video_media') return 'video'
   if (kind === 'audio' || kind === 'audio_media') return 'audio'
   if (kind === 'merge') return 'merge'
+  if (kind === 'view_control') return 'compass'
   if (kind === 'mask') return 'brush'
   return 'sparkles'
 }
@@ -2945,6 +4066,9 @@ function createConnectedTarget(from: CanvasElement, kind: NodeKind, point: { x: 
   }
   pushCanvasElement(target, point)
   activeCanvas.value.connections.push({ id: createID(), from: from.id, to: target.id })
+  if (kind === 'tail_frame' && (localMediaAsset(from)?.url || taskResultVideo(from)?.url)) {
+    void runGenerateNode(target).catch((error) => showCanvasNotice(error instanceof Error ? error.message : '尾帧提取失败'))
+  }
 }
 
 function createConnectedSource(to: CanvasElement, kind: NodeKind, point: { x: number; y: number }) {
@@ -2966,6 +4090,43 @@ function createElementForConnectionTarget(kind: NodeKind, point: { x: number; y:
   if (kind === 'merge') {
     const minSize = minNodeSize('merge')
     return { id: createID(), kind: 'merge', text: '', x: point.x, y: point.y - minSize.height / 2, width: minSize.width, height: minSize.height, zIndex: maxCanvasZIndex() + 1 }
+  }
+  if (kind === 'view_control') {
+    const minSize = minNodeSize('view_control')
+    return {
+      id: createID(),
+      kind: 'view_control',
+      text: '',
+      view_azimuth: 30,
+      view_elevation: 0,
+      view_roll: 0,
+      view_distance: 50,
+      view_scene_yaw: -28,
+      view_scene_pitch: 18,
+      view_scene_zoom: 1,
+      x: point.x - minSize.width / 2,
+      y: point.y - minSize.height / 2,
+      width: minSize.width,
+      height: minSize.height,
+      zIndex: maxCanvasZIndex() + 1,
+    }
+  }
+  if (kind === 'tail_frame') {
+    const minSize = minNodeSize('tail_frame')
+    return {
+      id: createID(),
+      kind: 'tail_frame',
+      media_type: 'image',
+      media_url: '',
+      media_thumbnail_url: '',
+      media_filename: '',
+      text: '尾帧',
+      x: point.x - minSize.width / 2,
+      y: point.y - minSize.height / 2,
+      width: minSize.width,
+      height: minSize.height,
+      zIndex: maxCanvasZIndex() + 1,
+    }
   }
   if (kind === 'llm' || kind === 'image' || kind === 'video' || kind === 'audio' || kind === 'mask') {
     const element = createProcessElement(kind, point)
@@ -3059,7 +4220,9 @@ function onPointerMove(event: PointerEvent) {
 }
 
 function stopDrag(event?: PointerEvent) {
+  const wasNodeDrag = dragState.value?.type === 'node'
   dragState.value = null
+  if (wasNodeDrag) hideInspectorDuringDrag.value = false
 }
 
 function onCanvasWheel(event: WheelEvent) {
@@ -3109,6 +4272,159 @@ function toggleMiniMap(event?: Event) {
   if (event) blurControl(event)
 }
 
+function viewControlKnobStyle(element: CanvasElement) {
+  const point = viewControlCameraPoint(element)
+  return {
+    opacity: String(point.depth < -0.16 ? 0.58 : 1),
+    transform: `translate(calc(-50% + ${point.x}px), calc(-50% + ${point.y}px)) scale(${point.scale}) rotate(${point.azimuth}deg)`,
+    zIndex: String(point.depth < 0 ? 4 : 8),
+  }
+}
+
+function viewControlPreviewStyle(element: CanvasElement) {
+  const distance = clamp(element.view_distance ?? 50, 0, 100)
+  const scale = 1.1 - distance / 500
+  return {
+    transform: `translate(-50%, -50%) scale(${scale})`,
+  }
+}
+
+function viewControlRigStyle(element: CanvasElement) {
+  const roll = clamp(element.view_roll ?? 0, -45, 45)
+  const yaw = normalizeAzimuth(element.view_scene_yaw ?? -28)
+  const pitch = clamp(element.view_scene_pitch ?? 18, -65, 65)
+  const sceneZoom = clamp(element.view_scene_zoom ?? 1, 0.72, 1.7)
+  return {
+    transform: `scale(${sceneZoom}) rotateX(${pitch}deg) rotateY(${yaw}deg) rotateZ(${roll}deg)`,
+  }
+}
+
+function viewControlSightlineStyle(element: CanvasElement) {
+  const point = viewControlCameraPoint(element)
+  const length = Math.max(34, Math.hypot(point.x, point.y) - 24)
+  const angle = Math.atan2(point.y, point.x) * 180 / Math.PI
+  return {
+    opacity: String(point.depth < -0.16 ? 0.38 : 0.82),
+    width: `${length}px`,
+    transform: `rotate(${angle}deg)`,
+    zIndex: String(point.depth < 0 ? 3 : 7),
+  }
+}
+
+function viewControlCameraPoint(element: CanvasElement) {
+  const azimuth = normalizeAzimuth(element.view_azimuth ?? 0)
+  const elevation = clamp(element.view_elevation ?? 0, -60, 60)
+  const azimuthRad = azimuth * Math.PI / 180
+  const elevationRad = elevation * Math.PI / 180
+  const cosElevation = Math.cos(elevationRad)
+  const depth = Math.cos(azimuthRad) * cosElevation
+  const x = Math.sin(azimuthRad) * cosElevation * 104
+  const y = -Math.sin(elevationRad) * 72 + depth * 14
+  return {
+    azimuth,
+    depth,
+    x,
+    y,
+    scale: 0.76 + (depth + 1) * 0.16,
+  }
+}
+
+function startViewControlSceneDrag(event: PointerEvent, element: CanvasElement) {
+  if (event.button !== 0) return
+  if (event.target instanceof HTMLElement && event.target.closest('button, input, .view-control-knob')) return
+  event.preventDefault()
+  event.stopPropagation()
+  ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+  viewControlDrag.value = {
+    type: 'scene',
+    elementID: element.id,
+    startX: event.clientX,
+    startY: event.clientY,
+    originYaw: element.view_scene_yaw ?? -28,
+    originPitch: element.view_scene_pitch ?? 18,
+  }
+}
+
+function startViewControlCameraDrag(event: PointerEvent, element: CanvasElement) {
+  if (event.button !== 0) return
+  event.preventDefault()
+  event.stopPropagation()
+  const stage = (event.currentTarget as HTMLElement).closest<HTMLElement>('.canvas-view-control-stage')
+  if (!stage) return
+  stage.setPointerCapture(event.pointerId)
+  viewControlDrag.value = { type: 'camera', elementID: element.id, target: stage }
+  updateViewControlFromPointer(event, element, stage)
+}
+
+function dragViewControl(event: PointerEvent, element: CanvasElement) {
+  const state = viewControlDrag.value
+  if (!state || state.elementID !== element.id) return
+  event.preventDefault()
+  event.stopPropagation()
+  if (state.type === 'scene') {
+    element.view_scene_yaw = normalizeAzimuth(state.originYaw + (event.clientX - state.startX) * 0.7)
+    element.view_scene_pitch = clamp(state.originPitch - (event.clientY - state.startY) * 0.5, -65, 65)
+    return
+  }
+  updateViewControlFromPointer(event, element, state.target)
+}
+
+function stopViewControlDrag(event?: PointerEvent) {
+  if (event?.currentTarget instanceof HTMLElement && event.currentTarget.hasPointerCapture(event.pointerId)) {
+    event.currentTarget.releasePointerCapture(event.pointerId)
+  }
+  viewControlDrag.value = null
+}
+
+function updateViewControlFromPointer(event: PointerEvent, element: CanvasElement, target: HTMLElement) {
+  const rect = target.getBoundingClientRect()
+  const centerX = rect.left + rect.width / 2
+  const centerY = rect.top + rect.height / 2
+  const dx = event.clientX - centerX
+  const dy = event.clientY - centerY
+  element.view_azimuth = normalizeAzimuth(Math.round(clamp(dx / Math.max(1, rect.width * 0.42), -1, 1) * 180))
+  element.view_elevation = clamp(Math.round(clamp(-dy / Math.max(1, rect.height * 0.36), -1, 1) * 60), -60, 60)
+}
+
+function nudgeViewControl(element: CanvasElement, axis: 'azimuth' | 'elevation' | 'roll', delta: number) {
+  if (axis === 'azimuth') element.view_azimuth = normalizeAzimuth(Math.round((element.view_azimuth ?? 0) + delta))
+  if (axis === 'elevation') element.view_elevation = clamp(Math.round((element.view_elevation ?? 0) + delta), -60, 60)
+  if (axis === 'roll') element.view_roll = clamp(Math.round((element.view_roll ?? 0) + delta), -45, 45)
+}
+
+function setViewControlAzimuth(element: CanvasElement, value: number) {
+  element.view_azimuth = normalizeAzimuth(value)
+}
+
+function updateViewControlPose(element: CanvasElement, value: { azimuth: number; elevation: number; distance: number }) {
+  element.view_azimuth = normalizeAzimuth(value.azimuth)
+  element.view_elevation = clamp(Math.round(value.elevation), -60, 60)
+  element.view_distance = clamp(Math.round(value.distance), 0, 100)
+}
+
+function resetViewControl(element: CanvasElement) {
+  element.view_azimuth = 30
+  element.view_elevation = 0
+  element.view_roll = 0
+  element.view_distance = 50
+  element.view_scene_yaw = -28
+  element.view_scene_pitch = 18
+  element.view_scene_zoom = 1
+}
+
+function zoomViewControlScene(event: WheelEvent, element: CanvasElement) {
+  event.preventDefault()
+  event.stopPropagation()
+  const current = element.view_scene_zoom ?? 1
+  const next = current * Math.exp(-event.deltaY * 0.0018)
+  element.view_scene_zoom = clamp(Number(next.toFixed(3)), 0.72, 1.7)
+}
+
+function normalizeAzimuth(value: number) {
+  const normalized = ((value + 180) % 360 + 360) % 360 - 180
+  return Object.is(normalized, -0) ? 0 : normalized
+}
+
 function onMiniMapClick(event: { position: { x: number; y: number } }) {
   flow.setCenter(event.position.x, event.position.y, { zoom: camera.zoom, duration: 160 })
 }
@@ -3116,7 +4432,7 @@ function onMiniMapClick(event: { position: { x: number; y: number } }) {
 function onCanvasPointerDownCapture(event: PointerEvent) {
   closeMentionMenuFromPointer(event)
   if (event.button !== 0 || spacePanning.value) return
-  if (event.target instanceof HTMLElement && event.target.closest('.canvas-topbar, .canvas-assets-fab, .canvas-minimap-toggle, .canvas-vueflow-minimap, .asset-sidebar, .context-menu')) return
+  if (event.target instanceof HTMLElement && event.target.closest('.canvas-topbar, .canvas-assets-fab, .canvas-minimap-toggle, .canvas-vueflow-minimap, .asset-sidebar, .canvas-inspector, .context-menu')) return
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -3125,24 +4441,23 @@ function clamp(value: number, min: number, max: number) {
 </script>
 
 <template>
-  <section class="canvas-workspace" :class="{ 'space-panning': spacePanning, 'zen-mode': zenMode }" @click="canvasContextMenu = null" @contextmenu.prevent.stop="openCanvasContextMenu" @wheel.capture="onCanvasWheel" @pointerdown.capture="onCanvasPointerDownCapture" @pointermove="onPointerMove" @pointerup="stopDrag" @pointercancel="stopDrag">
+  <section class="canvas-workspace" :class="{ 'space-panning': spacePanning, 'zen-mode': zenMode, 'assets-open': showAssets }" @click="canvasContextMenu = null" @contextmenu.prevent.stop="openCanvasContextMenu" @wheel.capture="onCanvasWheel" @pointerdown.capture="onCanvasPointerDownCapture" @pointermove="onPointerMove" @pointerup="stopDrag" @pointercancel="stopDrag">
     <div class="canvas-topbar glass-panel" :class="{ 'zen-collapsed': zenMode }" @pointerdown.stop>
       <div class="canvas-console-track">
         <div class="canvas-console-content" :aria-hidden="zenMode">
           <div class="canvas-switcher">
-            <select v-model="activeCanvasID" aria-label="选择画布">
-              <option v-for="canvas in canvases" :key="canvas.id" :value="canvas.id">{{ canvas.name }}</option>
-            </select>
+            <InlineSelect class="toolbar-status-select canvas-board-select" label="画布" :model-value="activeCanvasID" :options="canvasOptions" @update:model-value="activeCanvasID = $event" />
             <button type="button" title="新建画布" @click="createCanvas"><AppIcon name="add" /></button>
-            <button type="button" title="重命名画布" @click="renameCanvas"><AppIcon name="pencil" /></button>
-            <button type="button" title="删除画布" :disabled="canvases.length <= 1" @click="deleteCanvas"><AppIcon name="close" /></button>
+            <button type="button" title="重命名画布" @click="openRenameCanvas"><AppIcon name="pencil" /></button>
+            <button type="button" :title="activeCanvasShared ? '取消广场分享' : '分享到广场'" :disabled="!activeCanvas" @click="toggleActiveCanvasShare"><AppIcon :name="activeCanvasShared ? 'eyeOff' : 'share'" /></button>
+            <button type="button" title="更新广场分享" :disabled="!activeCanvas || !activeCanvasShared" @click="shareActiveCanvas"><AppIcon name="upload" /></button>
+            <button type="button" title="删除画布" :disabled="canvases.length <= 1" @click="openDeleteCanvas"><AppIcon name="close" /></button>
           </div>
           <span class="canvas-tool-divider" aria-hidden="true"></span>
           <div class="canvas-switcher canvas-node-tools">
             <button type="button" title="添加文字提示词" @click="addPromptNode()"><AppIcon name="text" /></button>
             <button type="button" title="添加媒体节点" @click="addAssetNode()"><AppIcon name="gallery" /></button>
             <button type="button" title="添加汇合节点" @click="addMergeNode()"><AppIcon name="merge" /></button>
-            <button type="button" title="添加蒙版节点" @click="addGenerateNode('mask')"><AppIcon name="brush" /></button>
             <button type="button" title="添加 AI 生成节点" @click="addAiNode()"><AppIcon name="sparkles" /></button>
             <button type="button" class="canvas-run-button" title="按连接顺序运行整张画布" :disabled="runningWorkflow" @click="runCanvasWorkflow"><AppIcon :name="runningWorkflow ? 'stop' : 'play'" /></button>
           </div>
@@ -3210,6 +4525,8 @@ function clamp(value: number, min: number, max: number) {
             data-placeholder="输入这里要使用的文字提示词，可输入 @ 引用连接节点素材..." @pointerdown.stop
             @mousedown.stop @click.stop @wheel.stop @input="onPromptTextInput($event, element)"
             @keyup="onPromptTextInput($event, element)" @keydown="onRichEditorKeydown($event, element)"
+            @compositionstart="onEditorCompositionStart($event, element)"
+            @compositionend="onEditorCompositionEnd($event, element)"
             @blur="syncEditableText($event, element)" v-html="renderEditableText(element.text)"></div>
         </div>
 
@@ -3229,7 +4546,68 @@ function clamp(value: number, min: number, max: number) {
         <div v-else-if="element.kind === 'merge'" class="canvas-merge-node">
           <div class="canvas-merge-symbol">
             <span>汇合</span>
-            <small>输入 {{ connectedInputs(element).length }}</small>
+            <div class="canvas-node-summary compact">
+              <span>提示词 {{ inputSummaryCounts(element).prompts }}</span>
+              <span>图片 {{ inputSummaryCounts(element).images }}</span>
+              <span>视频 {{ inputSummaryCounts(element).videos }}</span>
+              <span>音频 {{ inputSummaryCounts(element).audios }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div v-else-if="element.kind === 'view_control'" class="canvas-view-control-node" @pointerdown.stop>
+          <ViewControl3D
+            :image-url="displayImageURL(viewControlSourceImage(element)) || originalImageURL(viewControlSourceImage(element))"
+            :azimuth="element.view_azimuth ?? 0"
+            :elevation="element.view_elevation ?? 0"
+            :distance="element.view_distance ?? 50"
+            :roll="element.view_roll ?? 0"
+            @change="updateViewControlPose(element, $event)"
+          />
+          <div class="canvas-view-control-fields">
+            <label>
+              <span>方位 {{ Math.round(element.view_azimuth ?? 0) }}°</span>
+              <input v-model.number="element.view_azimuth" type="range" min="-180" max="180" />
+            </label>
+            <label>
+              <span>俯仰 {{ Math.round(element.view_elevation ?? 0) }}°</span>
+              <input v-model.number="element.view_elevation" type="range" min="-60" max="60" />
+            </label>
+            <label>
+              <span>滚转 {{ Math.round(element.view_roll ?? 0) }}°</span>
+              <input v-model.number="element.view_roll" type="range" min="-45" max="45" />
+            </label>
+            <label>
+              <span>距离 {{ Math.round(element.view_distance ?? 50) }}%</span>
+              <input v-model.number="element.view_distance" type="range" min="0" max="100" />
+            </label>
+          </div>
+          <div class="canvas-view-presets">
+            <button type="button" :class="{ active: Math.abs(normalizeAzimuth(element.view_azimuth ?? 0)) < 8 }" @click="setViewControlAzimuth(element, 0)">正面</button>
+            <button type="button" :class="{ active: Math.abs(normalizeAzimuth(element.view_azimuth ?? 0) + 90) < 8 }" @click="setViewControlAzimuth(element, -90)">左侧</button>
+            <button type="button" :class="{ active: Math.abs(Math.abs(normalizeAzimuth(element.view_azimuth ?? 0)) - 180) < 8 }" @click="setViewControlAzimuth(element, 180)">背面</button>
+            <button type="button" :class="{ active: Math.abs(normalizeAzimuth(element.view_azimuth ?? 0) - 90) < 8 }" @click="setViewControlAzimuth(element, 90)">右侧</button>
+          </div>
+          <div class="canvas-view-control-footer">
+            <span>{{ viewControlDirectionLabel(element) }}</span>
+            <button type="button" title="重置视角" @click="resetViewControl(element)"><AppIcon name="resetView" :size="13" /></button>
+          </div>
+        </div>
+
+        <div v-else-if="element.kind === 'tail_frame'" class="canvas-tail-frame-node">
+          <div v-if="localUploadedImage(element)?.url" class="canvas-zoomable-image" @wheel="zoomNodeImage($event, element)"
+            @pointerdown="startNodeImagePan($event, element)" @pointermove="moveNodeImagePan($event, element)"
+            @pointerup="stopNodeImagePan" @pointercancel="stopNodeImagePan">
+            <div v-if="canvasImageStatus(element, localUploadedImage(element)?.url) !== 'loaded'" class="canvas-image-placeholder"
+              :class="{ error: canvasImageStatus(element, localUploadedImage(element)?.url) === 'error' }">
+              {{ canvasImageStatus(element, localUploadedImage(element)?.url) === 'error' ? '图片加载失败' : '图片加载中' }}
+            </div>
+            <img :src="localUploadedImage(element)?.url" alt="尾帧图片" :style="imageZoomStyle(element)" draggable="false"
+              @load="markCanvasImageLoaded(element, localUploadedImage(element)?.url)"
+              @error="markCanvasImageError(element, localUploadedImage(element)?.url)" />
+          </div>
+          <div v-else class="canvas-tail-frame-empty">
+            <span>{{ nodeRuntime(element)?.status === 'running' ? '正在提取尾帧...' : '连接视频后运行，自动输出尾帧图片' }}</span>
           </div>
         </div>
 
@@ -3272,12 +4650,16 @@ function clamp(value: number, min: number, max: number) {
           <div v-if="element.kind === 'llm'" class="canvas-rich-editor canvas-llm-editor" contenteditable="true"
             :data-node-id="element.id" data-placeholder="运行后展示、编辑 LLM 输出，可输入 @ 引用连接节点素材..." @pointerdown.stop
             @wheel.stop @input="onPromptTextInput($event, element)" @keyup="onPromptTextInput($event, element)"
+            @compositionstart="onEditorCompositionStart($event, element)"
+            @compositionend="onEditorCompositionEnd($event, element)"
             @blur="syncEditableText($event, element)" @keydown="onRichEditorKeydown($event, element)"
             v-html="renderEditableText(element.text)"></div>
           <div v-else class="canvas-result-preview">
             <template v-if="generatedTask(element)?.status === 'succeeded'">
               <CanvasVideoPlayer v-if="element.kind === 'video'"
-                :src="generatedTask(element)?.result_videos?.[0]?.url" />
+                :src="generatedTask(element)?.result_videos?.[0]?.url"
+                @time="updateVideoFrameTime(element, $event)"
+                @duration="updateVideoDuration(element, $event)" />
               <div v-else-if="element.kind === 'audio'" class="canvas-audio-media">
                 <span>音频</span>
                 <audio :src="firstAudioAsset(generatedTask(element))?.url" controls preload="metadata"></audio>
@@ -3302,101 +4684,14 @@ function clamp(value: number, min: number, max: number) {
             <span v-else-if="generatedTask(element)">生成中...</span>
             <span v-else>{{ element.kind === 'audio' ? '音频生成结果将在这里显示' : '连接提示词和媒体后运行' }}</span>
           </div>
-          <div v-if="element.kind === 'video'" class="canvas-video-trim" @pointerdown.stop>
-            <span>截取</span>
-            <div class="canvas-trim-range">
-              <input :value="element.video_clip_start" class="clip-start" type="range" min="0"
-                :max="videoClipMax(element)" step="0.1" @input="updateVideoClip(element, 'video_clip_start', $event)" />
-              <input :value="element.video_clip_end" class="clip-end" type="range" min="0" :max="videoClipMax(element)"
-                step="0.1" @input="updateVideoClip(element, 'video_clip_end', $event)" />
-            </div>
-            <label>从<input :value="element.video_clip_start" type="number" min="0" :max="videoClipMax(element)"
-                step="0.1" @input="updateVideoClip(element, 'video_clip_start', $event)" /></label>
-            <label>到<input :value="element.video_clip_end" type="number" min="0" :max="videoClipMax(element)" step="0.1"
-                @input="updateVideoClip(element, 'video_clip_end', $event)" /></label>
-          </div>
-          <div class="canvas-node-fields"
-            :class="{ 'video-fields': element.kind === 'video', 'image-fields': element.kind === 'image', 'llm-fields': element.kind === 'llm' || element.kind === 'audio' }"
-            @pointerdown.stop>
-            <span class="canvas-node-field-label">{{ element.kind === 'video' ? '视频' : element.kind === 'image' ? '图片' : element.kind === 'audio' ? '音频' :
-              '文字'
-            }}</span>
-            <label v-if="element.kind !== 'llm' && element.kind !== 'audio'" class="canvas-param-field"><span>模型</span><select v-model="element.model"
-                @change="element.kind === 'video' ? updateCanvasVideoModel(element) : updateCanvasImageModel(element)">
-                <option v-for="model in props.models" :key="model" :value="model">{{ model }}</option>
-              </select></label>
-            <label v-if="element.kind === 'image' && !isNanoBananaElement(element) && !isSeedreamElement(element)" class="canvas-param-field"><span>分辨率</span><select :value="gptImageSizeBase(element)" @change="updateGptImageSizeBase(element, $event)">
-                <option v-for="option in gptImageSizeBaseOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
-              </select></label>
-            <label v-if="element.kind === 'image' && !isNanoBananaElement(element) && !isSeedreamElement(element)" class="canvas-param-field"><span>比例</span><select :value="gptImageRatio(element)" :disabled="gptImageSizeBase(element) === 'auto'" @change="updateGptImageRatio(element, $event)">
-                <option v-for="ratio in ratioOptions" :key="ratio" :value="ratio">{{ ratio }}</option>
-              </select></label>
-            <label v-if="isNanoBananaElement(element)" class="canvas-param-field"><span>分辨率</span><select :value="nanoImageSize(element)" @change="updateNanoImageSize(element, $event)">
-                <option v-for="option in nanoBananaSizeBaseOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
-              </select></label>
-            <label v-if="isNanoBananaElement(element)" class="canvas-param-field"><span>比例</span><select :value="nanoAspectRatio(element)" @change="updateNanoAspectRatio(element, $event)">
-                <option v-for="ratio in nanoBananaRatios" :key="ratio" :value="ratio">{{ ratio }}</option>
-              </select></label>
-            <label v-if="isSeedreamElement(element)" class="canvas-param-field"><span>分辨率</span><select :value="seedreamImageSize(element)" @change="updateSeedreamImageSize(element, $event)">
-                <option v-for="option in seedreamSizeBaseOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
-              </select></label>
-            <label v-if="isSeedreamElement(element)" class="canvas-param-field"><span>比例</span><select :value="seedreamAspectRatio(element)" @change="updateSeedreamAspectRatio(element, $event)">
-                <option v-for="ratio in seedreamRatios" :key="ratio" :value="ratio">{{ ratio }}</option>
-              </select></label>
-            <label v-if="element.kind === 'image' && !isNanoBananaElement(element) && !isSeedreamElement(element)" class="canvas-param-field"><span>质量</span><select v-model="element.quality">
-                <option>auto</option>
-                <option>high</option>
-                <option>medium</option>
-                <option>low</option>
-              </select></label>
-            <label v-if="element.kind === 'image' && !isNanoBananaElement(element)" class="canvas-param-field"><span>格式</span><select :value="element.output_format || props.defaultForm.output_format" @change="updateCanvasOutputFormat(element, $event)">
-                <option>png</option>
-                <option>jpeg</option>
-                <option v-if="!isSeedreamElement(element)">webp</option>
-              </select></label>
-            <label v-if="element.kind === 'image' && !isNanoBananaElement(element) && !isSeedreamElement(element) && supportsOutputCompression(element)" class="canvas-param-field"><span>压缩</span><input
-                v-model.number="element.output_compression" type="number" min="0" max="100" /></label>
-            <label v-if="element.kind === 'image' && !isNanoBananaElement(element) && !isSeedreamElement(element)" class="canvas-param-field"><span>背景</span><select v-model="element.background">
-                <option>auto</option>
-                <option v-if="supportsTransparentBackground(element)">transparent</option>
-                <option>opaque</option>
-              </select></label>
-            <label v-if="element.kind === 'image' && !isNanoBananaElement(element) && !isSeedreamElement(element)" class="canvas-param-field"><span>审核</span><select v-model="element.moderation">
-                <option>low</option>
-                <option>auto</option>
-              </select></label>
-            <label v-if="element.kind === 'image' && !isNanoBananaElement(element) && !isSeedreamElement(element)" class="canvas-param-field"><span>保真</span><select v-model="element.input_fidelity">
-                <option>high</option>
-                <option>low</option>
-              </select></label>
-            <label v-if="element.kind === 'video'" class="canvas-param-field canvas-ratio-param"><span>比例</span><RatioPicker
-                :model-value="element.video_ratio || canvasVideoCapability(element).defaultRatio"
-                :ratios="canvasVideoRatios(element)" compact @update:model-value="element.video_ratio = $event" /></label>
-            <label v-if="element.kind === 'video'" class="canvas-param-field"><span>分辨率</span><select v-model="element.video_resolution">
-                <option v-for="resolution in canvasVideoResolutions(element)" :key="resolution" :value="resolution">{{
-                  resolution.toUpperCase() }}</option>
-              </select></label>
-            <label v-if="element.kind === 'video'" class="canvas-param-field"><span>时长</span><input
-                v-model.number="element.video_duration" type="number" :min="canvasVideoCapability(element).duration.min"
-                :max="canvasVideoCapability(element).duration.max" /></label>
-            <label v-if="element.kind === 'video'" class="canvas-check-field"><input v-model="element.generate_audio"
-                type="checkbox" />音频</label>
-            <label v-if="element.kind === 'llm'" class="canvas-param-field"><span>模型</span><select v-model="element.model">
-                <option v-for="model in props.models" :key="model" :value="model">{{ model }}</option>
-              </select></label>
-            <label v-if="element.kind === 'llm'" class="canvas-param-field"><span>推理</span><select v-model="element.reasoning_effort">
-                <option value="none">不检查</option>
-                <option value="low">低</option>
-                <option value="medium">中</option>
-                <option value="high">高</option>
-              </select></label>
-            <label v-if="element.kind === 'audio'" class="canvas-param-field"><span>模型</span><select v-model="element.model">
-                <option value="">请选择音频模型</option>
-              </select></label>
+          <div v-if="generatedParamChips(element).length" class="canvas-generated-params">
+            <span v-for="param in generatedParamChips(element)" :key="param">{{ param }}</span>
           </div>
           <div class="canvas-node-summary">
-            <span>提示词 {{ connectedInputs(element).filter((item) => isPromptLike(item.kind)).length }}</span>
-            <span>媒体 {{ connectedInputs(element).filter((item) => isMediaKind(item.kind)).length }}</span>
+            <span>提示词 {{ inputSummaryCounts(element).prompts }}</span>
+            <span>图片 {{ inputSummaryCounts(element).images }}</span>
+            <span>视频 {{ inputSummaryCounts(element).videos }}</span>
+            <span>音频 {{ inputSummaryCounts(element).audios }}</span>
             <span v-if="nodeProgressLabel(element)"
               :class="{ failed: nodeRuntime(element)?.status === 'failed' || generatedTask(element)?.status === 'failed' || (element.frozen && !hasFrozenResult(element)) }">{{
                 nodeProgressLabel(element) }}</span>
@@ -3427,21 +4722,6 @@ function clamp(value: number, min: number, max: number) {
           <template v-else>
             <template v-if="element.kind === 'video_media'">
               <CanvasVideoPlayer :src="element.media_url" />
-              <div class="canvas-video-trim media-trim" @pointerdown.stop>
-                <span>截取</span>
-                <div class="canvas-trim-range">
-                  <input :value="element.video_clip_start" class="clip-start" type="range" min="0"
-                    :max="videoClipMax(element)" step="0.1"
-                    @input="updateVideoClip(element, 'video_clip_start', $event)" />
-                  <input :value="element.video_clip_end" class="clip-end" type="range" min="0"
-                    :max="videoClipMax(element)" step="0.1"
-                    @input="updateVideoClip(element, 'video_clip_end', $event)" />
-                </div>
-                <label>从<input :value="element.video_clip_start" type="number" min="0" :max="videoClipMax(element)"
-                    step="0.1" @input="updateVideoClip(element, 'video_clip_start', $event)" /></label>
-                <label>到<input :value="element.video_clip_end" type="number" min="0" :max="videoClipMax(element)"
-                    step="0.1" @input="updateVideoClip(element, 'video_clip_end', $event)" /></label>
-              </div>
             </template>
             <div v-else-if="element.kind === 'audio_media'" class="canvas-audio-media">
               <span>音频</span>
@@ -3527,33 +4807,346 @@ function clamp(value: number, min: number, max: number) {
 
     <div v-if="canvasNotice" class="canvas-notice">{{ canvasNotice }}</div>
 
+    <div v-if="renameDialog" class="modal-backdrop canvas-modal-backdrop" @click.self="closeRenameCanvas" @wheel.self.prevent.stop>
+      <section class="canvas-rename-modal light-modal" @keydown.esc.prevent="closeRenameCanvas">
+        <button class="modal-close" @click="closeRenameCanvas"><AppIcon name="close" /></button>
+        <h2>重命名画布</h2>
+        <p class="settings-hint">给当前画布换一个更容易识别的名字。</p>
+        <label>画布名称<input ref="renameInput" v-model="renameDialog.value" type="text" maxlength="40" placeholder="画布名称" @keydown.enter.prevent="confirmRenameCanvas" /></label>
+        <div class="modal-actions-row">
+          <button class="cancel" @click="closeRenameCanvas"><AppIcon name="close" />取消</button>
+          <button class="confirm" :disabled="!renameDialog.value.trim()" @click="confirmRenameCanvas"><AppIcon name="check" />保存</button>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="deleteDialog" class="modal-backdrop canvas-modal-backdrop" @click.self="closeDeleteCanvas" @wheel.self.prevent.stop>
+      <section class="canvas-delete-modal light-modal" @keydown.esc.prevent="closeDeleteCanvas">
+        <button class="modal-close" @click="closeDeleteCanvas"><AppIcon name="close" /></button>
+        <h2>删除画布</h2>
+        <p class="settings-hint">确定删除“{{ deleteDialog.name }}”？这个画布里的节点和连线会一起删除。</p>
+        <div class="modal-actions-row">
+          <button class="cancel" @click="closeDeleteCanvas"><AppIcon name="close" />取消</button>
+          <button class="confirm danger" @click="confirmDeleteCanvas"><AppIcon name="trash" />删除</button>
+        </div>
+      </section>
+    </div>
+
+    <aside v-if="inspectedElement && hasInspectorPanel(inspectedElement.kind) && !hideInspectorDuringDrag" class="canvas-inspector glass-panel" :style="inspectorStyle" @pointerdown.stop @click.stop @contextmenu.prevent.stop>
+      <template v-for="element in [inspectedElement]" :key="element.id">
+        <header class="canvas-inspector-head compact">
+          <span>{{ nodeBadge(element) || element.kind.toUpperCase() }}</span>
+          <strong>{{ elementTitle(element) }}</strong>
+        </header>
+
+        <section v-if="element.kind === 'image' || element.kind === 'video'" class="canvas-setting-section primary">
+          <div class="canvas-model-picker">
+            <button type="button" class="canvas-model-current" :class="{ open: modelMenuOpen }" @click="toggleModelMenu(element)">
+              <span>模型</span>
+              <strong>{{ modelOptionLabel(canvasNodeModel(element)) }}</strong>
+            </button>
+            <div v-if="modelMenuOpen" class="canvas-model-menu">
+              <button
+                v-for="model in canvasModelOptions(element)"
+                :key="model"
+                type="button"
+                class="canvas-model-option"
+                :class="{ active: (element.model || canvasNodeModel(element)) === model }"
+                @click="selectCanvasModel(element, model)"
+              >
+                <strong>{{ modelOptionLabel(model) }}</strong>
+                <small>{{ model }}</small>
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section v-if="element.kind === 'image'" class="canvas-setting-section">
+          <div class="canvas-inline-title">
+            <strong>分辨率</strong>
+          </div>
+          <div v-if="!isNanoBananaElement(element) && !isSeedreamElement(element)" class="canvas-pill-grid">
+            <button
+              v-for="option in gptImageSizeBaseOptions"
+              :key="option.value"
+              type="button"
+              class="canvas-pill-choice"
+              :class="{ active: gptImageSizeBase(element) === option.value }"
+              :title="optionHint('size', option.value)"
+              @click="updateGptImageSizeBase(element, option.value)"
+            >
+              {{ option.label }}
+            </button>
+          </div>
+          <div v-else-if="isNanoBananaElement(element)" class="canvas-pill-grid">
+            <button
+              v-for="option in nanoBananaSizeBaseOptions"
+              :key="option.value"
+              type="button"
+              class="canvas-pill-choice"
+              :class="{ active: nanoImageSize(element) === option.value }"
+              :title="optionHint('size', option.value)"
+              @click="updateNanoImageSize(element, option.value)"
+            >
+              {{ option.label }}
+            </button>
+          </div>
+          <div v-else class="canvas-pill-grid">
+            <button
+              v-for="option in seedreamSizeBaseOptions"
+              :key="option.value"
+              type="button"
+              class="canvas-pill-choice"
+              :class="{ active: seedreamImageSize(element) === option.value }"
+              :title="optionHint('size', option.value)"
+              @click="updateSeedreamImageSize(element, option.value)"
+            >
+              {{ option.label }}
+            </button>
+          </div>
+        </section>
+
+        <section v-if="element.kind === 'image'" class="canvas-setting-section">
+          <div class="canvas-inline-title">
+            <strong>比例</strong>
+          </div>
+          <div v-if="!isNanoBananaElement(element) && !isSeedreamElement(element)" class="canvas-ratio-grid" :class="{ disabled: gptImageSizeBase(element) === 'auto' }">
+            <button
+              v-for="ratio in ratioOptions"
+              :key="ratio"
+              type="button"
+              class="canvas-ratio-card"
+              :class="{ active: gptImageRatio(element) === ratio }"
+              :disabled="gptImageSizeBase(element) === 'auto'"
+              @click="updateGptImageRatio(element, ratio)"
+            >
+              <span class="canvas-ratio-preview"><i :style="ratioPreviewStyle(ratio)"></i></span>
+              <strong>{{ ratio }}</strong>
+            </button>
+          </div>
+          <div v-else-if="isNanoBananaElement(element)" class="canvas-ratio-grid">
+            <button
+              v-for="ratio in nanoBananaRatios"
+              :key="ratio"
+              type="button"
+              class="canvas-ratio-card"
+              :class="{ active: nanoAspectRatio(element) === ratio }"
+              @click="updateNanoAspectRatio(element, ratio)"
+            >
+              <span class="canvas-ratio-preview" :class="{ auto: ratio === 'auto' }"><i :style="ratioPreviewStyle(ratio)"></i></span>
+              <strong>{{ ratio }}</strong>
+            </button>
+          </div>
+          <div v-else class="canvas-ratio-grid">
+            <button
+              v-for="ratio in seedreamRatios"
+              :key="ratio"
+              type="button"
+              class="canvas-ratio-card"
+              :class="{ active: seedreamAspectRatio(element) === ratio }"
+              @click="updateSeedreamAspectRatio(element, ratio)"
+            >
+              <span class="canvas-ratio-preview" :class="{ auto: ratio === 'auto' }"><i :style="ratioPreviewStyle(ratio)"></i></span>
+              <strong>{{ ratio }}</strong>
+            </button>
+          </div>
+        </section>
+
+        <section v-if="element.kind === 'image' && !isNanoBananaElement(element) && !isSeedreamElement(element)" class="canvas-setting-section">
+          <div class="canvas-inline-title">
+            <strong>质量</strong>
+          </div>
+          <div class="canvas-pill-grid">
+            <button v-for="quality in ['auto', 'high', 'medium', 'low']" :key="quality" type="button" class="canvas-pill-choice" :class="{ active: (element.quality || props.defaultForm.quality) === quality }" :title="optionHint('quality', quality)" @click="element.quality = quality">
+              {{ optionLabel(quality) }}
+            </button>
+          </div>
+        </section>
+
+        <section v-if="element.kind === 'image' && !isNanoBananaElement(element)" class="canvas-setting-section">
+          <div class="canvas-inline-title">
+            <strong>输出</strong>
+          </div>
+          <div class="canvas-pill-grid">
+            <button v-for="format in canvasOutputFormatOptions(element)" :key="format" type="button" class="canvas-pill-choice" :class="{ active: (element.output_format || props.defaultForm.output_format) === format }" :title="optionHint('format', format)" @click="updateCanvasOutputFormat(element, format)">
+              {{ optionLabel(format) }}
+            </button>
+          </div>
+        </section>
+
+        <section v-if="element.kind === 'image' && !isNanoBananaElement(element) && !isSeedreamElement(element)" class="canvas-setting-section advanced">
+          <div class="canvas-inline-title">
+            <strong>高级</strong>
+          </div>
+          <div class="canvas-mini-row">
+            <span>背景</span>
+            <div class="canvas-pill-grid">
+              <button v-for="background in canvasBackgroundOptions(element)" :key="background" type="button" class="canvas-pill-choice" :class="{ active: (element.background || props.defaultForm.background) === background }" :title="optionHint('background', background)" @click="element.background = background">
+                {{ optionLabel(background) }}
+              </button>
+            </div>
+          </div>
+          <label v-if="supportsOutputCompression(element)" class="canvas-slider-field">
+            <span><strong>压缩</strong><em>{{ element.output_compression ?? props.defaultForm.output_compression ?? 80 }}</em></span>
+            <input v-model.number="element.output_compression" type="range" min="0" max="100" />
+          </label>
+          <div class="canvas-mini-row">
+            <span>审核</span>
+            <div class="canvas-pill-grid two">
+              <button v-for="moderation in ['low', 'auto']" :key="moderation" type="button" class="canvas-pill-choice" :class="{ active: (element.moderation || props.defaultForm.moderation) === moderation }" :title="optionHint('moderation', moderation)" @click="element.moderation = moderation">
+                {{ optionLabel(moderation) }}
+              </button>
+            </div>
+          </div>
+          <div class="canvas-mini-row">
+            <span>保真</span>
+            <div class="canvas-pill-grid two">
+              <button v-for="fidelity in ['high', 'low']" :key="fidelity" type="button" class="canvas-pill-choice" :class="{ active: (element.input_fidelity || props.defaultForm.input_fidelity) === fidelity }" :title="optionHint('fidelity', fidelity)" @click="element.input_fidelity = fidelity">
+                {{ optionLabel(fidelity) }}
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section v-if="element.kind === 'video'" class="canvas-setting-section">
+          <div class="canvas-inline-title">
+            <strong>视频规格</strong>
+          </div>
+          <div class="canvas-ratio-grid">
+            <button v-for="ratio in canvasVideoRatios(element)" :key="ratio" type="button" class="canvas-ratio-card" :class="{ active: (element.video_ratio || canvasVideoCapability(element).defaultRatio) === ratio }" @click="element.video_ratio = ratio">
+              <span class="canvas-ratio-preview" :class="{ auto: ratio === 'adaptive' }"><i :style="ratioPreviewStyle(ratio)"></i></span>
+              <strong>{{ videoRatioLabel(ratio) }}</strong>
+            </button>
+          </div>
+          <div class="canvas-pill-grid">
+            <button v-for="resolution in canvasVideoResolutions(element)" :key="resolution" type="button" class="canvas-pill-choice" :class="{ active: (element.video_resolution || props.defaultForm.video_resolution) === resolution }" :title="optionHint('resolution', resolution)" @click="element.video_resolution = resolution">
+              {{ resolution.toUpperCase() }}
+            </button>
+          </div>
+          <div class="canvas-readonly-field">
+            <span>尺寸</span>
+            <strong>{{ canvasVideoSizeLabel(element) }}</strong>
+          </div>
+          <label class="canvas-number-field">
+            <span>时长</span>
+            <input v-model.number="element.video_duration" type="number" :min="canvasVideoCapability(element).duration.min" :max="canvasVideoCapability(element).duration.max" />
+          </label>
+          <button type="button" class="canvas-toggle-choice" :class="{ active: canvasGenerateAudio(element) }" @click="element.generate_audio = !canvasGenerateAudio(element)">
+            <span>
+              <strong>生成音频</strong>
+              <small>{{ canvasGenerateAudio(element) ? '随视频生成声音' : '仅生成画面' }}</small>
+            </span>
+            <i class="canvas-switch-indicator" aria-hidden="true"></i>
+          </button>
+          <button v-if="canvasSupportsDraft(element)" type="button" class="canvas-toggle-choice" :class="{ active: canvasVideoDraft(element) }" @click="toggleCanvasVideoDraft(element)">
+            <span>
+              <strong>样片模式</strong>
+              <small>draft</small>
+            </span>
+            <i class="canvas-switch-indicator" aria-hidden="true"></i>
+          </button>
+        </section>
+
+        <section v-if="element.kind === 'video' && canvasSupportsDraft(element)" class="canvas-setting-section">
+          <div class="canvas-inline-title">
+            <strong>首尾帧</strong>
+            <small>{{ videoFrameCandidates(element).length ? '从上游图片选择' : '连接图片节点后选择' }}</small>
+          </div>
+          <div v-if="videoFrameCandidates(element).length" class="canvas-frame-source-list">
+            <div v-for="candidate in videoFrameCandidates(element)" :key="candidate.id" class="canvas-frame-source-row">
+              <span>{{ candidate.label }}</span>
+              <div class="canvas-frame-source-actions">
+                <button type="button" class="canvas-pill-choice" :class="{ active: videoNodeFrameRoleForCandidate(element, candidate.id) === 'first_frame' }" @click="setVideoNodeFrameSource(element, 'first_frame', candidate.id)">首帧</button>
+                <button type="button" class="canvas-pill-choice" :class="{ active: videoNodeFrameRoleForCandidate(element, candidate.id) === 'last_frame' }" @click="setVideoNodeFrameSource(element, 'last_frame', candidate.id)">尾帧</button>
+              </div>
+            </div>
+          </div>
+          <p v-else class="canvas-empty-hint">连接图片节点后选择首尾帧</p>
+        </section>
+
+        <section v-if="element.kind === 'llm'" class="canvas-setting-section">
+          <div class="canvas-inline-title">
+            <strong>文字模型</strong>
+          </div>
+          <div class="canvas-model-picker">
+            <button type="button" class="canvas-model-current" :class="{ open: modelMenuOpen }" @click="toggleModelMenu(element)">
+              <span>模型</span>
+              <strong>{{ element.model || '请选择模型' }}</strong>
+            </button>
+            <div v-if="modelMenuOpen" class="canvas-model-menu">
+              <button v-for="model in props.models" :key="model" type="button" class="canvas-model-option" :class="{ active: element.model === model }" @click="element.model = model; modelMenuElementID = ''">
+                <strong>{{ model }}</strong>
+                <small>语言模型</small>
+              </button>
+            </div>
+          </div>
+          <div class="canvas-pill-grid canvas-reasoning-grid">
+            <button
+              v-for="reasoning in [
+                { value: 'none', label: '关闭', hint: '直接输出' },
+                { value: 'low', label: '低', hint: '轻量思考' },
+                { value: 'medium', label: '中', hint: '均衡推理' },
+                { value: 'high', label: '高', hint: '更深推理' }
+              ]"
+              :key="reasoning.value"
+              type="button"
+              class="canvas-pill-choice canvas-reasoning-choice"
+              :class="{ active: (element.reasoning_effort || 'none') === reasoning.value }"
+              :title="reasoning.hint"
+              @click="element.reasoning_effort = reasoning.value"
+            >
+              <strong>{{ reasoning.label }}</strong>
+              <small>{{ reasoning.hint }}</small>
+            </button>
+          </div>
+        </section>
+
+        <section v-if="element.kind === 'audio'" class="canvas-setting-section">
+          <div class="canvas-inline-title">
+            <strong>音频模型</strong>
+          </div>
+          <div class="canvas-readonly-field">
+            <span>模型</span>
+            <strong>敬请期待</strong>
+          </div>
+        </section>
+      </template>
+    </aside>
+
     <Transition :name="assetsClosingForZen ? 'canvas-assets-zen-close' : 'canvas-assets-slide'">
       <aside v-if="showAssets" class="asset-sidebar glass-panel" :class="{ 'closing-for-zen': assetsClosingForZen }" @pointerdown.stop>
-        <div class="canvas-sidebar-head">
-          <strong>素材</strong>
-          <small>{{ visibleAssetTasks.length }}/{{ assetTotal || usableTasks.length }}</small>
+        <div class="asset-sidebar-fixed">
+          <div class="canvas-sidebar-head">
+            <strong>素材</strong>
+            <small>{{ assetTotal || usableTasks.length }} 条</small>
+            <button type="button" title="刷新素材" :disabled="assetLoading" @click="refreshAssetPage"><AppIcon name="refresh" :size="14" /></button>
+          </div>
+          <form class="asset-search" @submit.prevent="submitAssetSearch">
+            <input v-model="assetSearch" type="search" placeholder="提示词、模型、图片、视频/音频" />
+            <button type="submit" :disabled="assetLoading"><AppIcon name="search" :size="14" />搜索</button>
+          </form>
         </div>
-        <label class="asset-search">
-          <span>刷新素材</span>
-          <input v-model="assetSearch" type="search" placeholder="提示词、模型、图片、视频/音频" />
-        </label>
-        <button v-for="task in visibleAssetTasks" :key="task.id" type="button" class="asset-row"
-          :title="assetPromptTitle(task)" @click="addTask(task)">
-          <video v-if="isVideoTask(task)" :src="task.result_videos?.[0]?.url" muted playsinline preload="metadata" />
-          <span v-else-if="firstAudioAsset(task)" class="asset-prompt-icon">音频</span>
-          <img v-else :src="originalImageURL(task.result_images?.[0])" alt="素材" />
-          <span>
-            <strong>{{ assetLabel(task) }}</strong>
-            <small>{{ task.prompt || task.model }}</small>
-          </span>
-        </button>
-        <button v-if="assetHasMore" type="button" class="asset-load-more" :disabled="assetLoading"
-          @click="loadMoreAssets">
-          {{ assetLoading ? '加载中...' : '加载更多' }}
-        </button>
-        <div v-if="assetError" class="asset-error">{{ assetError }}</div>
-        <div v-if="assetLoading && !visibleAssetTasks.length" class="asset-empty">加载中...</div>
-        <div v-else-if="!visibleAssetTasks.length" class="asset-empty">没有匹配素材</div>
+        <div class="asset-list-scroll">
+          <button v-for="task in visibleAssetTasks" :key="task.id" type="button" class="asset-row"
+            :title="assetPromptTitle(task)" @click="addTask(task)">
+            <img v-if="isVideoTask(task) && taskVideoCover(task)" :src="taskVideoCover(task)" alt="视频封面" />
+            <span v-else-if="isVideoTask(task)" class="asset-prompt-icon">视频</span>
+            <span v-else-if="firstAudioAsset(task)" class="asset-prompt-icon">音频</span>
+            <img v-else :src="originalImageURL(task.result_images?.[0])" alt="素材" />
+            <span>
+              <strong>{{ assetLabel(task) }}</strong>
+              <small>{{ task.prompt || task.model }}</small>
+            </span>
+          </button>
+          <div v-if="assetError" class="asset-error">{{ assetError }}</div>
+          <div v-if="assetLoading && !visibleAssetTasks.length" class="asset-empty">加载中...</div>
+          <div v-else-if="!visibleAssetTasks.length" class="asset-empty">没有匹配素材</div>
+        </div>
+        <div class="asset-pagination">
+          <button type="button" :disabled="!canPrevAssetPage || assetLoading" @click="previousAssetPage">上一页</button>
+          <span>{{ assetPageIndex + 1 }} / {{ assetPageCount }}</span>
+          <button type="button" :disabled="!canNextAssetPage || assetLoading" @click="nextAssetPage">{{ assetLoading ? '加载中' : '下一页' }}</button>
+        </div>
       </aside>
     </Transition>
   </section>

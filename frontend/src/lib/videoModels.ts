@@ -14,7 +14,7 @@ export type VideoModelCapability = {
   defaultResolution: VideoResolution
 }
 
-const DOUBAO_SEEDANCE_2: VideoModelCapability = {
+const DOUBAO_SEEDANCE: VideoModelCapability = {
   ratios: ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16', 'adaptive'],
   resolutions: ['480p', '720p', '1080p'],
   duration: { min: 4, max: 15, default: 5 },
@@ -32,7 +32,7 @@ const DEFAULT_VIDEO_CAPABILITY: VideoModelCapability = {
 
 export function videoModelCapability(model?: string): VideoModelCapability {
   const normalized = normalizeModelName(model)
-  if (normalized === 'doubao-seedance-2.0' || normalized === 'doubao-seedance-2-0') return DOUBAO_SEEDANCE_2
+  if (normalized === 'doubao-seedance-2.0' || normalized === 'doubao-seedance-2-0' || normalized === 'doubao-seedance-1.5-pro' || normalized === 'doubao-seedance-1-5-pro') return DOUBAO_SEEDANCE
   return DEFAULT_VIDEO_CAPABILITY
 }
 
@@ -40,8 +40,8 @@ export function videoRatioOptions(model?: string) {
   return videoModelCapability(model).ratios
 }
 
-export function videoResolutionOptions(model?: string) {
-  return videoModelCapability(model).resolutions
+export function videoResolutionOptions(model?: string, draft = false) {
+  return supportsVideoDraft(model) && draft ? ['480p'] as VideoResolution[] : videoModelCapability(model).resolutions
 }
 
 export function normalizeVideoSettings(input: {
@@ -49,16 +49,23 @@ export function normalizeVideoSettings(input: {
   ratio?: string
   resolution?: string
   duration?: number
+  draft?: boolean
 }) {
   const capability = videoModelCapability(input.model)
   const ratio = capability.ratios.includes(input.ratio || '') ? input.ratio || capability.defaultRatio : capability.defaultRatio
-  const resolution = capability.resolutions.includes(input.resolution as VideoResolution)
+  const allowedResolutions = videoResolutionOptions(input.model, Boolean(input.draft))
+  const resolution = allowedResolutions.includes(input.resolution as VideoResolution)
     ? input.resolution as VideoResolution
-    : capability.defaultResolution
+    : allowedResolutions[0] || capability.defaultResolution
   const rawDuration = Number(input.duration)
   const duration = Math.min(capability.duration.max, Math.max(capability.duration.min, Number.isFinite(rawDuration) ? rawDuration : capability.duration.default))
   const size = videoSizeFor(ratio, resolution)
   return { ratio, resolution, duration, width: size.width, height: size.height }
+}
+
+export function supportsVideoDraft(model?: string) {
+  const normalized = normalizeModelName(model)
+  return normalized === 'doubao-seedance-1.5-pro' || normalized === 'doubao-seedance-1-5-pro'
 }
 
 export function videoSizeFor(ratio: string, resolution: VideoResolution) {
@@ -94,6 +101,17 @@ export function videoSizeFor(ratio: string, resolution: VideoResolution) {
   const byResolution = sizes[resolution] || sizes['720p']
   if (ratio in byResolution) return byResolution[ratio as keyof typeof byResolution]
   return byResolution['16:9']
+}
+
+export function videoRatioLabel(ratio?: string) {
+  return ratio === 'adaptive' ? 'auto' : ratio || ''
+}
+
+export function videoSizeLabel(ratio: string, resolution: VideoResolution, size?: { width: number; height: number }) {
+  const prefix = `${resolution.toUpperCase()} ${videoRatioLabel(ratio)}`
+  if (ratio === 'adaptive') return prefix
+  const resolved = size || videoSizeFor(ratio, resolution)
+  return `${prefix} · ${resolved.width}x${resolved.height}`
 }
 
 export function videoResolutionFromSize(width: number, height: number): VideoResolution {

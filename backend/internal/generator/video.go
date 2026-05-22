@@ -39,7 +39,6 @@ func (c *Client) SubmitVideo(ctx context.Context, task *model.Task, finalPrompt 
 		return VideoSubmitResult{}, err
 	}
 	fmt.Println("generator video submit_enter:", "id=", task.ID, "task_type=", task.TaskType, "model=", task.Model, "endpoint=", endpoint)
-	finalPrompt = buildReferenceGuidePrompt(finalPrompt, task.ReferenceImages, task.ReferenceVideos, task.ReferenceAudios)
 	payload := buildVideoPayload(task, finalPrompt)
 	requestData, err := json.Marshal(payload)
 	if err != nil {
@@ -193,22 +192,43 @@ func (c *Client) doJSONExchange(ctx context.Context, method, endpoint, apiKey st
 
 func buildVideoPayload(task *model.Task, finalPrompt string) map[string]any {
 	content := []map[string]any{}
+	promptMappings := []string{}
+	isSeedance15 := isSeedance15VideoModel(task.Model)
+	imageIndex := 0
 	for _, image := range task.ReferenceImages {
 		if image.URL == "" {
 			continue
 		}
-		content = append(content, map[string]any{
+		imageIndex++
+		item := map[string]any{
 			"type": "image_url",
 			"image_url": map[string]string{
 				"url": image.URL,
 			},
-			"role": "reference_image",
-		})
+		}
+		if isSeedance15 {
+			if role := seedance15ImageRole(image.VideoFrameRole); role != "" && len(task.ReferenceImages) > 1 {
+				item["role"] = role
+			}
+		} else {
+			item["role"] = "reference_image"
+		}
+		content = append(content, item)
+		if label := referenceLabel(image.ReferenceLabel, image.NodeID, ""); label != "" {
+			promptMappings = append(promptMappings, fmt.Sprintf("@%s 对应图片%d", label, imageIndex))
+		}
+		if image.MaskURL != "" {
+			if label := referenceLabel(image.MaskReferenceLabel, image.ReferenceLabel, ""); label != "" {
+				promptMappings = append(promptMappings, fmt.Sprintf("@%s 对应图片%d的蒙版", label, imageIndex))
+			}
+		}
 	}
+	videoIndex := 0
 	for _, video := range task.ReferenceVideos {
 		if video.URL == "" {
 			continue
 		}
+		videoIndex++
 		videoURL := map[string]any{
 			"url": video.URL,
 		}
@@ -218,37 +238,62 @@ func buildVideoPayload(task *model.Task, finalPrompt string) map[string]any {
 		if video.ClipEnd > 0 && video.ClipEnd > video.ClipStart {
 			videoURL["clip_end"] = video.ClipEnd
 		}
-		content = append(content, map[string]any{
+		item := map[string]any{
 			"type":      "video_url",
 			"video_url": videoURL,
-			"role":      "reference_video",
-		})
+		}
+		if !isSeedance15 {
+			item["role"] = "reference_video"
+		}
+		content = append(content, item)
+		if label := referenceLabel(video.ReferenceLabel, video.NodeID, ""); label != "" {
+			promptMappings = append(promptMappings, fmt.Sprintf("@%s 对应视频%d", label, videoIndex))
+		}
 	}
+	audioIndex := 0
 	for _, audio := range task.ReferenceAudios {
 		if audio.URL == "" {
 			continue
 		}
-		content = append(content, map[string]any{
+		audioIndex++
+		item := map[string]any{
 			"type": "audio_url",
 			"audio_url": map[string]string{
 				"url": audio.URL,
 			},
-			"role": "reference_audio",
-		})
+		}
+		if !isSeedance15 {
+			item["role"] = "reference_audio"
+		}
+		content = append(content, item)
+		if label := referenceLabel(audio.ReferenceLabel, audio.NodeID, ""); label != "" {
+			promptMappings = append(promptMappings, fmt.Sprintf("@%s 对应音频%d", label, audioIndex))
+		}
 	}
-	payload := map[string]any{
-		"model":          firstNonEmpty(task.Model, "doubao-seedance-2.0"),
-		"prompt":         finalPrompt,
+	prompt := strings.TrimSpace(finalPrompt)
+	if len(promptMappings) > 0 {
+		prefix := strings.Join(promptMappings, "\n")
+		if prompt != "" {
+			prompt = prefix + "\n\n" + prompt
+		} else {
+			prompt = prefix
+		}
+	}
+	metadata := map[string]any{
 		"generate_audio": task.GenerateAudio,
 		"ratio":          firstNonEmpty(task.VideoRatio, "16:9"),
 		"resolution":     videoResolutionFromSize(defaultInt(task.VideoWidth, 1280), defaultInt(task.VideoHeight, 720)),
-		"width":          defaultInt(task.VideoWidth, 1280),
-		"height":         defaultInt(task.VideoHeight, 720),
 		"duration":       defaultInt(task.VideoDuration, 5),
-		"watermark":      task.Watermark,
+		"draft":          task.Draft && isSeedance15VideoModel(task.Model),
+		"watermark":      false,
 	}
 	if len(content) > 0 {
-		payload["metadata"] = map[string]any{"content": content}
+		metadata["content"] = content
+	}
+	payload := map[string]any{
+		"model":    firstNonEmpty(task.Model, "doubao-seedance-2.0"),
+		"prompt":   prompt,
+		"metadata": metadata,
 	}
 	return payload
 }
@@ -265,6 +310,22 @@ func videoResolutionFromSize(width, height int) string {
 		return "720p"
 	}
 	return "480p"
+}
+
+func isSeedance15VideoModel(modelName string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(modelName))
+	return normalized == "doubao-seedance-1.5-pro" || normalized == "doubao-seedance-1-5-pro"
+}
+
+func seedance15ImageRole(role string) string {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "first_frame":
+		return "first_frame"
+	case "last_frame":
+		return "last_frame"
+	default:
+		return ""
+	}
 }
 
 func IsVideoSucceeded(status string) bool {

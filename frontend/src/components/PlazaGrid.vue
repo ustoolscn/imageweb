@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import type { PlazaItem } from '../types'
+import { canvasPreviewAspectRatio, canvasPreviewMedia, canvasPreviewUrl } from '../lib/canvasPreview'
 import { isVideoTask } from '../lib/view'
+import { ensureVideoCover, videoCoverURL } from '../lib/videoCover'
 import AppIcon from './AppIcon.vue'
 
 const loadedImages = ref(new Set<string>())
+const measuredCanvasRatios = ref<Record<string, string>>({})
 
-defineProps<{
+const props = defineProps<{
   items: PlazaItem[]
   loadingMore: boolean
   hasMorePlazaItems: boolean
@@ -15,6 +18,7 @@ defineProps<{
 const emit = defineEmits<{
   selectItem: [item: PlazaItem]
   openPreview: [url: string, label: string, event?: Event, maskUrl?: string]
+  contextMenu: [item: PlazaItem, event: MouseEvent]
   reuse: [item: PlazaItem]
   toggleLike: [item: PlazaItem, event: Event]
   loadMore: []
@@ -28,17 +32,36 @@ function videoUrl(item: PlazaItem) {
   return item.result_videos?.[0]?.url || ''
 }
 
+function videoCover(item: PlazaItem) {
+  const video = item.result_videos?.[0]
+  return video?.thumbnail_url || videoCoverURL(video?.url)
+}
+
 function previewImageUrl(item: PlazaItem) {
   const image = item.result_images?.[0]
   return image?.thumbnail_url || image?.url || ''
 }
 
 function cardImageUrl(item: PlazaItem) {
+  if (item.item_type === 'canvas') return canvasPreviewUrl(item)
   return previewImageUrl(item) || imageUrl(item)
 }
 
 function cardMediaUrl(item: PlazaItem) {
+  if (item.item_type === 'canvas') return canvasPreviewUrl(item)
   return isVideoTask(item) ? videoUrl(item) : cardImageUrl(item)
+}
+
+function isCardVideo(item: PlazaItem) {
+  return item.item_type === 'canvas' ? canvasPreviewMedia(item)?.type === 'video' : isVideoTask(item)
+}
+
+function cardVideoCover(item: PlazaItem) {
+  if (item.item_type === 'canvas') {
+    const media = canvasPreviewMedia(item)
+    return media?.thumbnail_url || videoCoverURL(media?.url)
+  }
+  return videoCover(item)
 }
 
 function referenceImageUrl(item: PlazaItem) {
@@ -58,7 +81,21 @@ function isImageLoaded(url?: string) {
   return Boolean(url && loadedImages.value.has(url))
 }
 
+function markCanvasPreviewLoaded(item: PlazaItem, event: Event) {
+  const image = event.currentTarget as HTMLImageElement | null
+  const media = canvasPreviewMedia(item)
+  if (!image?.naturalWidth || !image.naturalHeight || !media?.url) return
+  measuredCanvasRatios.value = {
+    ...measuredCanvasRatios.value,
+    [media.url]: `${image.naturalWidth} / ${image.naturalHeight}`,
+  }
+}
+
 function imageAspectRatio(item: PlazaItem) {
+  if (item.item_type === 'canvas') {
+    const media = canvasPreviewMedia(item)
+    return (media?.url && measuredCanvasRatios.value[media.url]) || canvasPreviewAspectRatio(item)
+  }
   if (isVideoTask(item)) {
     const width = item.video_width || item.result_videos?.[0]?.width || 16
     const height = item.video_height || item.result_videos?.[0]?.height || 9
@@ -70,6 +107,25 @@ function imageAspectRatio(item: PlazaItem) {
   const height = Number(match[2])
   return width > 0 && height > 0 ? `${width} / ${height}` : '1 / 1'
 }
+
+function canvasNodeCount(item: PlazaItem) {
+  const canvas = item.canvas as { elements?: unknown[] } | undefined
+  return Array.isArray(canvas?.elements) ? canvas.elements.length : 0
+}
+
+function canvasConnectionCount(item: PlazaItem) {
+  const canvas = item.canvas as { connections?: unknown[] } | undefined
+  return Array.isArray(canvas?.connections) ? canvas.connections.length : 0
+}
+
+watch(() => props.items, (items) => {
+  items.forEach((item) => {
+    const video = item.result_videos?.[0]
+    if (isVideoTask(item) && video?.url && !video.thumbnail_url) ensureVideoCover(video.url).catch(() => {})
+    const canvasMedia = canvasPreviewMedia(item)
+    if (canvasMedia?.type === 'video' && canvasMedia.url && !canvasMedia.thumbnail_url) ensureVideoCover(canvasMedia.url).catch(() => {})
+  })
+}, { immediate: true, deep: true })
 </script>
 
 <template>
@@ -79,16 +135,16 @@ function imageAspectRatio(item: PlazaItem) {
   </section>
 
   <section v-if="items.length" class="plaza-grid">
-    <article v-for="item in items" :key="item.id" class="plaza-card" @click="emit('selectItem', item)">
+    <article v-for="item in items" :key="item.id" class="plaza-card" @click="emit('selectItem', item)" @contextmenu.prevent.stop="emit('contextMenu', item, $event)">
       <div
         v-if="cardMediaUrl(item)"
         class="plaza-image-wrap"
-        :class="{ loaded: isVideoTask(item) || isImageLoaded(cardImageUrl(item)) }"
+        :class="{ loaded: isCardVideo(item) || isImageLoaded(cardImageUrl(item)), 'canvas-preview-wrap': item.item_type === 'canvas' }"
         :style="{ aspectRatio: imageAspectRatio(item) }"
       >
         <div class="plaza-image-placeholder">加载中</div>
-        <template v-if="isVideoTask(item)">
-          <video class="preview-video" :src="videoUrl(item)" muted playsinline preload="metadata" />
+        <template v-if="isCardVideo(item)">
+          <img v-if="cardVideoCover(item)" class="preview-video" :src="cardVideoCover(item)" alt="视频封面" loading="lazy" decoding="async" />
           <span class="preview-play-indicator" aria-hidden="true">
             <span></span>
           </span>
@@ -100,7 +156,7 @@ function imageAspectRatio(item: PlazaItem) {
           loading="lazy"
           decoding="async"
           fetchpriority="low"
-          @load="markImageLoaded(cardImageUrl(item))"
+          @load="markImageLoaded(cardImageUrl(item)); markCanvasPreviewLoaded(item, $event)"
         />
         <div v-if="referenceImageUrl(item)" class="plaza-reference-overlay" title="参考图">
           <div class="plaza-reference-badge">参考图</div>
@@ -112,11 +168,16 @@ function imageAspectRatio(item: PlazaItem) {
           <p>{{ item.prompt }}</p>
         </div>
       </div>
+      <div v-else-if="item.item_type === 'canvas'" class="plaza-card-empty plaza-canvas-card">
+        <AppIcon name="canvas" :size="34" />
+        <strong>{{ item.canvas_name || '广场画布' }}</strong>
+        <span>{{ canvasNodeCount(item) }} 个节点 · {{ canvasConnectionCount(item) }} 条连线</span>
+      </div>
       <div v-else class="plaza-card-empty">暂无图片</div>
       <div class="plaza-card-actions" @click.stop>
         <button type="button" title="复用配置" aria-label="复用配置" @click="emit('reuse', item)">
           <AppIcon name="copy" />
-          <span>复用</span>
+          <span>{{ item.item_type === 'canvas' ? '导入' : '复用' }}</span>
         </button>
         <button type="button" :title="item.liked ? '取消点赞' : '点赞'" :aria-label="item.liked ? '取消点赞' : '点赞'" :class="{ favorite: item.liked }" @click="emit('toggleLike', item, $event)">
           <AppIcon name="favorite" />

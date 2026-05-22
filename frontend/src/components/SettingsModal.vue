@@ -19,7 +19,7 @@ function save() {
 </script>
 
 <template>
-  <div class="modal-backdrop" @click.self="emit('close')">
+  <div class="modal-backdrop" @click.self="emit('close')" @wheel.self.prevent.stop>
     <section class="settings-modal light-modal">
       <button class="modal-close" @click="emit('close')"><AppIcon name="close" /></button>
       <h2>连接设置</h2>

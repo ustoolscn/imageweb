@@ -903,6 +903,10 @@ func buildReferenceGuidePrompt(userPrompt string, images []model.UploadedImage, 
 			extra = "，带蒙版"
 		}
 		lines = append(lines, fmt.Sprintf("- [%s] 对应第 %d 张参考图%s。", label, imageIndex, extra))
+		if strings.TrimSpace(image.MaskURL) != "" {
+			maskLabel := referenceLabel(image.MaskReferenceLabel, image.ReferenceLabel, fmt.Sprintf("MASK_%d", imageIndex))
+			lines = append(lines, fmt.Sprintf("- [%s] 对应第 %d 张参考图的蒙版。", maskLabel, imageIndex))
+		}
 	}
 	videoIndex := 0
 	for _, video := range videos {

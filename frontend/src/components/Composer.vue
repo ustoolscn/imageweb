@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, nextTick, ref } from 'vue'
 import type { UploadedImage } from '../types'
 import type { ImageForm, PendingReferenceAudio, PendingReferenceImage, PendingReferenceVideo, PreviewSource } from '../uiTypes'
-import { videoModelCapability, videoRatioOptions, videoResolutionOptions } from '../lib/videoModels'
+import { supportsVideoDraft, videoModelCapability, videoRatioLabel } from '../lib/videoModels'
+import { imageSizeLabel } from '../lib/sizes'
 import { displayImageURL } from '../lib/view'
 import AppIcon from './AppIcon.vue'
-import RatioPicker from './RatioPicker.vue'
+import InlineSelect from './InlineSelect.vue'
 
 const props = defineProps<{
   form: ImageForm
@@ -25,34 +26,394 @@ const emit = defineEmits<{
   openEditablePreview: [source: PreviewSource, index: number, url: string, label: string, event: Event]
   removeReusedReference: [index: number]
   removeReference: [index: number]
+  updateReferenceFrameRole: [source: 'reused' | 'new', index: number, role: UploadedImage['video_frame_role']]
   removeReferenceVideo: [index: number]
   removeReferenceAudio: [index: number]
   openReferenceVideoModal: []
   openReferenceAudioModal: []
+  openReferenceAssetModal: []
+  openReferenceAssetUrlModal: []
+  openReferenceMediaPreview: [type: 'video' | 'audio', url: string, label: string, event: Event]
   openSizeModal: []
+  openVideoSizeModal: []
   referenceChange: [event: Event]
+  referenceAssetChange: [event: Event]
 }>()
 
-const currentVideoRatios = computed(() => videoRatioOptions(props.form.model))
-const currentVideoResolutions = computed(() => videoResolutionOptions(props.form.model))
 const currentVideoCapability = computed(() => videoModelCapability(props.form.model))
-const imageModelOptions = computed(() => props.models.filter((model) => model !== 'doubao-seedance-2.0'))
+const currentVideoSupportsDraft = computed(() => supportsVideoDraft(props.form.model))
+const showVideoFrameRoles = computed(() => props.form.task_type === 'video_generation' && supportsVideoDraft(props.form.model))
+const referenceAssetIcons = computed(() => showVideoFrameRoles.value ? ['image'] : props.form.task_type === 'video_generation' ? ['image', 'video', 'audio'] : ['image'])
+const promptEditor = ref<HTMLDivElement | null>(null)
+const mentionMenu = ref<{ query: string; start: number; end: number; activeIndex: number } | null>(null)
+const suppressMentionMenuAfterDelete = ref(false)
+const builtinImageModels = ['gpt-image-2', 'nano-banana-2', 'doubao-seedream-5.0-lite']
+const builtinVideoModels = ['doubao-seedance-2.0', 'doubao-seedance-1.5-pro']
+const imageModelOptions = computed(() => [...builtinImageModels])
+const videoModelOptions = computed(() => {
+  const options = [...builtinVideoModels]
+  for (const model of props.models || []) {
+    if (!builtinVideoModels.includes(model) || options.includes(model)) continue
+    options.push(model)
+  }
+  return options
+})
 const isNanoBanana = computed(() => props.form.model === 'nano-banana-2')
 const isSeedream = computed(() => props.form.model === 'doubao-seedream-5.0-lite')
 const supportsTransparentBackground = computed(() => props.form.output_format === 'png')
 const supportsOutputCompression = computed(() => props.form.output_format === 'jpeg' || props.form.output_format === 'webp')
-const sizeLabel = computed(() => props.form.model === 'nano-banana-2' || props.form.model === 'doubao-seedream-5.0-lite' ? '比例/分辨率' : '尺寸')
+const sizeLabel = computed(() => '尺寸')
+const videoSizeLabel = computed(() => `${props.form.video_resolution.toUpperCase()} ${videoRatioLabel(props.form.video_ratio)}`)
+const qualityOptions = [
+  { value: 'auto', label: 'auto', caption: '自动质量' },
+  { value: 'high', label: 'high', caption: '高质量' },
+  { value: 'medium', label: 'medium', caption: '中等质量' },
+  { value: 'low', label: 'low', caption: '低质量' },
+]
+const formatOptions = computed(() => [
+  { value: 'png', label: 'png', caption: '无损图片' },
+  { value: 'jpeg', label: 'jpeg', caption: '较小体积' },
+  ...(!isSeedream.value ? [{ value: 'webp', label: 'webp', caption: '高压缩图片' }] : []),
+])
+const backgroundOptions = computed(() => [
+  { value: 'auto', label: 'auto', caption: '自动背景' },
+  ...(supportsTransparentBackground.value ? [{ value: 'transparent', label: 'transparent', caption: '透明背景' }] : []),
+  { value: 'opaque', label: 'opaque', caption: '不透明背景' },
+])
+const moderationOptions = [
+  { value: 'low', label: 'low', caption: '低审核' },
+  { value: 'auto', label: 'auto', caption: '自动审核' },
+]
+const fidelityOptions = [
+  { value: 'high', label: 'high', caption: '高保真' },
+  { value: 'low', label: 'low', caption: '低保真' },
+]
+const mentionCandidates = computed(() => {
+  const imageItems = [...reusedReferenceImagesWithLabels.value, ...referenceImagesWithLabels.value].flatMap((item) => [
+    { label: item.label, type: '图片', detail: '参考图' },
+    ...(item.masked ? [{ label: item.maskLabel, type: '蒙版', detail: `${item.label} 的蒙版` }] : []),
+  ])
+  const items = [
+    ...imageItems,
+    ...props.referenceVideos.map((video, index) => ({ label: referenceLabel(video, `视频${index + 1}`), type: '视频', detail: '参考视频' })),
+    ...props.referenceAudios.map((audio, index) => ({ label: referenceLabel(audio, `音频${index + 1}`), type: '音频', detail: '参考音频' })),
+  ]
+  const query = mentionMenu.value?.query.toLowerCase() || ''
+  return items.filter((item) => item.label.toLowerCase().includes(query) || item.type.toLowerCase().includes(query)).slice(0, 8)
+})
+const reusedReferenceImagesWithLabels = computed(() => props.reusedReferenceImages.map((image, index) => ({
+  image,
+  label: referenceLabel(image, `图片${index + 1}`),
+  frameRoleLabel: frameRoleLabel(image.video_frame_role),
+  maskLabel: maskReferenceLabel(image, referenceLabel(image, `图片${index + 1}`)),
+  masked: Boolean(image.mask_url),
+})))
+const referenceImagesWithLabels = computed(() => props.referenceImages.map((image, index) => ({
+  image,
+  label: referenceLabel(image, `图片${props.reusedReferenceImages.length + index + 1}`),
+  frameRoleLabel: frameRoleLabel(image.video_frame_role),
+  maskLabel: maskReferenceLabel(image, referenceLabel(image, `图片${props.reusedReferenceImages.length + index + 1}`)),
+  masked: Boolean(image.mask_url),
+})))
+const mentionLabels = computed(() => {
+  const labels = new Set<string>()
+  mentionCandidates.value.forEach((item) => labels.add(item.label))
+  reusedReferenceImagesWithLabels.value.forEach((item) => {
+    labels.add(item.label)
+    if (item.masked) labels.add(item.maskLabel)
+  })
+  referenceImagesWithLabels.value.forEach((item) => {
+    labels.add(item.label)
+    if (item.masked) labels.add(item.maskLabel)
+  })
+  props.referenceVideos.forEach((video, index) => labels.add(referenceLabel(video, `视频${index + 1}`)))
+  props.referenceAudios.forEach((audio, index) => labels.add(referenceLabel(audio, `音频${index + 1}`)))
+  return labels
+})
+const highlightedPrompt = computed(() => renderPromptMentions(props.form.prompt))
 
 function textValue(event: Event) {
   return (event.target as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement).value
+}
+
+function onPromptInput(event: Event) {
+  const target = event.currentTarget as HTMLElement
+  const cursor = editorCaretOffset(target)
+  const text = editorPlainText(target)
+  emit('updateField', 'prompt', text)
+  if (suppressMentionMenuAfterDelete.value) {
+    mentionMenu.value = null
+    suppressMentionMenuAfterDelete.value = false
+  } else {
+    updateMentionMenu(target, cursor, text)
+  }
+  nextTick(() => setEditorCaret(cursor))
+}
+
+function onPromptKeyup(event: KeyboardEvent) {
+  if (event.key === 'Backspace' || event.key === 'Delete') {
+    mentionMenu.value = null
+    suppressMentionMenuAfterDelete.value = false
+    return
+  }
+  const target = event.currentTarget as HTMLElement
+  updateMentionMenu(target, editorCaretOffset(target), editorPlainText(target))
+}
+
+function onPromptKeydown(event: KeyboardEvent) {
+  if (event.key === 'Backspace' || event.key === 'Delete') {
+    handlePromptDelete(event)
+    return
+  }
+  if (!mentionMenu.value || !mentionCandidates.value.length) return
+  if (event.key === 'ArrowDown') {
+    event.preventDefault()
+    mentionMenu.value.activeIndex = (mentionMenu.value.activeIndex + 1) % mentionCandidates.value.length
+  } else if (event.key === 'ArrowUp') {
+    event.preventDefault()
+    mentionMenu.value.activeIndex = (mentionMenu.value.activeIndex - 1 + mentionCandidates.value.length) % mentionCandidates.value.length
+  } else if (event.key === 'Enter' || event.key === 'Tab') {
+    event.preventDefault()
+    insertMention(mentionCandidates.value[mentionMenu.value.activeIndex]?.label)
+  } else if (event.key === 'Escape') {
+    mentionMenu.value = null
+  }
+}
+
+function handlePromptDelete(event: KeyboardEvent) {
+  const target = event.currentTarget as HTMLElement
+  const selection = editorSelectionOffsets(target)
+  let start = selection.start
+  let end = selection.end
+  if (start === end) {
+    const mentionRange = promptMentionRangeAt(props.form.prompt, event.key === 'Backspace' ? start - 1 : start)
+    if (mentionRange) {
+      start = mentionRange.start
+      end = mentionRange.end
+    } else if (event.key === 'Backspace') {
+      if (start <= 0) {
+        mentionMenu.value = null
+        return
+      }
+      start -= 1
+    } else {
+      if (end >= props.form.prompt.length) {
+        mentionMenu.value = null
+        return
+      }
+      end += 1
+    }
+  }
+  if (start === end) {
+    mentionMenu.value = null
+    return
+  }
+  event.preventDefault()
+  suppressMentionMenuAfterDelete.value = true
+  mentionMenu.value = null
+  const nextValue = `${props.form.prompt.slice(0, start)}${props.form.prompt.slice(end)}`
+  emit('updateField', 'prompt', nextValue)
+  nextTick(() => setEditorCaret(start))
+}
+
+function promptMentionRangeAt(text: string, index: number) {
+  if (index < 0) return null
+  const labels = mentionLabels.value
+  const pattern = /@([^\s@]+)/g
+  for (const match of text.matchAll(pattern)) {
+    const token = match[1] || ''
+    if (!labels.has(token)) continue
+    const start = match.index ?? 0
+    const end = start + match[0].length
+    if (index >= start && index < end) return { start, end }
+  }
+  return null
+}
+
+function updateMentionMenu(target: HTMLElement | null = promptEditor.value, cursor = target ? editorCaretOffset(target) : 0, value = target ? editorPlainText(target) : props.form.prompt) {
+  if (!target) return
+  const before = value.slice(0, cursor)
+  const match = before.match(/(^|\s)@([^\s@]*)$/)
+  if (!match) {
+    mentionMenu.value = null
+    return
+  }
+  const query = match[2] || ''
+  const start = cursor - query.length - 1
+  const previous = mentionMenu.value?.query === query ? mentionMenu.value.activeIndex : 0
+  mentionMenu.value = { query, start, end: cursor, activeIndex: previous }
+}
+
+function insertMention(label?: string) {
+  const menu = mentionMenu.value
+  const target = promptEditor.value
+  if (!label || !menu || !target) return
+  const value = props.form.prompt
+  const token = `@${label} `
+  const nextValue = `${value.slice(0, menu.start)}${token}${value.slice(menu.end)}`
+  emit('updateField', 'prompt', nextValue)
+  mentionMenu.value = null
+  nextTick(() => {
+    const cursor = menu.start + token.length
+    target.focus()
+    setEditorCaret(cursor)
+  })
+}
+
+function onPromptPasteLocal(event: ClipboardEvent) {
+  emit('promptPaste', event)
+  if (event.defaultPrevented) return
+  const text = event.clipboardData?.getData('text/plain')
+  if (!text) return
+  event.preventDefault()
+  insertPlainTextAtCaret(text)
+}
+
+function insertPlainTextAtCaret(text: string) {
+  const menu = mentionMenu.value
+  const target = promptEditor.value
+  const cursor = target ? editorCaretOffset(target) : props.form.prompt.length
+  const value = props.form.prompt
+  const start = menu?.start ?? cursor
+  const end = menu?.end ?? cursor
+  const nextValue = `${value.slice(0, start)}${text}${value.slice(end)}`
+  emit('updateField', 'prompt', nextValue)
+  mentionMenu.value = null
+  nextTick(() => {
+    target?.focus()
+    setEditorCaret(start + text.length)
+  })
+}
+
+function editorPlainText(target: HTMLElement) {
+  return target.innerText.replace(/\u00a0/g, ' ').replace(/\n$/, '')
+}
+
+function editorCaretOffset(target: HTMLElement) {
+  const selection = window.getSelection()
+  if (!selection?.rangeCount) return editorPlainText(target).length
+  const range = selection.getRangeAt(0)
+  if (!target.contains(range.endContainer)) return editorPlainText(target).length
+  const preRange = document.createRange()
+  preRange.selectNodeContents(target)
+  preRange.setEnd(range.endContainer, range.endOffset)
+  return preRange.toString().replace(/\u00a0/g, ' ').length
+}
+
+function editorSelectionOffsets(target: HTMLElement) {
+  const selection = window.getSelection()
+  if (!selection?.rangeCount) {
+    const end = editorPlainText(target).length
+    return { start: end, end }
+  }
+  const range = selection.getRangeAt(0)
+  if (!target.contains(range.startContainer) || !target.contains(range.endContainer)) {
+    const end = editorPlainText(target).length
+    return { start: end, end }
+  }
+  const startRange = document.createRange()
+  startRange.selectNodeContents(target)
+  startRange.setEnd(range.startContainer, range.startOffset)
+  const endRange = document.createRange()
+  endRange.selectNodeContents(target)
+  endRange.setEnd(range.endContainer, range.endOffset)
+  const start = startRange.toString().replace(/\u00a0/g, ' ').length
+  const end = endRange.toString().replace(/\u00a0/g, ' ').length
+  return { start: Math.min(start, end), end: Math.max(start, end) }
+}
+
+function setEditorCaret(offset: number) {
+  const target = promptEditor.value
+  if (!target) return
+  target.focus({ preventScroll: true })
+  let remaining = Math.max(0, offset)
+  const placeCaret = (node: Node, nodeOffset: number) => {
+    const range = document.createRange()
+    range.setStart(node, nodeOffset)
+    range.collapse(true)
+    const selection = window.getSelection()
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+  }
+  const walk = (node: Node): boolean => {
+    for (const child of Array.from(node.childNodes)) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        const length = child.textContent?.length || 0
+        if (remaining <= length) {
+          placeCaret(child, remaining)
+          return true
+        }
+        remaining -= length
+        continue
+      }
+      if (child instanceof HTMLElement && child.classList.contains('composer-mention-token')) {
+        const tokenLength = child.textContent?.length || 0
+        if (remaining <= 0) {
+          placeCaret(node, Array.prototype.indexOf.call(node.childNodes, child))
+          return true
+        }
+        if (remaining <= tokenLength) {
+          placeCaret(node, Array.prototype.indexOf.call(node.childNodes, child) + 1)
+          return true
+        }
+        remaining -= tokenLength
+        continue
+      }
+      if (walk(child)) return true
+    }
+    return false
+  }
+  if (walk(target)) return
+  const range = document.createRange()
+  range.selectNodeContents(target)
+  range.collapse(false)
+  const selection = window.getSelection()
+  selection?.removeAllRanges()
+  selection?.addRange(range)
+}
+
+function renderPromptMentions(text: string) {
+  const labels = mentionLabels.value
+  if (!text) return ''
+  let html = ''
+  let lastIndex = 0
+  const pattern = /@([^\s@]+)/g
+  for (const match of text.matchAll(pattern)) {
+    const index = match.index ?? 0
+    const token = match[1] || ''
+    if (!labels.has(token)) continue
+    html += escapeHTML(text.slice(lastIndex, index))
+    html += `<span class="composer-mention-token" contenteditable="false">@${escapeHTML(token)}</span>`
+    lastIndex = index + match[0].length
+  }
+  html += escapeHTML(text.slice(lastIndex))
+  return html
+}
+
+function escapeHTML(text: string) {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
 function numberValue(event: Event) {
   return Number((event.target as HTMLInputElement).value)
 }
 
-function checkedValue(event: Event) {
-  return (event.target as HTMLInputElement).checked
+function referenceLabel(item: { reference_label?: string; filename?: string }, fallback: string) {
+  return item.reference_label || fallback
+}
+
+function maskReferenceLabel(item: { mask_reference_label?: string }, baseLabel: string) {
+  return item.mask_reference_label || `${baseLabel}-蒙版`
+}
+
+function frameRoleLabel(role?: UploadedImage['video_frame_role']) {
+  if (role === 'first_frame') return '首帧'
+  if (role === 'last_frame') return '尾帧'
+  return ''
+}
+
+function nextFrameRole(current: UploadedImage['video_frame_role'], target: UploadedImage['video_frame_role']) {
+  return current === target ? '' : target
 }
 </script>
 
@@ -64,59 +425,98 @@ function checkedValue(event: Event) {
     </div>
 
     <div class="prompt-row">
-      <textarea :value="form.prompt" :placeholder="form.task_type === 'video_generation' ? '描述你想生成的视频...' : '描述你想生成的图片...'" rows="2" @input="emit('updateField', 'prompt', textValue($event))" @paste="emit('promptPaste', $event)" />
-      <button class="submit" :disabled="submitting || !hasConfig" @click="emit('updateField', 'task_type', form.task_type)"><AppIcon name="play" />{{ submitting ? '提交中' : (form.task_type === 'video_generation' ? '生成视频' : '生成图片') }}</button>
+      <div class="composer-prompt-wrap">
+        <div ref="promptEditor" class="composer-rich-prompt" contenteditable="true" :data-placeholder="form.task_type === 'video_generation' ? '描述你想生成的视频，可输入 @ 引用参考...' : '描述你想生成的图片，可输入 @ 引用参考...'" @input="onPromptInput" @keyup="onPromptKeyup" @keydown="onPromptKeydown" @paste="onPromptPasteLocal" v-html="highlightedPrompt"></div>
+        <div v-if="mentionMenu && mentionCandidates.length" class="composer-mention-menu">
+          <button v-for="(item, index) in mentionCandidates" :key="item.label" type="button" :class="{ active: mentionMenu.activeIndex === index }" @pointerenter="mentionMenu.activeIndex = index" @mousedown.prevent="insertMention(item.label)">
+            <strong>@{{ item.label }}</strong>
+            <span>{{ item.type }} · {{ item.detail }}</span>
+          </button>
+        </div>
+      </div>
+      <button class="submit" :disabled="submitting || !hasConfig"><AppIcon name="play" />{{ submitting ? '提交中' : (form.task_type === 'video_generation' ? '生成视频' : '生成图片') }}</button>
     </div>
 
     <div v-if="reusedReferenceImages.length || referenceImages.length || referenceVideos.length || referenceAudios.length" class="preview-strip">
-      <div v-for="(image, index) in reusedReferenceImages" :key="image.url" class="input-thumb reused">
-        <img :src="displayImageURL(image)" alt="参考图" loading="lazy" decoding="async" @click="emit('openEditablePreview', 'reused', index, image.url, `参考 ${index + 1}`, $event)" />
-        <span>参考 {{ index + 1 }}{{ image.mask_url ? ' · 蒙版' : '' }}</span>
+      <div v-for="({ image, label, masked, frameRoleLabel }, index) in reusedReferenceImagesWithLabels" :key="image.url" class="input-thumb reused">
+        <img :src="displayImageURL(image)" alt="参考图" loading="lazy" decoding="async" @click="emit('openEditablePreview', 'reused', index, image.url, label, $event)" />
+        <span>{{ label }}{{ frameRoleLabel ? ` · ${frameRoleLabel}` : '' }}{{ masked ? ' · 蒙版' : '' }}</span>
+        <div v-if="showVideoFrameRoles" class="frame-role-controls">
+          <button type="button" :class="{ active: image.video_frame_role === 'first_frame' }" @click.stop="emit('updateReferenceFrameRole', 'reused', index, nextFrameRole(image.video_frame_role, 'first_frame'))">首</button>
+          <button type="button" :class="{ active: image.video_frame_role === 'last_frame' }" @click.stop="emit('updateReferenceFrameRole', 'reused', index, nextFrameRole(image.video_frame_role, 'last_frame'))">尾</button>
+        </div>
         <button type="button" @click="emit('removeReusedReference', index)"><AppIcon name="close" :size="12" /></button>
       </div>
-      <div v-for="(image, index) in referenceImages" :key="image.preview_url" class="input-thumb" :class="{ uploading: image.uploading, failed: image.upload_error }">
-        <img :src="image.preview_url" alt="参考图" @click="emit('openEditablePreview', 'new', index, image.preview_url, image.filename || `参考 ${reusedReferenceImages.length + index + 1}`, $event)" />
-        <span>{{ image.filename || `参考 ${reusedReferenceImages.length + index + 1}` }}{{ image.mask_url ? ' · 蒙版' : '' }}{{ image.uploading ? ' · 上传中' : '' }}{{ image.upload_error ? ' · 上传失败' : '' }}</span>
+      <div v-for="({ image, label, masked, frameRoleLabel }, index) in referenceImagesWithLabels" :key="image.preview_url" class="input-thumb" :class="{ uploading: image.uploading, failed: image.upload_error }">
+        <img :src="image.preview_url" alt="参考图" @click="emit('openEditablePreview', 'new', index, image.preview_url, label, $event)" />
+        <span>{{ label }}{{ frameRoleLabel ? ` · ${frameRoleLabel}` : '' }}{{ masked ? ' · 蒙版' : '' }}{{ image.uploading ? ' · 上传中' : '' }}{{ image.upload_error ? ' · 上传失败' : '' }}</span>
+        <div v-if="showVideoFrameRoles" class="frame-role-controls">
+          <button type="button" :class="{ active: image.video_frame_role === 'first_frame' }" @click.stop="emit('updateReferenceFrameRole', 'new', index, nextFrameRole(image.video_frame_role, 'first_frame'))">首</button>
+          <button type="button" :class="{ active: image.video_frame_role === 'last_frame' }" @click.stop="emit('updateReferenceFrameRole', 'new', index, nextFrameRole(image.video_frame_role, 'last_frame'))">尾</button>
+        </div>
         <button type="button" @click="emit('removeReference', index)"><AppIcon name="close" :size="12" /></button>
       </div>
-      <div v-for="(video, index) in referenceVideos" :key="video.url" class="input-thumb video-thumb" :class="{ uploading: video.loading, failed: video.error }">
-        <img v-if="video.cover_url" :src="video.cover_url" alt="参考视频封面" />
-        <video v-else :src="video.url" muted playsinline preload="metadata" />
-        <span>{{ video.filename || `视频 ${index + 1}` }}</span>
+      <div v-for="(video, index) in referenceVideos" :key="video.reference_label || video.url || `video-${index}`" class="input-thumb video-thumb" :class="{ uploading: video.loading, failed: video.error }">
+        <button type="button" class="media-thumb-open" :disabled="!video.url" @click="emit('openReferenceMediaPreview', 'video', video.url, referenceLabel(video, `视频${index + 1}`), $event)">
+          <img v-if="video.cover_url" :src="video.cover_url" alt="参考视频封面" />
+          <span v-else class="audio-mark">视频</span>
+        </button>
+        <span>{{ referenceLabel(video, `视频${index + 1}`) }}{{ video.loading ? ' · 上传中' : '' }}{{ video.error ? ' · 失败' : '' }}</span>
         <button type="button" @click="emit('removeReferenceVideo', index)"><AppIcon name="close" :size="12" /></button>
       </div>
-      <div v-for="(audio, index) in referenceAudios" :key="audio.url" class="input-thumb audio-thumb" :class="{ uploading: audio.loading, failed: audio.error }">
-        <div class="audio-mark">音</div>
-        <span>{{ audio.filename || `音频 ${index + 1}` }}</span>
+      <div v-for="(audio, index) in referenceAudios" :key="audio.reference_label || audio.url || `audio-${index}`" class="input-thumb audio-thumb" :class="{ uploading: audio.loading, failed: audio.error }">
+        <button type="button" class="audio-mark" :disabled="!audio.url" @click="emit('openReferenceMediaPreview', 'audio', audio.url, referenceLabel(audio, `音频${index + 1}`), $event)">音</button>
+        <span>{{ referenceLabel(audio, `音频${index + 1}`) }}{{ audio.loading ? ' · 上传中' : '' }}{{ audio.error ? ' · 失败' : '' }}</span>
         <button type="button" @click="emit('removeReferenceAudio', index)"><AppIcon name="close" :size="12" /></button>
       </div>
     </div>
 
-    <div v-if="form.task_type === 'image_generation'" class="form-row">
-      <label>模型<select :value="form.model" @change="emit('updateField', 'model', textValue($event))"><option v-for="item in imageModelOptions" :key="item" :value="item">{{ item }}</option></select></label>
-      <div class="field"><span>{{ sizeLabel }}</span><button type="button" class="size-trigger" @click.stop.prevent="emit('openSizeModal')">{{ form.size }}</button></div>
-      <label v-if="!isNanoBanana && !isSeedream">质量<select :value="form.quality" @change="emit('updateField', 'quality', textValue($event))"><option>auto</option><option>high</option><option>medium</option><option>low</option></select></label>
-      <label v-if="!isNanoBanana">格式<select :value="form.output_format" @change="emit('updateField', 'output_format', textValue($event))"><option>png</option><option>jpeg</option><option v-if="!isSeedream">webp</option></select></label>
-      <label v-if="!isNanoBanana && !isSeedream && supportsOutputCompression">压缩<input :value="form.output_compression" type="number" min="0" max="100" @input="emit('updateField', 'output_compression', numberValue($event))" /></label>
-      <label v-if="!isSeedream">背景<select :value="form.background" @change="emit('updateField', 'background', textValue($event))"><option>auto</option><option v-if="supportsTransparentBackground">transparent</option><option>opaque</option></select></label>
-      <label v-if="!isSeedream">审核<select :value="form.moderation" @change="emit('updateField', 'moderation', textValue($event))"><option>low</option><option>auto</option></select></label>
-      <label v-if="!isNanoBanana && !isSeedream">保真<select :value="form.input_fidelity" @change="emit('updateField', 'input_fidelity', textValue($event))"><option>high</option><option>low</option></select></label>
-    </div>
+    <div class="composer-controls">
+      <div class="composer-fields">
+        <div v-if="form.task_type === 'image_generation'" class="form-row">
+          <InlineSelect class="model-select" label="模型" :model-value="form.model" :options="imageModelOptions" @update:model-value="emit('updateField', 'model', $event)" />
+          <div class="composer-select">
+            <button type="button" class="composer-select-current size-select-current" @click.stop.prevent="emit('openSizeModal')">
+              <span>{{ sizeLabel }}</span>
+              <strong>{{ imageSizeLabel(form.size) }}</strong>
+            </button>
+          </div>
+          <InlineSelect v-if="!isNanoBanana && !isSeedream" label="质量" :model-value="form.quality" :options="qualityOptions" @update:model-value="emit('updateField', 'quality', $event)" />
+          <InlineSelect v-if="!isNanoBanana" label="格式" :model-value="form.output_format" :options="formatOptions" @update:model-value="emit('updateField', 'output_format', $event)" />
+          <label v-if="!isNanoBanana && !isSeedream && supportsOutputCompression" class="composer-number-field"><span>压缩</span><input :value="form.output_compression" type="number" min="0" max="100" @input="emit('updateField', 'output_compression', numberValue($event))" /></label>
+          <InlineSelect v-if="!isSeedream" label="背景" :model-value="form.background" :options="backgroundOptions" @update:model-value="emit('updateField', 'background', $event)" />
+          <InlineSelect v-if="!isSeedream" label="审核" :model-value="form.moderation" :options="moderationOptions" @update:model-value="emit('updateField', 'moderation', $event)" />
+          <InlineSelect v-if="!isNanoBanana && !isSeedream" label="保真" :model-value="form.input_fidelity" :options="fidelityOptions" @update:model-value="emit('updateField', 'input_fidelity', $event)" />
+        </div>
 
-    <div v-else class="form-row video-form-row">
-      <label>模型<select :value="form.model" @change="emit('updateField', 'model', textValue($event))"><option value="doubao-seedance-2.0">doubao-seedance-2.0</option><option v-for="item in models.filter((model) => model !== 'gpt-image-2' && model !== 'doubao-seedance-2.0')" :key="item" :value="item">{{ item }}</option></select></label>
-      <div class="field video-ratio-field"><span>比例</span><RatioPicker :model-value="form.video_ratio" :ratios="currentVideoRatios" @update:model-value="emit('updateField', 'video_ratio', $event)" /></div>
-      <label>分辨率<select :value="form.video_resolution" @change="emit('updateField', 'video_resolution', textValue($event))"><option v-for="resolution in currentVideoResolutions" :key="resolution" :value="resolution">{{ resolution.toUpperCase() }}</option></select></label>
-      <div class="field"><span>尺寸</span><strong class="readonly-size">{{ form.video_width }}x{{ form.video_height }}</strong></div>
-      <label>时长<input :value="form.video_duration" type="number" :min="currentVideoCapability.duration.min" :max="currentVideoCapability.duration.max" @input="emit('updateField', 'video_duration', numberValue($event))" /></label>
-      <label class="check-field"><input :checked="form.generate_audio" type="checkbox" @change="emit('updateField', 'generate_audio', checkedValue($event))" />生成音频</label>
-      <label class="check-field"><input :checked="form.watermark" type="checkbox" @change="emit('updateField', 'watermark', checkedValue($event))" />水印</label>
-    </div>
+        <div v-else class="form-row video-form-row">
+          <InlineSelect class="model-select" label="模型" :model-value="form.model" :options="videoModelOptions" @update:model-value="emit('updateField', 'model', $event)" />
+          <div class="composer-select">
+            <button type="button" class="composer-select-current size-select-current" @click.stop.prevent="emit('openVideoSizeModal')">
+              <span>尺寸</span>
+              <strong>{{ videoSizeLabel }}</strong>
+            </button>
+          </div>
+          <label class="composer-number-field"><span>时长</span><input :value="form.video_duration" type="number" :min="currentVideoCapability.duration.min" :max="currentVideoCapability.duration.max" @input="emit('updateField', 'video_duration', numberValue($event))" /></label>
+          <button type="button" class="composer-toggle-choice" :class="{ active: form.generate_audio }" @click="emit('updateField', 'generate_audio', !form.generate_audio)">
+            <span><strong>生成音频</strong><small>随视频生成声音</small></span>
+            <i class="canvas-switch-indicator"></i>
+          </button>
+          <button v-if="currentVideoSupportsDraft" type="button" class="composer-toggle-choice" :class="{ active: form.video_draft }" @click="emit('updateField', 'video_draft', !form.video_draft)">
+            <span><strong>样片模式</strong><small>draft</small></span>
+            <i class="canvas-switch-indicator"></i>
+          </button>
+        </div>
+      </div>
 
-    <div class="upload-row single-upload">
-      <label class="upload"><AppIcon name="image" />参考图<input type="file" multiple accept="image/*" @change="emit('referenceChange', $event)" /></label>
-      <button v-if="form.task_type === 'video_generation'" type="button" class="upload" @click="emit('openReferenceVideoModal')"><AppIcon name="video" />参考视频</button>
-      <button v-if="form.task_type === 'video_generation'" type="button" class="upload" @click="emit('openReferenceAudioModal')"><AppIcon name="audio" />参考音频</button>
+      <div class="reference-assets-panel">
+        <button type="button" class="reference-asset-button" @click="emit('openReferenceAssetModal')">
+          <strong>参考</strong>
+          <span class="reference-asset-icons" aria-hidden="true">
+            <AppIcon v-for="icon in referenceAssetIcons" :key="icon" :name="icon" />
+          </span>
+        </button>
+      </div>
     </div>
   </form>
 </template>

@@ -37,11 +37,103 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/llm", h.llm)
 	mux.HandleFunc("/api/upload", h.upload)
 	mux.HandleFunc("/api/mask-preview", h.maskPreview)
+	mux.HandleFunc("/api/canvases", h.canvases)
+	mux.HandleFunc("/api/canvases/share", h.shareCanvas)
 	mux.HandleFunc("/api/plaza", h.plaza)
 	mux.HandleFunc("/api/plaza/", h.plazaByID)
 	mux.HandleFunc("/api/tasks", h.tasks)
 	mux.HandleFunc("/api/tasks/updates", h.taskUpdates)
 	mux.HandleFunc("/api/tasks/", h.taskByID)
+}
+
+func (h *Handler) canvases(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		apiKey := r.URL.Query().Get("apikey")
+		baseURL := r.URL.Query().Get("baseurl")
+		if apiKey == "" || baseURL == "" {
+			writeError(w, http.StatusBadRequest, "缺少 baseurl 或 apikey")
+			return
+		}
+		if !h.allowBaseURL(w, r, baseURL) {
+			return
+		}
+		state, err := h.Store.CanvasState(r.Context(), apiKey, baseURL)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, state)
+	case http.MethodPut:
+		var req model.CanvasStateRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if req.APIKey == "" || req.BaseURL == "" {
+			writeError(w, http.StatusBadRequest, "缺少 baseurl 或 apikey")
+			return
+		}
+		if !json.Valid(req.Canvases) {
+			writeError(w, http.StatusBadRequest, "画布数据不是有效 JSON")
+			return
+		}
+		var raw []any
+		if err := json.Unmarshal(req.Canvases, &raw); err != nil {
+			writeError(w, http.StatusBadRequest, "画布数据必须是数组")
+			return
+		}
+		if !h.allowBaseURL(w, r, req.BaseURL) {
+			return
+		}
+		state, err := h.Store.SaveCanvasState(r.Context(), req.APIKey, req.BaseURL, req.Canvases)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, state)
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (h *Handler) shareCanvas(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		methodNotAllowed(w)
+		return
+	}
+	var req model.ShareCanvasRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.APIKey == "" || req.BaseURL == "" {
+		writeError(w, http.StatusBadRequest, "缺少 baseurl 或 apikey")
+		return
+	}
+	if !h.allowBaseURL(w, r, req.BaseURL) {
+		return
+	}
+	if r.Method == http.MethodDelete {
+		if req.CanvasID == "" {
+			writeError(w, http.StatusBadRequest, "缺少画布 id")
+			return
+		}
+		if err := h.Store.UnshareCanvasFromPlaza(r.Context(), req.CanvasID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if !json.Valid(req.Canvas) {
+		writeError(w, http.StatusBadRequest, "画布数据不是有效 JSON")
+		return
+	}
+	item, err := h.Store.ShareCanvasToPlaza(r.Context(), req.APIKey, req.BaseURL, req.CanvasName, req.Canvas)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
 }
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
@@ -280,6 +372,7 @@ func (h *Handler) createTask(w http.ResponseWriter, r *http.Request) {
 		"video_height=", req.VideoHeight,
 		"video_duration=", req.VideoDuration,
 		"generate_audio=", req.GenerateAudio,
+		"draft=", req.Draft,
 		"watermark=", req.Watermark,
 		"ref_images=", len(req.ReferenceImages),
 		"ref_videos=", len(req.ReferenceVideos),
@@ -310,13 +403,25 @@ func (h *Handler) createTask(w http.ResponseWriter, r *http.Request) {
 		VideoHeight:       req.VideoHeight,
 		VideoDuration:     req.VideoDuration,
 		GenerateAudio:     req.GenerateAudio,
-		Watermark:         req.Watermark,
+		Draft:             req.Draft,
+		Watermark:         false,
 	}
 	if task.TaskType == model.TaskTypeVideoGeneration {
 		if task.Model == "" || isImageModel(task.Model) {
 			task.Model = "doubao-seedance-2.0"
 		}
 		normalizeVideoTaskOptions(task)
+		if !isSeedance15Model(strings.ToLower(strings.TrimSpace(task.Model))) {
+			task.Draft = false
+		}
+		if isSeedance15Model(strings.ToLower(strings.TrimSpace(task.Model))) && len(task.ReferenceImages) > 2 {
+			writeError(w, http.StatusBadRequest, "doubao-seedance-1.5-pro 最多只支持 2 张参考图")
+			return
+		}
+		if isSeedance15Model(strings.ToLower(strings.TrimSpace(task.Model))) && (len(task.ReferenceVideos) > 0 || len(task.ReferenceAudios) > 0) {
+			writeError(w, http.StatusBadRequest, "doubao-seedance-1.5-pro 参考素材只支持图片，不支持视频或音频")
+			return
+		}
 	}
 	if task.N <= 0 {
 		task.N = 1
@@ -342,6 +447,7 @@ func (h *Handler) createTask(w http.ResponseWriter, r *http.Request) {
 		"video_height=", task.VideoHeight,
 		"video_duration=", task.VideoDuration,
 		"generate_audio=", task.GenerateAudio,
+		"draft=", task.Draft,
 		"watermark=", task.Watermark,
 		"ref_images=", len(task.ReferenceImages),
 		"ref_videos=", len(task.ReferenceVideos),
@@ -646,6 +752,7 @@ func (h *Handler) retryTask(w http.ResponseWriter, r *http.Request, id string) {
 	newTask.ResponseJSON = ""
 	newTask.Favorite = false
 	newTask.SharedToPlaza = false
+	newTask.Watermark = false
 	newTask.ResultImages = nil
 	newTask.ResultImagesJSON = "[]"
 	newTask.ResultVideos = nil
@@ -834,7 +941,7 @@ func normalizeVideoTaskOptions(task *model.Task) {
 
 func videoModelCapability(modelName string) videoCapability {
 	normalized := strings.ToLower(strings.TrimSpace(modelName))
-	if normalized == "doubao-seedance-2.0" || normalized == "doubao-seedance-2-0" {
+	if isSeedanceModel(normalized) {
 		return videoCapability{
 			ratios:            []string{"21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "adaptive"},
 			resolutions:       []string{"480p", "720p", "1080p"},
@@ -854,6 +961,14 @@ func videoModelCapability(modelName string) videoCapability {
 		defaultRatio:      "16:9",
 		defaultResolution: "720p",
 	}
+}
+
+func isSeedanceModel(normalized string) bool {
+	return normalized == "doubao-seedance-2.0" || normalized == "doubao-seedance-2-0" || normalized == "doubao-seedance-1.5-pro" || normalized == "doubao-seedance-1-5-pro"
+}
+
+func isSeedance15Model(normalized string) bool {
+	return normalized == "doubao-seedance-1.5-pro" || normalized == "doubao-seedance-1-5-pro"
 }
 
 func videoResolutionFromSize(width, height int) string {

@@ -1,14 +1,15 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { ComponentPublicInstance } from 'vue'
 import type { PreviewImage } from '../uiTypes'
 import AppIcon from './AppIcon.vue'
 
+type MaskTool = 'pan' | 'brush' | 'eraser'
+
 const props = defineProps<{
   image: PreviewImage
-  maskTool: 'brush' | 'eraser'
+  maskTool: MaskTool
   maskBrushSize: number
-  maskPreviewUrl: (url: string) => string
 }>()
 
 const emit = defineEmits<{
@@ -18,7 +19,7 @@ const emit = defineEmits<{
   imageLoad: []
   clearMask: []
   saveMask: []
-  'update:maskTool': [tool: 'brush' | 'eraser']
+  'update:maskTool': [tool: MaskTool]
   'update:maskBrushSize': [size: number]
 }>()
 
@@ -28,15 +29,17 @@ const zoom = ref(1)
 const offset = ref({ x: 0, y: 0 })
 const isDragging = ref(false)
 const imageLoaded = ref(false)
+const readonlyMaskOverlayUrl = ref('')
+const previewContextMenu = ref<{ x: number; y: number } | null>(null)
 const panSpeed = 1.45
 const pointers = new Map<number, { x: number; y: number }>()
 let dragStart: { pointerId: number; x: number; y: number } | null = null
 let pinchStart: { distance: number; zoom: number; centerX: number; centerY: number; offsetX: number; offsetY: number } | null = null
 let localCanvas: HTMLCanvasElement | null = null
 let maskPaintState: { point: { x: number; y: number } } | null = null
-let activeMaskPointer: { pointerId: number; canvas: HTMLCanvasElement; tool: 'brush' | 'eraser'; brushSize: number } | null = null
+let activeMaskPointer: { pointerId: number; canvas: HTMLCanvasElement; tool: Exclude<MaskTool, 'pan'>; brushSize: number } | null = null
 
-const zoomable = computed(() => !props.image.editable)
+const zoomable = computed(() => !props.image.editable || props.maskTool === 'pan')
 const zoomStyle = computed(() => ({
   transform: `translate(${offset.value.x}px, ${offset.value.y}px) scale(${zoom.value})`,
 }))
@@ -46,8 +49,59 @@ watch(() => props.image.url, () => {
   resetZoom()
 })
 
+watch(() => props.image.maskUrl, (maskUrl) => {
+  readonlyMaskOverlayUrl.value = ''
+  if (!maskUrl || props.image.editable) return
+  buildReadonlyMaskOverlay(maskUrl)
+}, { immediate: true })
+
 function markImageLoaded() {
   imageLoaded.value = true
+}
+
+async function buildReadonlyMaskOverlay(maskUrl: string) {
+  if (maskUrl.startsWith('data:image/') || maskUrl.startsWith('blob:')) {
+    readonlyMaskOverlayUrl.value = maskUrl
+    return
+  }
+  const image = await loadMaskImage(maskUrl).catch(() => null)
+  if (!image?.naturalWidth || !image.naturalHeight) {
+    readonlyMaskOverlayUrl.value = maskUrl
+    return
+  }
+  const canvas = document.createElement('canvas')
+  canvas.width = image.naturalWidth
+  canvas.height = image.naturalHeight
+  const ctx = canvas.getContext('2d')
+  if (!ctx) {
+    readonlyMaskOverlayUrl.value = maskUrl
+    return
+  }
+  try {
+    ctx.drawImage(image, 0, 0)
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height)
+    for (let index = 0; index < data.data.length; index += 4) {
+      const editable = data.data[index + 3] < 255
+      data.data[index] = 255
+      data.data[index + 1] = 255
+      data.data[index + 2] = 255
+      data.data[index + 3] = editable ? 184 : 0
+    }
+    ctx.putImageData(data, 0, 0)
+    readonlyMaskOverlayUrl.value = canvas.toDataURL('image/png')
+  } catch {
+    readonlyMaskOverlayUrl.value = maskUrl
+  }
+}
+
+function loadMaskImage(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image()
+    image.crossOrigin = 'anonymous'
+    image.onload = () => resolve(image)
+    image.onerror = () => reject(new Error('蒙板加载失败'))
+    image.src = src
+  })
 }
 
 function clampZoom(value: number) {
@@ -155,6 +209,63 @@ function resetZoom() {
   isDragging.value = false
 }
 
+function openPreviewContextMenu(event: MouseEvent) {
+  if (props.image.editable) return
+  event.preventDefault()
+  event.stopPropagation()
+  previewContextMenu.value = {
+    x: Math.min(event.clientX, window.innerWidth - 184),
+    y: Math.min(event.clientY, window.innerHeight - 48),
+  }
+}
+
+function closePreviewContextMenu() {
+  previewContextMenu.value = null
+}
+
+function downloadPreviewImage() {
+  const link = document.createElement('a')
+  link.href = props.image.url
+  link.download = filenameFromURL(props.image.url, `${props.image.label || 'preview'}.png`)
+  link.rel = 'noopener noreferrer'
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  previewContextMenu.value = null
+}
+
+function filenameFromURL(url: string, fallback: string) {
+  try {
+    const pathname = new URL(url, window.location.href).pathname
+    return decodeURIComponent(pathname.split('/').filter(Boolean).pop() || fallback)
+  } catch {
+    return fallback
+  }
+}
+
+function isTypingTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return false
+  if (target.closest('.mask-size input[type="range"]')) return false
+  return Boolean(target.closest('input, textarea, select, [contenteditable="true"]'))
+}
+
+function onKeydown(event: KeyboardEvent) {
+  if (!props.image.editable || isTypingTarget(event.target)) return
+  const key = event.key.toLowerCase()
+  if (key === 'q') {
+    event.preventDefault()
+    emit('update:maskTool', 'pan')
+  } else if (key === 'w') {
+    event.preventDefault()
+    emit('update:maskTool', 'brush')
+  } else if (key === 'e') {
+    event.preventDefault()
+    emit('update:maskTool', 'eraser')
+  } else if (event.key === 'Escape') {
+    emit('close')
+  }
+}
+
 function setBaseImage(element: TemplateRef) {
   emit('setBaseImage', element instanceof HTMLImageElement ? element : null)
 }
@@ -214,6 +325,10 @@ function startMaskPaint(event: PointerEvent) {
   if (!props.image.editable || event.button !== 0) return
   event.preventDefault()
   event.stopPropagation()
+  if (props.maskTool === 'pan') {
+    onPointerDown(event)
+    return
+  }
   const canvas = event.currentTarget as HTMLCanvasElement
   canvas.setPointerCapture(event.pointerId)
   activeMaskPointer = { pointerId: event.pointerId, canvas, tool: props.maskTool, brushSize: props.maskBrushSize }
@@ -227,6 +342,10 @@ function startMaskPaint(event: PointerEvent) {
 function moveMaskPaint(event: PointerEvent) {
   event.preventDefault()
   event.stopPropagation()
+  if (props.maskTool === 'pan') {
+    onPointerMove(event)
+    return
+  }
   const canvas = event.currentTarget as HTMLCanvasElement
   if (!isActiveMaskEvent(event)) return
   const events = event.getCoalescedEvents?.() || [event]
@@ -236,6 +355,10 @@ function moveMaskPaint(event: PointerEvent) {
 function stopMaskPaint(event: PointerEvent) {
   event.preventDefault()
   event.stopPropagation()
+  if (props.maskTool === 'pan') {
+    onPointerEnd(event)
+    return
+  }
   const canvas = event.currentTarget as HTMLCanvasElement
   finishMaskPaint(event, canvas)
 }
@@ -267,7 +390,12 @@ function finishMaskPaint(event: PointerEvent, canvas: HTMLCanvasElement) {
   activeMaskPointer = null
 }
 
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown)
+})
+
 onUnmounted(() => {
+  window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('pointermove', moveMaskPaintFromWindow)
   window.removeEventListener('pointerup', stopMaskPaintFromWindow)
   window.removeEventListener('pointercancel', stopMaskPaintFromWindow)
@@ -275,20 +403,27 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="modal-backdrop image-viewer" @click.self="emit('close')">
+  <div class="modal-backdrop image-viewer" @click.self="emit('close')" @click="closePreviewContextMenu" @contextmenu.prevent.stop="openPreviewContextMenu" @wheel.self.prevent.stop>
     <section class="image-viewer-panel" :class="{ editable: image.editable }">
       <button class="modal-close" @click="emit('close')"><AppIcon name="close" /></button>
       <template v-if="image.editable">
-        <div class="mask-stage">
-          <img :ref="setBaseImage" :src="image.url" :alt="image.label" @load="emit('imageLoad')" />
-          <canvas :ref="setCanvas" @pointerdown.stop.prevent="startMaskPaint" @pointermove.stop.prevent="moveMaskPaint" @pointerup.stop.prevent="stopMaskPaint" @pointercancel.stop.prevent="stopMaskPaint" />
+        <div
+          class="mask-stage mask-edit-stage"
+          :class="{ zoomed: zoom > 1, dragging: isDragging, 'tool-pan': maskTool === 'pan' }"
+          @wheel="onWheel"
+        >
+          <img :ref="setBaseImage" :src="image.url" :alt="image.label" :style="zoomStyle" @load="emit('imageLoad')" />
+          <canvas :ref="setCanvas" :style="zoomStyle" @pointerdown.stop.prevent="startMaskPaint" @pointermove.stop.prevent="moveMaskPaint" @pointerup.stop.prevent="stopMaskPaint" @pointercancel.stop.prevent="stopMaskPaint" />
         </div>
         <div class="mask-tools">
-          <button :class="{ active: maskTool === 'brush' }" @click="emit('update:maskTool', 'brush')"><AppIcon name="brush" />涂抹蒙板</button>
-          <button :class="{ active: maskTool === 'eraser' }" @click="emit('update:maskTool', 'eraser')"><AppIcon name="eraser" />橡皮擦</button>
-          <label>画笔 <input :value="maskBrushSize" type="range" min="8" max="120" @input="updateBrushSize" /></label>
-          <button @click="emit('clearMask')"><AppIcon name="trash" />清空蒙板</button>
-          <button class="primary" @click="emit('saveMask')"><AppIcon name="download" />保存蒙板</button>
+          <div class="mask-tool-toggle">
+            <button type="button" :class="{ active: maskTool === 'pan' }" title="拖动视图 Q" @click="emit('update:maskTool', 'pan')"><AppIcon name="compass" />拖动</button>
+            <button type="button" :class="{ active: maskTool === 'brush' }" title="涂抹蒙版 W" @click="emit('update:maskTool', 'brush')"><AppIcon name="brush" />涂抹</button>
+            <button type="button" :class="{ active: maskTool === 'eraser' }" title="擦除蒙版 E" @click="emit('update:maskTool', 'eraser')"><AppIcon name="eraser" />擦除</button>
+          </div>
+          <label class="mask-size"><span>画笔</span><input :value="maskBrushSize" type="range" min="8" max="96" @input="updateBrushSize" /></label>
+          <button type="button" @click="emit('clearMask')"><AppIcon name="trash" />清空</button>
+          <button type="button" class="primary" @click="emit('saveMask')"><AppIcon name="download" />保存</button>
         </div>
       </template>
       <div
@@ -305,7 +440,7 @@ onUnmounted(() => {
         <div v-if="!imageLoaded" class="image-viewer-placeholder">加载原图中</div>
         <div class="zoom-content" :style="zoomStyle">
           <img :src="image.url" :alt="image.label" @load="markImageLoaded" />
-          <img class="readonly-mask-overlay" :src="maskPreviewUrl(image.maskUrl)" alt="蒙板" />
+          <img v-if="readonlyMaskOverlayUrl" class="readonly-mask-overlay" :src="readonlyMaskOverlayUrl" alt="蒙板" />
         </div>
       </div>
       <div
@@ -328,6 +463,12 @@ onUnmounted(() => {
         <button type="button" @click="resetZoom"><AppIcon name="resetView" />重置</button>
       </div>
       <div>{{ image.label }}{{ image.maskUrl ? ' · 蒙板' : '' }}</div>
+      <div v-if="previewContextMenu" class="context-menu image-viewer-context-menu" :style="{ left: `${previewContextMenu.x}px`, top: `${previewContextMenu.y}px` }" @click.stop @contextmenu.prevent.stop>
+        <button type="button" @click="downloadPreviewImage">
+          <AppIcon name="download" :size="14" />
+          <span>下载</span>
+        </button>
+      </div>
     </section>
   </div>
 </template>

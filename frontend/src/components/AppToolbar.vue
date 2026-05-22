@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import AppIcon from './AppIcon.vue'
+import InlineSelect from './InlineSelect.vue'
 import type { PlazaSort, ThemeMode, ViewMode } from '../uiTypes'
 
 const props = defineProps<{
@@ -36,6 +37,14 @@ const currentStatus = computed({
   set: (value: string) => emit('update:status', value),
 })
 
+const statusOptions = [
+  { value: 'all', label: '全部状态' },
+  { value: 'pending', label: '排队中' },
+  { value: 'running', label: '生成中' },
+  { value: 'succeeded', label: '成功' },
+  { value: 'failed', label: '失败' },
+]
+
 const currentKeyword = computed({
   get: () => props.keyword,
   set: (value: string) => emit('update:keyword', value),
@@ -57,6 +66,11 @@ const currentThemeIcon = computed(() => {
   if (props.themeMode === 'dark') return 'moon'
   return 'contrast'
 })
+
+function updateStatus(value: string) {
+  currentStatus.value = value
+  emit('resetTasks')
+}
 </script>
 
 <template>
@@ -77,39 +91,47 @@ const currentThemeIcon = computed(() => {
       </div>
     </div>
 
-    <div class="toolbar-controls" :class="{ plaza: viewMode === 'plaza', canvas: viewMode === 'canvas' }">
+    <div class="toolbar-controls" :class="{ tasks: viewMode === 'tasks', plaza: viewMode === 'plaza', canvas: viewMode === 'canvas' }">
       <div class="view-tabs three-tabs" :class="{ 'two-tabs': hideCanvas }">
-        <button :class="{ active: viewMode === 'tasks' }" @click="emit('switchView', 'tasks')"><AppIcon name="task" />任务</button>
-        <button v-if="!hideCanvas" :class="{ active: viewMode === 'canvas' }" @click="emit('switchView', 'canvas')"><AppIcon name="canvas" />画布</button>
-        <button :class="{ active: viewMode === 'plaza' }" @click="emit('switchView', 'plaza')"><AppIcon name="gallery" />广场</button>
+        <button title="任务" aria-label="任务" :class="{ active: viewMode === 'tasks' }" @click="emit('switchView', 'tasks')">
+          <AppIcon name="task" /><span class="view-tab-label">任务</span>
+        </button>
+        <button v-if="!hideCanvas" title="画布" aria-label="画布" :class="{ active: viewMode === 'canvas' }" @click="emit('switchView', 'canvas')">
+          <AppIcon name="canvas" /><span class="view-tab-label">画布</span>
+        </button>
+        <button title="广场" aria-label="广场" :class="{ active: viewMode === 'plaza' }" @click="emit('switchView', 'plaza')">
+          <AppIcon name="gallery" /><span class="view-tab-label">广场</span>
+        </button>
       </div>
       <template v-if="viewMode === 'tasks'">
-        <select v-model="currentStatus" @change="emit('resetTasks')">
-          <option value="all">全部状态</option>
-          <option value="pending">排队中</option>
-          <option value="running">生成中</option>
-          <option value="succeeded">成功</option>
-          <option value="failed">失败</option>
-        </select>
+        <InlineSelect class="toolbar-status-select" label="状态" :model-value="currentStatus" :options="statusOptions" @update:model-value="updateStatus" />
         <div class="search-wrap">
-          <AppIcon name="search" :size="14" />
           <input v-model="currentKeyword" class="search" placeholder="搜索提示词、参数..." @keyup.enter="emit('resetTasks')" />
         </div>
-        <button class="ghost task-search-button" @click="emit('resetTasks')"><AppIcon name="search" />搜索</button>
-        <button class="ghost" :class="{ active: favoriteOnly }" @click="emit('toggleFavoriteOnly')"><AppIcon name="favorite" />{{ favoriteOnly ? '看全部' : '只看收藏' }}</button>
-        <button class="ghost" @click="emit('refreshTasks')"><AppIcon name="refresh" />刷新</button>
+        <button class="ghost task-search-button compact-on-narrow" title="搜索" aria-label="搜索" @click="emit('resetTasks')">
+          <AppIcon name="search" /><span class="toolbar-action-label">搜索</span>
+        </button>
+        <button class="ghost compact-on-narrow" :class="{ active: favoriteOnly }" :title="favoriteOnly ? '看全部' : '只看收藏'" :aria-label="favoriteOnly ? '看全部' : '只看收藏'" @click="emit('toggleFavoriteOnly')">
+          <AppIcon name="favorite" /><span class="toolbar-action-label">{{ favoriteOnly ? '看全部' : '只看收藏' }}</span>
+        </button>
+        <button class="ghost compact-on-narrow" title="刷新" aria-label="刷新" @click="emit('refreshTasks')">
+          <AppIcon name="refresh" /><span class="toolbar-action-label">刷新</span>
+        </button>
       </template>
       <template v-else-if="viewMode === 'plaza'">
         <div class="search-wrap plaza-search">
-          <AppIcon name="search" :size="14" />
           <input v-model="currentPlazaKeyword" class="search" placeholder="搜索广场作品..." @keyup.enter="emit('refreshPlazaItems')" />
         </div>
-        <button class="ghost plaza-search-button" @click="emit('refreshPlazaItems')"><AppIcon name="search" />搜索</button>
+        <button class="ghost plaza-search-button compact-on-narrow" title="搜索" aria-label="搜索" @click="emit('refreshPlazaItems')">
+          <AppIcon name="search" /><span class="toolbar-action-label">搜索</span>
+        </button>
         <div class="plaza-sort">
           <button :class="{ active: plazaSort === 'time' }" @click="emit('switchPlazaSort', 'time')">最新发布</button>
           <button :class="{ active: plazaSort === 'likes' }" @click="emit('switchPlazaSort', 'likes')">点赞最多</button>
         </div>
-        <button class="ghost" @click="emit('refreshPlazaItems')"><AppIcon name="refresh" />刷新</button>
+        <button class="ghost compact-on-narrow" title="刷新" aria-label="刷新" @click="emit('refreshPlazaItems')">
+          <AppIcon name="refresh" /><span class="toolbar-action-label">刷新</span>
+        </button>
       </template>
       <button class="ghost theme-toggle icon-only" :title="`当前主题：${currentThemeLabel}`" :aria-label="`当前主题：${currentThemeLabel}`" @click="emit('toggleTheme')"><AppIcon :name="currentThemeIcon" /></button>
     </div>

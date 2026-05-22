@@ -77,6 +77,23 @@ export function parseSeedreamSize(value: string) {
   return { imageSize: '2K', aspectRatio: '16:9' }
 }
 
+export function imageSizeLabel(value: string) {
+  if (!value || value === 'auto') return value || ''
+  if (/^(512|1K|2K|4K)\s+(auto|1:1|1:4|1:8|2:3|3:2|3:4|4:1|4:3|4:5|5:4|8:1|9:16|16:9|21:9)$/.test(value)) return value
+  if (seedreamSizeBases.includes(value as keyof typeof seedreamSizePresets)) return `${value} auto`
+  for (const [ratio, sizes] of Object.entries(ratioSizePresets)) {
+    for (const [base, size] of Object.entries(sizes)) {
+      if (size === value) return `${base} ${ratio}`
+    }
+  }
+  for (const [base, ratios] of Object.entries(seedreamSizePresets)) {
+    for (const [ratio, size] of Object.entries(ratios)) {
+      if (size === value) return `${base} ${ratio}`
+    }
+  }
+  return value
+}
+
 export function ratioPreviewStyle(ratio: string) {
   const [a, b] = ratio.split(':').map(Number)
   const scale = 24 / Math.max(a, b)

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { ratioPreviewStyle, type SizeBase } from '../lib/sizes'
+import { imageSizeLabel, ratioPreviewStyle, type SizeBase } from '../lib/sizes'
 import AppIcon from './AppIcon.vue'
 
 type SizeBaseOption = {
@@ -32,11 +32,11 @@ const sizeHint = computed(() => {
 </script>
 
 <template>
-  <div class="modal-backdrop" @click.self="emit('close')">
+  <div class="modal-backdrop" @click.self="emit('close')" @wheel.self.prevent.stop>
     <section class="size-modal light-modal">
       <button class="modal-close" @click="emit('close')"><AppIcon name="close" /></button>
       <h2>设置图像尺寸</h2>
-      <p class="current-size">当前：{{ currentSize }}</p>
+      <p class="current-size">当前：{{ imageSizeLabel(currentSize) }}</p>
       <h3>清晰度</h3>
       <div class="option-grid four size-bases">
         <button v-for="item in sizeBaseOptions" :key="item.value" :class="{ active: selectedBase === item.value }" @click="emit('selectBase', item.value)">
@@ -46,14 +46,14 @@ const sizeHint = computed(() => {
       </div>
       <h3>图像比例</h3>
       <div class="option-grid four ratios" :class="{ muted: selectedBase === 'auto' }">
-        <button v-for="item in ratioOptions" :key="item" :class="{ active: selectedRatio === item }" @click="emit('selectRatio', item)">
+        <button v-for="item in ratioOptions" :key="item" :disabled="selectedBase === 'auto'" :class="{ active: selectedRatio === item }" @click="emit('selectRatio', item)">
           <span class="ratio-preview"><i :style="ratioPreviewStyle(item)"></i></span>
           <span>{{ item }}</span>
         </button>
       </div>
       <div class="will-use">
         <span>将使用</span>
-        <strong>{{ draftSize }}</strong>
+        <strong>{{ imageSizeLabel(draftSize) }}</strong>
         <em>{{ sizeHint }}</em>
       </div>
       <div class="modal-actions-row">

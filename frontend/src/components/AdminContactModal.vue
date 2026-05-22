@@ -11,7 +11,7 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <div class="modal-backdrop" @click.self="emit('close')">
+  <div class="modal-backdrop" @click.self="emit('close')" @wheel.self.prevent.stop>
     <section class="admin-contact-modal light-modal">
       <button class="modal-close" @click="emit('close')"><AppIcon name="close" /></button>
       <h2>联系管理员</h2>

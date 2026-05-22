@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { APIError, createTask, deleteTask, fetchModels, fetchSiteBrand, fetchTaskUpdates, getTask, listPlazaItems, listTasks, retryTask, runLLM, setPlazaLike, setTaskFavorite, shareTask, unshareTask, uploadImage } from './api'
+import { APIError, createTask, deleteTask, fetchModels, fetchSiteBrand, fetchTaskUpdates, getTask, listPlazaItems, listTasks, retryTask, runLLM, setPlazaLike, setTaskFavorite, shareCanvas, shareTask, unshareCanvas, unshareTask, uploadImage } from './api'
 import AdminContactModal from './components/AdminContactModal.vue'
 import AppIcon from './components/AppIcon.vue'
 import AppToolbar from './components/AppToolbar.vue'
@@ -14,8 +14,9 @@ import SizeModal from './components/SizeModal.vue'
 import SourceModal from './components/SourceModal.vue'
 import TaskDetailModal from './components/TaskDetailModal.vue'
 import TaskGrid from './components/TaskGrid.vue'
+import VideoSizeModal from './components/VideoSizeModal.vue'
 import { nanoBananaRatios, nanoBananaSizeBaseOptions, nanoBananaSizeValue, parseNanoBananaSize, parseSeedreamSize, ratioOptions, seedreamRatios, seedreamSizeBaseOptions, seedreamSizeValue, sizeBaseOptions, sizeFromRatio, type SizeBase } from './lib/sizes'
-import { normalizeVideoSettings, videoResolutionFromSize, videoSizeFor } from './lib/videoModels'
+import { normalizeVideoSettings, supportsVideoDraft, videoRatioOptions, videoResolutionFromSize, videoResolutionOptions, videoSizeFor, videoSizeLabel, type VideoResolution } from './lib/videoModels'
 import { canOpenSource, canShareTask, isFavorite, maskBaseURL } from './lib/view'
 import type { CreateTaskPayload, MediaAsset, PlazaItem, Task, UploadedImage } from './types'
 import type { CanvasLLMPayload, CanvasRunPayload, ImageForm, PendingReferenceAudio, PendingReferenceImage, PendingReferenceVideo, PreviewImage, SettingsPayload, ThemeMode, ViewMode, AppliedThemeMode } from './uiTypes'
@@ -23,8 +24,10 @@ import type { CanvasLLMPayload, CanvasRunPayload, ImageForm, PendingReferenceAud
 const MASK_EDIT_MAX_SIDE = 1600
 const MASK_EDIT_MAX_DPR = 1.5
 const imageModels = ['gpt-image-2', 'nano-banana-2', 'doubao-seedream-5.0-lite']
+const videoModels = ['doubao-seedance-2.0', 'doubao-seedance-1.5-pro']
 const NANO_BANANA_MODEL = 'nano-banana-2'
 const SEEDREAM_MODEL = 'doubao-seedream-5.0-lite'
+const DEFAULT_VIDEO_MODEL = 'doubao-seedance-2.0'
 
 const savedModel = localStorage.getItem('image_web_model') || 'gpt-image-2'
 const savedTheme = parseSavedTheme(localStorage.getItem('image_web_theme'))
@@ -36,6 +39,7 @@ const plazaItems = ref<PlazaItem[]>([])
 const totalPlazaItems = ref(0)
 const viewMode = ref<ViewMode>('tasks')
 const canvasZenMode = ref(false)
+const canvasFrameReady = ref(false)
 const hideCanvasForCompact = ref(false)
 const themeMode = ref<ThemeMode>(savedTheme)
 const systemThemeMode = ref<AppliedThemeMode>(getSystemThemeMode())
@@ -68,21 +72,27 @@ const showMobileComposer = ref(false)
 const showSettingsModal = ref(false)
 const settingsDraft = reactive({ baseurl: baseurl.value, apikey: apikey.value })
 const showSizeModal = ref(false)
+const showVideoSizeModal = ref(false)
 const showReferenceVideoModal = ref(false)
 const showReferenceAudioModal = ref(false)
+const showReferenceAssetURLModal = ref(false)
 const videoURLDraft = ref('')
 const audioURLDraft = ref('')
+const referenceAssetURLDraft = ref('')
 const addingReferenceVideo = ref(false)
 const addingReferenceAudio = ref(false)
+const addingReferenceAssetURL = ref(false)
 const selectedTask = ref<Task | null>(null)
 const selectedPlazaItem = ref<PlazaItem | null>(null)
+const pendingCanvasImport = ref<{ token: number; canvas: unknown } | null>(null)
 const sourceTask = ref<Task | null>(null)
 const previewImage = ref<PreviewImage | null>(null)
+const previewMedia = ref<{ type: 'video' | 'audio'; url: string; label: string } | null>(null)
 const contextMenu = ref<{ x: number; y: number; items: Array<{ label: string; action: () => void; disabled?: boolean; danger?: boolean }> } | null>(null)
 const maskCanvas = ref<HTMLCanvasElement | null>(null)
 const maskBaseImage = ref<HTMLImageElement | null>(null)
 const maskDrawing = ref(false)
-const maskTool = ref<'brush' | 'eraser'>('brush')
+const maskTool = ref<'pan' | 'brush' | 'eraser'>('brush')
 const maskBrushSize = ref(36)
 const lastMaskPoint = ref<{ x: number; y: number } | null>(null)
 const activeMaskPointer = ref<{ pointerId: number; canvas: HTMLCanvasElement } | null>(null)
@@ -92,6 +102,8 @@ let pollTimer: number | undefined
 let clockTimer: number | undefined
 let systemThemeQuery: MediaQueryList | undefined
 let compactCanvasQuery: MediaQueryList | undefined
+const maskPreviewCache = new Map<string, string>()
+const maskPreviewPending = new Map<string, Promise<string>>()
 
 function parseSavedTheme(value: string | null): ThemeMode {
   return value === 'light' || value === 'dark' || value === 'system' ? value : 'system'
@@ -109,10 +121,12 @@ function syncCompactCanvasMode(event?: MediaQueryListEvent) {
   hideCanvasForCompact.value = event?.matches ?? Boolean(window.matchMedia?.('(max-width: 820px)').matches)
 }
 
+const initialImageModel = imageModels.includes(savedModel) ? savedModel : 'gpt-image-2'
+
 const form = reactive<ImageForm>({
   task_type: 'image_generation',
   prompt: '',
-  model: imageModels.includes(savedModel) ? savedModel : 'gpt-image-2',
+  model: initialImageModel,
   size: savedModel === NANO_BANANA_MODEL ? '1K 1:1' : '1024x1024',
   quality: 'auto',
   output_format: 'png',
@@ -127,6 +141,7 @@ const form = reactive<ImageForm>({
   video_height: 720,
   video_duration: 5,
   generate_audio: true,
+  video_draft: false,
   watermark: false,
   reference_video_urls: '',
   reference_audio_urls: '',
@@ -136,14 +151,20 @@ const sizeDraft = reactive<{ base: SizeBase; ratio: string }>({
   base: 'auto',
   ratio: '1:1',
 })
+const videoSizeDraft = reactive<{ ratio: string; resolution: VideoResolution }>({
+  ratio: '16:9',
+  resolution: '720p',
+})
 const pendingSizeSync = ref(form.size)
 
 const referenceImages = ref<PendingReferenceImage[]>([])
 const reusedReferenceImages = ref<UploadedImage[]>([])
 const referenceVideos = ref<PendingReferenceVideo[]>([])
 const referenceAudios = ref<PendingReferenceAudio[]>([])
+const referenceLabelCounters = reactive({ image: 1, video: 1, audio: 1 })
 
 const hasConfig = computed(() => Boolean(baseurl.value && apikey.value))
+const sharedCanvasIds = computed(() => plazaItems.value.filter((item) => item.item_type === 'canvas').map(plazaCanvasID).filter(Boolean))
 const runningCount = computed(() => tasks.value.filter((task) => task.status === 'pending' || task.status === 'running').length)
 const visibleSubtitle = computed(() => viewMode.value === 'plaza' ? `公开广场 · 已加载 ${plazaItems.value.length} 条 · 总计 ${totalPlazaItems.value} 条` : (hasConfig.value ? `${maskBaseURL(baseurl.value)} · 已加载 ${tasks.value.length} 条 · 总计 ${totalTasks.value} 条` : '通过 URL 传入 baseurl 和 apikey 后开始使用'))
 const draftSize = computed(() => sizeFromRatio(sizeDraft.base, sizeDraft.ratio))
@@ -165,6 +186,12 @@ const availableSizeBaseOptions = computed(() => sizeBaseOptions.filter((option) 
   if (option.value === '4K') return sizeAccess.allow4K
   return true
 }))
+const currentVideoRatioOptions = computed(() => videoRatioOptions(form.model))
+const currentVideoResolutionOptions = computed(() => videoResolutionOptions(form.model, form.video_draft))
+const currentVideoSizeLabel = computed(() => videoSizeLabel(form.video_ratio, form.video_resolution, { width: form.video_width, height: form.video_height }))
+const draftVideoSize = computed(() => {
+  return videoSizeLabel(videoSizeDraft.ratio, videoSizeDraft.resolution)
+})
 const appliedThemeMode = computed<AppliedThemeMode>(() => themeMode.value === 'system' ? systemThemeMode.value : themeMode.value)
 
 watch(() => form.model, (model) => {
@@ -177,6 +204,7 @@ watch(themeMode, (theme) => {
 
 watch(viewMode, (mode) => {
   if (mode !== 'canvas') canvasZenMode.value = false
+  if (mode !== 'canvas') canvasFrameReady.value = false
   if (mode === 'canvas' && hideCanvasForCompact.value) viewMode.value = 'tasks'
 })
 
@@ -184,9 +212,38 @@ watch(hideCanvasForCompact, (hidden) => {
   if (hidden && viewMode.value === 'canvas') viewMode.value = 'tasks'
 })
 
-function openContextMenu(event: MouseEvent, items: Array<{ label: string; action: () => void; disabled?: boolean; danger?: boolean }>) {
+type AppContextMenuItem = { label: string; action: () => void; disabled?: boolean; danger?: boolean }
+
+function estimateContextMenuWidth(items: AppContextMenuItem[]) {
+  const labelWidth = Math.max(0, ...items.map((item) => Array.from(item.label).reduce((width, char) => width + (char.charCodeAt(0) <= 0x7f ? 7 : 13), 0)))
+  return Math.min(260, Math.max(168, labelWidth + 20))
+}
+
+function placeContextMenu(clientX: number, clientY: number, items: AppContextMenuItem[]) {
+  const margin = 8
+  const width = Math.min(estimateContextMenuWidth(items), window.innerWidth - margin * 2)
+  const height = Math.min(items.length * 34 + 12, window.innerHeight - margin * 2)
+  const x = clientX + width + margin > window.innerWidth ? clientX - width : clientX
+  const y = clientY + height + margin > window.innerHeight ? clientY - height : clientY
+  return {
+    x: Math.min(Math.max(x, margin), window.innerWidth - width - margin),
+    y: Math.min(Math.max(y, margin), window.innerHeight - height - margin),
+    items,
+  }
+}
+
+function openContextMenu(event: MouseEvent, items: AppContextMenuItem[]) {
   event.preventDefault()
-  contextMenu.value = { x: event.clientX, y: event.clientY, items }
+  window.dispatchEvent(new Event('app-context-menu-opened'))
+  contextMenu.value = placeContextMenu(event.clientX, event.clientY, items)
+}
+
+function openPageContextMenu(event: MouseEvent) {
+  openContextMenu(event, [
+    { label: '刷新当前视图', action: () => viewMode.value === 'plaza' ? refreshPlazaItems() : refreshTasks() },
+    { label: '连接设置', action: openSettings },
+    { label: `切换主题：${themeMode.value === 'dark' ? '浅色' : '深色'}`, action: toggleTheme },
+  ])
 }
 
 function closeContextMenu() {
@@ -208,6 +265,15 @@ function openTaskContextMenu(task: Task, event: MouseEvent) {
     { label: task.shared_to_plaza ? '取消广场分享' : '分享到广场', action: () => toggleTaskShare(task), disabled: !canShareTask(task) },
     { label: '查看源数据', action: () => openSourceTask(task), disabled: !canOpenSource(task) },
     { label: '删除记录', action: () => removeTask(task), danger: true },
+  ])
+}
+
+function openPlazaContextMenu(item: PlazaItem, event: MouseEvent) {
+  openContextMenu(event, [
+    { label: '查看详情', action: () => { selectedPlazaItem.value = item } },
+    { label: item.item_type === 'canvas' ? '导入画布' : '复用配置', action: () => reusePlazaItem(item) },
+    { label: item.liked ? '取消点赞' : '点赞', action: () => togglePlazaLike(item) },
+    { label: '下载结果', action: () => openResultImage(item), disabled: item.item_type === 'canvas' || (!item.result_images?.length && !item.result_videos?.length) },
   ])
 }
 
@@ -254,12 +320,14 @@ function toggleFavoriteOnly() {
 function updateFormField(field: keyof ImageForm, value: string | number | boolean) {
   if (field === 'task_type') {
     form.task_type = value === 'video_generation' ? 'video_generation' : 'image_generation'
-    form.model = form.task_type === 'video_generation' ? 'doubao-seedance-2.0' : 'gpt-image-2'
+    form.model = form.task_type === 'video_generation' ? DEFAULT_VIDEO_MODEL : 'gpt-image-2'
     if (form.task_type === 'video_generation') normalizeVideoForm()
     return
   }
-  if (field === 'generate_audio' || field === 'watermark') {
-    form[field] = Boolean(value)
+  if (field === 'generate_audio' || field === 'video_draft' || field === 'watermark') {
+    if (field === 'video_draft') form.video_draft = supportsVideoDraft(form.model) ? Boolean(value) : false
+    else form[field] = field === 'watermark' ? false : Boolean(value)
+    if (field === 'video_draft') normalizeVideoForm()
     return
   }
   if (field === 'output_compression' || field === 'n' || field === 'video_duration') {
@@ -281,6 +349,7 @@ function updateFormField(field: keyof ImageForm, value: string | number | boolea
   if (field === 'prompt' || field === 'model' || field === 'size' || field === 'quality' || field === 'output_format' || field === 'background' || field === 'moderation' || field === 'input_fidelity' || field === 'reference_video_urls' || field === 'reference_audio_urls') {
     form[field] = text
     if (field === 'model') syncModelSize(text)
+    if (field === 'model' && !supportsVideoDraft(text)) form.video_draft = false
     if (field === 'output_format' && form.model === SEEDREAM_MODEL && text === 'webp') form.output_format = 'jpeg'
     if (field === 'output_format' && text !== 'png' && form.background === 'transparent') form.background = 'auto'
     if (field === 'model' && form.task_type === 'video_generation') normalizeVideoForm()
@@ -309,6 +378,68 @@ function syncModelSize(model: string) {
     form.size = '1024x1024'
     syncSizeDraft(form.size)
   }
+}
+
+function cachedMaskPreviewURL(maskUrl: string) {
+  if (!maskUrl) return ''
+  if (maskUrl.startsWith('data:image/') || maskUrl.startsWith('blob:')) return maskUrl
+  return maskPreviewCache.get(maskUrl) || maskUrl
+}
+
+function prefetchTaskMasks(items: Array<Pick<Task | PlazaItem, 'reference_images'>>) {
+  const urls = new Set<string>()
+  for (const item of items) {
+    for (const image of item.reference_images || []) {
+      const maskUrl = image.mask_url || ''
+      if (!maskUrl || maskUrl.startsWith('data:image/') || maskUrl.startsWith('blob:')) continue
+      if (maskPreviewCache.has(maskUrl) || maskPreviewPending.has(maskUrl)) continue
+      urls.add(maskUrl)
+    }
+  }
+  urls.forEach((url) => {
+    prefetchMaskPreview(url).catch(() => undefined)
+  })
+}
+
+function prefetchMaskPreview(maskUrl: string) {
+  if (!maskUrl || maskUrl.startsWith('data:image/') || maskUrl.startsWith('blob:')) return Promise.resolve(maskUrl)
+  const cached = maskPreviewCache.get(maskUrl)
+  if (cached) return Promise.resolve(cached)
+  const pending = maskPreviewPending.get(maskUrl)
+  if (pending) return pending
+  const next = buildVisibleMaskDataURL(maskUrl)
+    .then((previewUrl) => {
+      maskPreviewCache.set(maskUrl, previewUrl)
+      maskPreviewPending.delete(maskUrl)
+      return previewUrl
+    })
+    .catch((error) => {
+      maskPreviewPending.delete(maskUrl)
+      throw error
+    })
+  maskPreviewPending.set(maskUrl, next)
+  return next
+}
+
+async function buildVisibleMaskDataURL(maskUrl: string) {
+  const mask = await loadImageElement(maskUrl)
+  if (!mask.naturalWidth || !mask.naturalHeight) return maskUrl
+  const canvas = document.createElement('canvas')
+  canvas.width = mask.naturalWidth
+  canvas.height = mask.naturalHeight
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return maskUrl
+  ctx.drawImage(mask, 0, 0)
+  const data = ctx.getImageData(0, 0, canvas.width, canvas.height)
+  for (let index = 0; index < data.data.length; index += 4) {
+    const editable = data.data[index + 3] < 255
+    data.data[index] = 255
+    data.data[index + 1] = 255
+    data.data[index + 2] = 255
+    data.data[index + 3] = editable ? 184 : 0
+  }
+  ctx.putImageData(data, 0, 0)
+  return canvas.toDataURL('image/png')
 }
 
 function isNanoBananaSize(size: string) {
@@ -357,19 +488,41 @@ function patchTask(updated: Partial<Task> & { id: string }) {
   const patched = index >= 0 ? { ...tasks.value[index], ...updated } : selectedTask.value?.id === updated.id ? { ...selectedTask.value, ...updated } : null
   if (index >= 0 && patched) tasks.value[index] = patched
   if (selectedTask.value?.id === updated.id && patched) selectedTask.value = patched
+  if (patched) prefetchTaskMasks([patched])
 }
 
 function openPreviewImage(url: string, label: string, event?: Event, maskUrl = '') {
   event?.stopPropagation()
-  previewImage.value = { url, label, maskUrl }
+  const cachedMaskUrl = cachedMaskPreviewURL(maskUrl)
+  previewImage.value = { url, label, maskUrl: cachedMaskUrl }
+  if (maskUrl && cachedMaskUrl === maskUrl) {
+    prefetchMaskPreview(maskUrl).then((previewUrl) => {
+      if (previewImage.value?.url === url && previewImage.value.maskUrl === maskUrl) previewImage.value = { ...previewImage.value, maskUrl: previewUrl }
+    }).catch(() => undefined)
+  }
+}
+
+function openReferenceMediaPreview(type: 'video' | 'audio', url: string, label: string, event?: Event) {
+  event?.stopPropagation()
+  if (!url) return
+  previewMedia.value = { type, url, label }
 }
 
 function openEditablePreview(source: 'reused' | 'new', index: number, url: string, label: string, event?: Event) {
   event?.stopPropagation()
   const maskUrl = source === 'reused' ? reusedReferenceImages.value[index]?.mask_url || '' : referenceImages.value[index]?.mask_url || referenceMaskPreviews.value[index] || ''
-  previewImage.value = { url, label, maskUrl, editable: true, source, index }
+  const cachedMaskUrl = cachedMaskPreviewURL(maskUrl)
+  previewImage.value = { url, label, maskUrl: cachedMaskUrl, editable: true, source, index }
   maskTool.value = 'brush'
   nextTick(() => loadMaskCanvas())
+  if (maskUrl && cachedMaskUrl === maskUrl) {
+    prefetchMaskPreview(maskUrl).then((previewUrl) => {
+      if (previewImage.value?.url === url && previewImage.value.maskUrl === maskUrl) {
+        previewImage.value = { ...previewImage.value, maskUrl: previewUrl }
+        nextTick(() => loadMaskCanvas())
+      }
+    }).catch(() => undefined)
+  }
 }
 
 function closePreviewImage() {
@@ -382,10 +535,6 @@ function setMaskBaseImage(element: HTMLImageElement | null) {
 
 function setMaskCanvas(element: HTMLCanvasElement | null) {
   maskCanvas.value = element
-}
-
-function maskPreviewURL(maskUrl: string) {
-  return `/api/mask-preview?${new URLSearchParams({ url: maskUrl })}`
 }
 
 async function openSourceTask(task: Task, event?: Event) {
@@ -494,18 +643,38 @@ async function loadModels() {
   if (!hasConfig.value || baseURLBlocked.value) return
   try {
     const result = await fetchModels(baseurl.value, apikey.value)
-    const ids = result.data?.map((item) => item.id).filter(Boolean) || []
-    const nextModels = [...imageModels, 'doubao-seedance-2.0']
+    const ids = extractModelIDs(result)
+    const nextModels = [...imageModels, ...videoModels]
     for (const id of ids) {
       if (id && !nextModels.includes(id)) nextModels.push(id)
     }
     models.value = nextModels
-    form.model = form.task_type === 'video_generation' ? 'doubao-seedance-2.0' : (imageModels.includes(form.model) ? form.model : 'gpt-image-2')
+    if (form.task_type === 'video_generation') {
+      form.model = videoModels.includes(form.model) ? form.model : DEFAULT_VIDEO_MODEL
+    } else if (!imageModels.includes(form.model)) {
+      form.model = 'gpt-image-2'
+    }
     syncModelSize(form.model)
     if (form.task_type === 'video_generation') normalizeVideoForm()
   } catch (error) {
     handleRequestError(error, '模型加载失败')
   }
+}
+
+function extractModelIDs(result: unknown): string[] {
+  const source = Array.isArray(result)
+    ? result
+    : result && typeof result === 'object' && 'data' in result && Array.isArray((result as { data?: unknown }).data)
+      ? (result as { data: unknown[] }).data
+      : result && typeof result === 'object' && 'models' in result && Array.isArray((result as { models?: unknown }).models)
+        ? (result as { models: unknown[] }).models
+        : []
+  return source.map((item) => {
+    if (typeof item === 'string') return item
+    if (!item || typeof item !== 'object') return ''
+    const value = item as { id?: unknown; name?: unknown; model?: unknown }
+    return String(value.id || value.name || value.model || '')
+  }).map((id) => id.trim()).filter(Boolean)
 }
 
 async function refreshTasks(limit = Math.max(30, tasks.value.length)) {
@@ -514,6 +683,7 @@ async function refreshTasks(limit = Math.max(30, tasks.value.length)) {
   try {
     const result = await listTasks(apikey.value, baseurl.value, status.value, keyword.value, favoriteOnly.value, '', '', limit)
     tasks.value = result.data
+    prefetchTaskMasks(result.data)
     totalTasks.value = result.total
     hasMoreTasks.value = result.has_more
     nextTaskBeforeCreatedAt.value = result.next_before_created_at
@@ -538,6 +708,7 @@ async function refreshPlazaItems(limit = Math.max(30, plazaItems.value.length)) 
   try {
     const result = await listPlazaItems(plazaSort.value, ensurePlazaClientID(), plazaKeyword.value, '', '', 0, limit)
     plazaItems.value = result.data
+    prefetchTaskMasks(result.data)
     totalPlazaItems.value = result.total
     hasMorePlazaItems.value = result.has_more
     nextPlazaBeforeCreatedAt.value = result.next_before_created_at
@@ -565,7 +736,9 @@ async function loadMoreTasks() {
   try {
     const result = await listTasks(apikey.value, baseurl.value, status.value, keyword.value, favoriteOnly.value, nextTaskBeforeCreatedAt.value, nextTaskBeforeID.value)
     const existing = new Set(tasks.value.map((task) => task.id))
-    tasks.value.push(...result.data.filter((task) => !existing.has(task.id)))
+    const nextTasks = result.data.filter((task) => !existing.has(task.id))
+    tasks.value.push(...nextTasks)
+    prefetchTaskMasks(nextTasks)
     totalTasks.value = result.total
     hasMoreTasks.value = result.has_more
     nextTaskBeforeCreatedAt.value = result.next_before_created_at
@@ -583,7 +756,9 @@ async function loadMorePlazaItems() {
   try {
     const result = await listPlazaItems(plazaSort.value, ensurePlazaClientID(), plazaKeyword.value, nextPlazaBeforeCreatedAt.value, nextPlazaBeforeID.value, nextPlazaBeforeLikeCount.value)
     const existing = new Set(plazaItems.value.map((item) => item.id))
-    plazaItems.value.push(...result.data.filter((item) => !existing.has(item.id)))
+    const nextItems = result.data.filter((item) => !existing.has(item.id))
+    plazaItems.value.push(...nextItems)
+    prefetchTaskMasks(nextItems)
     totalPlazaItems.value = result.total
     hasMorePlazaItems.value = result.has_more
     nextPlazaBeforeCreatedAt.value = result.next_before_created_at
@@ -665,12 +840,21 @@ async function submitTask(mode: ImageForm['task_type'] = form.task_type) {
       showMessage(failedImage.upload_error || '参考图上传失败，请删除后重新上传')
       return
     }
-    const reference_images: UploadedImage[] = [
+    const localReferenceImages: UploadedImage[] = [
       ...reusedReferenceImages.value.map((image) => ({ ...image })),
       ...referenceImages.value.map(({ preview_url, uploading, upload_error, ...image }) => ({ ...image })),
-    ]
+    ].map(ensureMaskReferenceLabel)
+    const reference_images = await prepareCanvasReferenceImages(localReferenceImages)
     const isVideo = mode === 'video_generation'
     if (isVideo) normalizeVideoForm()
+    if (isVideo && supportsVideoDraft(form.model) && reference_images.length > 2) {
+      showMessage('doubao-seedance-1.5-pro 最多只支持 2 张参考图')
+      return
+    }
+    if (isVideo && supportsVideoDraft(form.model) && (referenceVideos.value.length || referenceAudios.value.length)) {
+      showMessage('doubao-seedance-1.5-pro 参考素材只支持图片，不支持视频或音频')
+      return
+    }
     const taskType = isVideo ? 'video_generation' : 'image_generation'
     const taskCount = 1
     const createdTasks: Task[] = []
@@ -688,6 +872,7 @@ async function submitTask(mode: ImageForm['task_type'] = form.task_type) {
         ratio: form.video_ratio,
         resolution: form.video_resolution,
         duration: form.video_duration,
+        draft: form.video_draft,
       })
       const createPayload: CreateTaskPayload = isVideo ? {
         ...basePayload,
@@ -698,7 +883,8 @@ async function submitTask(mode: ImageForm['task_type'] = form.task_type) {
         video_height: videoSettings.height,
         video_duration: videoSettings.duration,
         generate_audio: form.generate_audio,
-        watermark: form.watermark,
+        draft: supportsVideoDraft(form.model) ? form.video_draft : false,
+        watermark: false,
       } : {
         ...basePayload,
         size: form.size,
@@ -727,6 +913,7 @@ async function submitTask(mode: ImageForm['task_type'] = form.task_type) {
     if (!isVideo) {
       referenceImages.value = []
       reusedReferenceImages.value = []
+      resetReferenceLabels()
       clearFileInputs()
       revokePreviews()
     }
@@ -743,16 +930,19 @@ async function submitTask(mode: ImageForm['task_type'] = form.task_type) {
 }
 
 async function runCanvasNode(payload: CanvasRunPayload, applyTask?: (task: Task) => void) {
-  console.info('[canvas-run-node] payload', {
-    node_kind: payload.node_kind,
-    task_type: payload.task_type,
-    model: payload.model,
-    video_ratio: payload.video_ratio,
-    video_resolution: payload.video_resolution,
-    video_duration: payload.video_duration,
-    reference_images: payload.reference_images.length,
-    reference_videos: payload.reference_videos.length,
-    reference_audios: payload.reference_audios.length,
+    console.info('[canvas-run-node] payload', {
+      node_kind: payload.node_kind,
+      task_type: payload.task_type,
+      model: payload.model,
+      video_ratio: payload.video_ratio,
+      video_resolution: payload.video_resolution,
+      video_duration: payload.video_duration,
+      generate_audio: payload.generate_audio,
+      draft: payload.video_draft,
+      watermark: false,
+      reference_images: payload.reference_images.length,
+      reference_videos: payload.reference_videos.length,
+      reference_audios: payload.reference_audios.length,
   })
   if (!hasConfig.value) {
     showMessage('请先配置 baseurl 和 apikey')
@@ -769,8 +959,17 @@ async function runCanvasNode(payload: CanvasRunPayload, applyTask?: (task: Task)
       ratio: payload.video_ratio,
       resolution: payload.video_resolution,
       duration: payload.video_duration,
+      draft: payload.video_draft,
     })
     const referenceImages = await prepareCanvasReferenceImages(payload.reference_images)
+    if (isVideo && supportsVideoDraft(payload.model) && referenceImages.length > 2) {
+      showMessage('doubao-seedance-1.5-pro 最多只支持 2 张参考图')
+      return
+    }
+    if (isVideo && supportsVideoDraft(payload.model) && (payload.reference_videos.length || payload.reference_audios.length)) {
+      showMessage('doubao-seedance-1.5-pro 参考素材只支持图片，不支持视频或音频')
+      return
+    }
     const taskType: ImageForm['task_type'] = isVideo ? 'video_generation' : 'image_generation'
     const basePayload: Pick<CreateTaskPayload, 'apikey' | 'baseurl' | 'node_kind' | 'task_type' | 'prompt' | 'model' | 'reference_images'> = {
       apikey: apikey.value,
@@ -790,7 +989,8 @@ async function runCanvasNode(payload: CanvasRunPayload, applyTask?: (task: Task)
       video_height: videoSettings.height,
       video_duration: videoSettings.duration,
       generate_audio: payload.generate_audio,
-      watermark: payload.watermark,
+      draft: supportsVideoDraft(payload.model) ? payload.video_draft : false,
+      watermark: false,
     } : {
       ...basePayload,
       size: payload.size,
@@ -813,6 +1013,8 @@ async function runCanvasNode(payload: CanvasRunPayload, applyTask?: (task: Task)
       video_width: created.video_width,
       video_height: created.video_height,
       video_duration: created.video_duration,
+      generate_audio: created.generate_audio,
+      watermark: created.watermark,
     })
     if (!tasks.value.some((task) => task.id === created.id)) {
       tasks.value.unshift(created)
@@ -886,6 +1088,7 @@ function toVideoAsset(video: PendingReferenceVideo): MediaAsset {
     url: video.url,
     thumbnail_url: video.cover_url || video.thumbnail_url,
     filename: video.filename,
+    reference_label: video.reference_label,
     duration: video.duration,
     width: video.width,
     height: video.height,
@@ -897,6 +1100,7 @@ function toAudioAsset(audio: PendingReferenceAudio): MediaAsset {
     type: 'audio',
     url: audio.url,
     filename: audio.filename,
+    reference_label: audio.reference_label,
     duration: audio.duration,
   }
 }
@@ -937,6 +1141,78 @@ async function toggleTaskShare(task: Task, event?: Event) {
   } catch (error) {
     showMessage(error instanceof Error ? error.message : (task.shared_to_plaza ? '取消分享失败' : '分享失败'))
   }
+}
+
+async function shareCanvasToPlaza(canvas: unknown) {
+  if (!hasConfig.value) {
+    showMessage('请先配置 baseurl 和 apikey')
+    return
+  }
+  const source = typeof canvas === 'object' && canvas ? canvas as { id?: unknown; name?: unknown } : null
+  const canvasID = String(source?.id || '')
+  const name = String(source?.name || '')
+  const updating = Boolean(canvasID && sharedCanvasIds.value.includes(canvasID))
+  try {
+    const item = await shareCanvas(apikey.value, baseurl.value, name, canvas)
+    upsertPlazaItem(item)
+    if (viewMode.value === 'plaza') await refreshPlazaItems()
+    showMessage(updating ? '画布分享已更新' : '画布已分享到广场')
+  } catch (error) {
+    showMessage(error instanceof Error ? error.message : '画布分享失败')
+  }
+}
+
+function plazaCanvasID(item: PlazaItem) {
+  return item.item_type === 'canvas' ? String((item.canvas as { id?: unknown } | undefined)?.id || '') : ''
+}
+
+function upsertPlazaItem(item: PlazaItem) {
+  const index = plazaItems.value.findIndex((current) => current.id === item.id)
+  if (index >= 0) {
+    plazaItems.value[index] = item
+    if (selectedPlazaItem.value?.id === item.id) selectedPlazaItem.value = item
+    return
+  }
+  if (item.item_type === 'canvas') {
+    const canvasID = plazaCanvasID(item)
+    const existingCanvasIndex = plazaItems.value.findIndex((current) => plazaCanvasID(current) === canvasID)
+    if (existingCanvasIndex >= 0) {
+      plazaItems.value[existingCanvasIndex] = item
+      if (selectedPlazaItem.value && plazaCanvasID(selectedPlazaItem.value) === canvasID) selectedPlazaItem.value = item
+      return
+    }
+  }
+  plazaItems.value.unshift(item)
+  totalPlazaItems.value += 1
+}
+
+async function unshareCanvasFromPlaza(canvasID: string) {
+  if (!hasConfig.value) {
+    showMessage('请先配置 baseurl 和 apikey')
+    return
+  }
+  if (!canvasID) return
+  try {
+    await unshareCanvas(apikey.value, baseurl.value, canvasID)
+    const before = plazaItems.value.length
+    plazaItems.value = plazaItems.value.filter((item) => plazaCanvasID(item) !== canvasID)
+    totalPlazaItems.value = Math.max(0, totalPlazaItems.value - Math.max(0, before - plazaItems.value.length))
+    if (selectedPlazaItem.value && plazaCanvasID(selectedPlazaItem.value) === canvasID) selectedPlazaItem.value = null
+    showMessage('已取消画布分享')
+  } catch (error) {
+    showMessage(error instanceof Error ? error.message : '取消画布分享失败')
+  }
+}
+
+function reusePlazaItem(item: PlazaItem) {
+  if (item.item_type === 'canvas' && item.canvas) {
+    pendingCanvasImport.value = { token: Date.now(), canvas: item.canvas }
+    switchView('canvas')
+    selectedPlazaItem.value = null
+    showMessage('正在导入广场画布')
+    return
+  }
+  reuseTask(item)
 }
 
 async function togglePlazaLike(item: PlazaItem, event?: Event) {
@@ -994,6 +1270,7 @@ async function visualMaskDataURLToEditableMaskBlob(dataURL: string) {
 function loadImageElement(src: string) {
   return new Promise<HTMLImageElement>((resolve, reject) => {
     const image = new Image()
+    image.crossOrigin = 'anonymous'
     image.onload = () => resolve(image)
     image.onerror = () => reject(new Error('图片加载失败'))
     image.src = src
@@ -1001,6 +1278,7 @@ function loadImageElement(src: string) {
 }
 
 function reuseTask(task: Task | PlazaItem) {
+  resetReferenceLabels()
   if ('task_type' in task) {
     form.task_type = task.task_type || 'image_generation'
   } else {
@@ -1023,18 +1301,19 @@ function reuseTask(task: Task | PlazaItem) {
     syncVideoDimensions()
     form.video_duration = task.video_duration || 5
     form.generate_audio = task.generate_audio !== false
-    form.watermark = Boolean(task.watermark)
+    form.video_draft = supportsVideoDraft(task.model) ? Boolean(task.draft) : false
+    form.watermark = false
     form.reference_video_urls = (task.reference_videos || []).map((item) => item.url).join('\n')
-    referenceVideos.value = (task.reference_videos || []).map((item, index) => ({
-      ...item,
+    referenceVideos.value = (task.reference_videos || []).map((item) => ({
+      ...ensureReferenceLabel(item, 'video'),
       type: item.type || 'video',
-      filename: item.filename || `视频 ${index + 1}`,
+      filename: item.filename || 'reference-video',
       cover_url: item.thumbnail_url,
     }))
-    referenceAudios.value = (task.reference_audios || []).map((item, index) => ({
-      ...item,
+    referenceAudios.value = (task.reference_audios || []).map((item) => ({
+      ...ensureReferenceLabel(item, 'audio'),
       type: item.type || 'audio',
-      filename: item.filename || `音频 ${index + 1}`,
+      filename: item.filename || 'reference-audio',
     }))
     form.reference_audio_urls = ''
   } else {
@@ -1044,7 +1323,7 @@ function reuseTask(task: Task | PlazaItem) {
     form.reference_audio_urls = ''
   }
   referenceImages.value = []
-  reusedReferenceImages.value = [...(task.reference_images || [])]
+  reusedReferenceImages.value = (task.reference_images || []).map((image) => ensureMaskReferenceLabel(ensureReferenceLabel(image, 'image')))
   clearFileInputs()
   revokePreviews()
   syncSizeDraft(form.size)
@@ -1055,10 +1334,54 @@ function reuseTask(task: Task | PlazaItem) {
   showMessage('已复用任务配置和参考图')
 }
 
+function filenameFromURL(url: string, fallback: string) {
+  const clean = url.split('?')[0].split('#')[0]
+  const name = decodeURIComponent(clean.slice(clean.lastIndexOf('/') + 1))
+  return name || fallback
+}
+
+function nextReferenceLabel(type: 'image' | 'video' | 'audio') {
+  const prefix = type === 'image' ? '图片' : type === 'video' ? '视频' : '音频'
+  const value = referenceLabelCounters[type]
+  referenceLabelCounters[type] += 1
+  return `${prefix}${value}`
+}
+
+function ensureReferenceLabel<T extends { reference_label?: string }>(item: T, type: 'image' | 'video' | 'audio') {
+  return item.reference_label ? item : { ...item, reference_label: nextReferenceLabel(type) }
+}
+
+function ensureMaskReferenceLabel<T extends UploadedImage>(image: T): T {
+  if (!image.mask_url || image.mask_reference_label) return image
+  const baseLabel = image.reference_label || '图片'
+  return { ...image, mask_reference_label: `${baseLabel}-蒙版` }
+}
+
+function resetReferenceLabels() {
+  referenceLabelCounters.image = 1
+  referenceLabelCounters.video = 1
+  referenceLabelCounters.audio = 1
+}
+
+function inferReferenceAssetType(url: string): 'image' | 'video' | 'audio' {
+  const pathname = url.split('?')[0].split('#')[0].toLowerCase()
+  if (/\.(mp4|webm|mov|m4v|avi|mkv)$/i.test(pathname)) return 'video'
+  if (/\.(mp3|wav|m4a|aac|ogg|flac|opus)$/i.test(pathname)) return 'audio'
+  return 'image'
+}
+
 function openResultImage(task: Task | PlazaItem) {
-  const url = task.result_videos?.[0]?.url || task.result_images?.[0]?.url
+  const videoURL = task.result_videos?.[0]?.url
+  const imageURL = task.result_images?.[0]?.url
+  const url = videoURL || imageURL
   if (!url) return
-  window.open(url, '_blank', 'noopener,noreferrer')
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filenameFromURL(url, videoURL ? 'result-video.mp4' : 'result-image.png')
+  link.rel = 'noopener noreferrer'
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
 }
 
 function syncVideoDimensions() {
@@ -1073,6 +1396,7 @@ function normalizeVideoForm() {
     ratio: form.video_ratio,
     resolution: form.video_resolution,
     duration: form.video_duration,
+    draft: form.video_draft,
   })
   form.video_ratio = normalized.ratio
   form.video_resolution = normalized.resolution
@@ -1082,6 +1406,7 @@ function normalizeVideoForm() {
 }
 
 function switchView(mode: ViewMode) {
+  if (mode === 'canvas') canvasFrameReady.value = false
   viewMode.value = mode
   if (mode === 'plaza' && !plazaItems.value.length) resetPlazaItems()
   if (mode === 'canvas' && hasConfig.value && !tasks.value.length) refreshTasks()
@@ -1095,7 +1420,7 @@ function switchPlazaSort(sort: 'time' | 'likes') {
 function addResultToReferences(task: Task) {
   const image = task.result_images?.[0]
   if (!image?.url) return
-  reusedReferenceImages.value.push({ ...image })
+  reusedReferenceImages.value.push({ ...image, reference_label: nextReferenceLabel('image') })
   selectedTask.value = null
   showMessage('已加入参考图')
 }
@@ -1103,7 +1428,7 @@ function addResultToReferences(task: Task) {
 function appendReferenceFiles(files: File[]) {
   if (!files.length) return
   const start = referenceImages.value.length
-  referenceImages.value.push(...files.map((file) => ({ url: '', filename: file.name, preview_url: URL.createObjectURL(file), uploading: true })))
+  referenceImages.value.push(...files.map((file) => ({ url: '', filename: file.name, reference_label: nextReferenceLabel('image'), preview_url: URL.createObjectURL(file), uploading: true })))
   referenceMaskFiles.value.push(...files.map(() => null))
   referenceMaskPreviews.value.push(...files.map(() => null))
   files.forEach((file, offset) => uploadReferenceFile(file, start + offset))
@@ -1114,7 +1439,7 @@ async function uploadReferenceFile(file: File, index: number) {
     const uploaded = await uploadImage(file)
     const current = referenceImages.value[index]
     if (!current) return
-    referenceImages.value[index] = { ...uploaded, preview_url: current.preview_url, uploading: false }
+    referenceImages.value[index] = { ...uploaded, reference_label: current.reference_label, preview_url: current.preview_url, uploading: false }
   } catch (error) {
     const current = referenceImages.value[index]
     if (!current) return
@@ -1126,6 +1451,46 @@ function onReferenceChange(event: Event) {
   const files = Array.from((event.target as HTMLInputElement).files || [])
   appendReferenceFiles(files)
   ;(event.target as HTMLInputElement).value = ''
+}
+
+function onReferenceAssetChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files || [])
+  const imageFiles = files.filter((file) => file.type.startsWith('image/'))
+  const videoFiles = form.task_type === 'video_generation' && !supportsVideoDraft(form.model) ? files.filter((file) => file.type.startsWith('video/')) : []
+  const audioFiles = form.task_type === 'video_generation' && !supportsVideoDraft(form.model) ? files.filter((file) => file.type.startsWith('audio/')) : []
+  appendReferenceFiles(imageFiles)
+  videoFiles.forEach((file) => uploadReferenceMediaFile(file, 'video'))
+  audioFiles.forEach((file) => uploadReferenceMediaFile(file, 'audio'))
+  if (form.task_type === 'video_generation' && supportsVideoDraft(form.model) && files.some((file) => file.type.startsWith('video/') || file.type.startsWith('audio/'))) showMessage('doubao-seedance-1.5-pro 参考素材只支持图片')
+  if (files.length && !imageFiles.length && !videoFiles.length && !audioFiles.length) showMessage('未识别可用的参考素材文件')
+  if (files.length && showReferenceAssetURLModal.value) showReferenceAssetURLModal.value = false
+  input.value = ''
+}
+
+async function uploadReferenceMediaFile(file: File, type: 'video' | 'audio') {
+  const list = type === 'video' ? referenceVideos : referenceAudios
+  const item = {
+    type,
+    url: '',
+    filename: file.name,
+    reference_label: nextReferenceLabel(type),
+    loading: true,
+  }
+  list.value.push(item)
+  const index = list.value.length - 1
+  try {
+    const uploaded = await uploadImage(file)
+    if (!list.value[index]) return
+    list.value[index] = { ...list.value[index], url: uploaded.url, filename: uploaded.filename || file.name, loading: false }
+    if (type === 'video') {
+      const cover = await captureVideoCover(uploaded.url).catch(() => '')
+      if (cover && referenceVideos.value[index]) referenceVideos.value[index] = { ...referenceVideos.value[index], cover_url: cover, thumbnail_url: cover }
+    }
+  } catch (error) {
+    if (!list.value[index]) return
+    list.value[index] = { ...list.value[index], loading: false, error: error instanceof Error ? error.message : '素材上传失败' }
+  }
 }
 
 function onPromptPaste(event: ClipboardEvent) {
@@ -1151,6 +1516,60 @@ function removeReusedReference(index: number) {
   reusedReferenceImages.value.splice(index, 1)
 }
 
+function updateReferenceFrameRole(source: 'reused' | 'new', index: number, role: UploadedImage['video_frame_role']) {
+  const normalizedRole = role === 'first_frame' || role === 'last_frame' ? role : ''
+  const clearRole = (items: UploadedImage[]) => items.map((image) => image.video_frame_role === normalizedRole ? { ...image, video_frame_role: '' as const } : image)
+  if (normalizedRole) {
+    reusedReferenceImages.value = clearRole(reusedReferenceImages.value)
+    referenceImages.value = clearRole(referenceImages.value) as PendingReferenceImage[]
+  }
+  if (source === 'reused') {
+    const image = reusedReferenceImages.value[index]
+    if (image) reusedReferenceImages.value[index] = { ...image, video_frame_role: normalizedRole }
+    return
+  }
+  const image = referenceImages.value[index]
+  if (image) referenceImages.value[index] = { ...image, video_frame_role: normalizedRole }
+}
+
+function openReferenceAssetURLModal() {
+  referenceAssetURLDraft.value = ''
+  showReferenceAssetURLModal.value = true
+}
+
+async function addReferenceAssetFromURL() {
+  const url = referenceAssetURLDraft.value.trim()
+  if (!url) {
+    showMessage('请输入参考素材 URL')
+    return
+  }
+  if (!/^https?:\/\//i.test(url)) {
+    showMessage('参考素材 URL 必须以 http:// 或 https:// 开头')
+    return
+  }
+  addingReferenceAssetURL.value = true
+  try {
+    const assetType = form.task_type === 'video_generation' && !supportsVideoDraft(form.model) ? inferReferenceAssetType(url) : 'image'
+    if (assetType === 'image') {
+      if (reusedReferenceImages.value.some((image) => image.url === url) || referenceImages.value.some((image) => image.url === url)) {
+        showMessage('这个参考图片已经添加过了')
+        return
+      }
+      reusedReferenceImages.value.push({ url, filename: filenameFromURL(url, 'reference-image'), reference_label: nextReferenceLabel('image') })
+    } else if (assetType === 'video') {
+      videoURLDraft.value = url
+      await addReferenceVideoFromURL()
+    } else {
+      audioURLDraft.value = url
+      addReferenceAudioFromURL()
+    }
+    showReferenceAssetURLModal.value = false
+    referenceAssetURLDraft.value = ''
+  } finally {
+    addingReferenceAssetURL.value = false
+  }
+}
+
 function openReferenceVideoModal() {
   videoURLDraft.value = ''
   showReferenceVideoModal.value = true
@@ -1174,7 +1593,8 @@ async function addReferenceVideoFromURL() {
   const item: PendingReferenceVideo = {
     type: 'video',
     url,
-    filename: `视频 ${referenceVideos.value.length + 1}`,
+    filename: filenameFromURL(url, 'reference-video.mp4'),
+    reference_label: nextReferenceLabel('video'),
     loading: true,
   }
   referenceVideos.value.push(item)
@@ -1221,7 +1641,8 @@ function addReferenceAudioFromURL() {
   referenceAudios.value.push({
     type: 'audio',
     url,
-    filename: `音频 ${referenceAudios.value.length + 1}`,
+    filename: filenameFromURL(url, 'reference-audio.mp3'),
+    reference_label: nextReferenceLabel('audio'),
   })
   audioURLDraft.value = ''
   showReferenceAudioModal.value = false
@@ -1305,11 +1726,12 @@ async function loadMaskCanvas() {
     await new Promise<void>((resolve, reject) => {
       mask.onload = () => resolve()
       mask.onerror = () => reject(new Error('蒙板加载失败'))
-      mask.src = existing.startsWith('blob:') ? existing : maskPreviewURL(existing)
+      mask.crossOrigin = 'anonymous'
+      mask.src = existing
     }).catch(() => undefined)
     if (mask.complete && mask.naturalWidth) {
-      if (existing.startsWith('blob:')) drawVisibleMask(ctx, mask, canvas.width, canvas.height)
-      else ctx.drawImage(mask, 0, 0, canvas.width, canvas.height)
+      if (existing.startsWith('data:image/')) ctx.drawImage(mask, 0, 0, canvas.width, canvas.height)
+      else drawVisibleMask(ctx, mask, canvas.width, canvas.height)
     }
   }
 }
@@ -1320,16 +1742,20 @@ function drawVisibleMask(ctx: CanvasRenderingContext2D, mask: HTMLImageElement, 
   source.height = height
   const sourceCtx = source.getContext('2d')
   if (!sourceCtx) return
-  sourceCtx.drawImage(mask, 0, 0, width, height)
-  const data = sourceCtx.getImageData(0, 0, width, height)
-  for (let index = 0; index < data.data.length; index += 4) {
-    const editable = data.data[index + 3] < 255
-    data.data[index] = 255
-    data.data[index + 1] = 255
-    data.data[index + 2] = 255
-    data.data[index + 3] = editable ? 184 : 0
+  try {
+    sourceCtx.drawImage(mask, 0, 0, width, height)
+    const data = sourceCtx.getImageData(0, 0, width, height)
+    for (let index = 0; index < data.data.length; index += 4) {
+      const editable = data.data[index + 3] < 255
+      data.data[index] = 255
+      data.data[index + 1] = 255
+      data.data[index + 2] = 255
+      data.data[index + 3] = editable ? 184 : 0
+    }
+    ctx.putImageData(data, 0, 0)
+  } catch {
+    ctx.drawImage(mask, 0, 0, width, height)
   }
-  ctx.putImageData(data, 0, 0)
 }
 
 function currentMaskURL() {
@@ -1468,62 +1894,29 @@ function clearMaskCanvas() {
   ctx.clearRect(0, 0, canvas.width, canvas.height)
 }
 
-async function exportEditableAreaMask(sourceCanvas: HTMLCanvasElement) {
-  const sourceWidth = Number(sourceCanvas.dataset.sourceWidth) || sourceCanvas.width
-  const sourceHeight = Number(sourceCanvas.dataset.sourceHeight) || sourceCanvas.height
-  const normalized = document.createElement('canvas')
-  normalized.width = sourceWidth
-  normalized.height = sourceHeight
-  const normalizedCtx = normalized.getContext('2d')
-  if (!normalizedCtx) return null
-  normalizedCtx.imageSmoothingEnabled = true
-  normalizedCtx.drawImage(sourceCanvas, 0, 0, sourceWidth, sourceHeight)
-
-  const output = document.createElement('canvas')
-  output.width = sourceWidth
-  output.height = sourceHeight
-  const outputCtx = output.getContext('2d')
-  if (!outputCtx) return null
-  const source = normalizedCtx.getImageData(0, 0, sourceWidth, sourceHeight)
-  const mask = outputCtx.createImageData(sourceWidth, sourceHeight)
-  for (let index = 0; index < source.data.length; index += 4) {
-    const painted = source.data[index + 3] > 0
-    mask.data[index] = 255
-    mask.data[index + 1] = 255
-    mask.data[index + 2] = 255
-    mask.data[index + 3] = painted ? 0 : 255
-  }
-  outputCtx.putImageData(mask, 0, 0)
-  return new Promise<Blob | null>((resolve) => output.toBlob(resolve, 'image/png'))
-}
-
 async function saveMaskCanvas() {
   const image = previewImage.value
   const canvas = maskCanvas.value
   if (!image?.editable || image.index === undefined || !canvas) return
-  const blob = await exportEditableAreaMask(canvas)
-  if (!blob) return
-  const file = new File([blob], `mask-${image.index + 1}.png`, { type: 'image/png' })
+  const maskDataURL = canvas.toDataURL('image/png')
   if (image.source === 'reused') {
-    const uploaded = await uploadImage(file)
-    reusedReferenceImages.value[image.index] = { ...reusedReferenceImages.value[image.index], mask_url: uploaded.url }
-    previewImage.value = { ...image, maskUrl: uploaded.url }
+    reusedReferenceImages.value[image.index] = ensureMaskReferenceLabel({ ...reusedReferenceImages.value[image.index], mask_url: maskDataURL })
+    previewImage.value = { ...image, maskUrl: maskDataURL }
   } else {
     const previousMaskPreview = referenceMaskPreviews.value[image.index]
-    if (previousMaskPreview) URL.revokeObjectURL(previousMaskPreview)
-    referenceMaskFiles.value[image.index] = file
-    referenceMaskPreviews.value[image.index] = URL.createObjectURL(file)
-    const uploaded = await uploadImage(file)
-    if (referenceImages.value[image.index]) referenceImages.value[image.index] = { ...referenceImages.value[image.index], mask_url: uploaded.url }
-    previewImage.value = { ...image, maskUrl: uploaded.url }
+    if (previousMaskPreview?.startsWith('blob:')) URL.revokeObjectURL(previousMaskPreview)
+    referenceMaskFiles.value[image.index] = null
+    referenceMaskPreviews.value[image.index] = maskDataURL
+    if (referenceImages.value[image.index]) referenceImages.value[image.index] = ensureMaskReferenceLabel({ ...referenceImages.value[image.index], mask_url: maskDataURL })
+    previewImage.value = { ...image, maskUrl: maskDataURL }
   }
-  showMessage('蒙板已保存并上传，涂抹区域会被修改')
+  showMessage('蒙板已保存，提交任务时会自动上传')
 }
 
 function revokePreviews() {
   referenceImages.value.forEach((image) => URL.revokeObjectURL(image.preview_url))
   referenceMaskPreviews.value.forEach((url) => {
-    if (url) URL.revokeObjectURL(url)
+    if (url?.startsWith('blob:')) URL.revokeObjectURL(url)
   })
   referenceImages.value = []
   referenceMaskFiles.value = []
@@ -1535,11 +1928,35 @@ function openSizeModal() {
   showSizeModal.value = true
 }
 
+function openVideoSizeModal() {
+  syncVideoSizeDraft()
+  showVideoSizeModal.value = true
+}
+
 function applySize() {
   ensureAllowedSizeBase()
   form.size = currentDraftSize.value
   pendingSizeSync.value = form.size
   showSizeModal.value = false
+}
+
+function applyVideoSize() {
+  form.video_ratio = videoSizeDraft.ratio
+  form.video_resolution = form.video_draft ? '480p' : videoSizeDraft.resolution
+  normalizeVideoForm()
+  showVideoSizeModal.value = false
+}
+
+function syncVideoSizeDraft() {
+  const normalized = normalizeVideoSettings({
+    model: form.model,
+    ratio: form.video_ratio,
+    resolution: form.video_resolution,
+    duration: form.video_duration,
+    draft: form.video_draft,
+  })
+  videoSizeDraft.ratio = normalized.ratio
+  videoSizeDraft.resolution = normalized.resolution
 }
 
 function ensureAllowedSizeBase() {
@@ -1589,7 +2006,7 @@ function showMessage(text: string) {
 </script>
 
 <template>
-  <main class="page" :class="[`theme-${appliedThemeMode}`, { 'canvas-view': viewMode === 'canvas', 'canvas-zen-view': viewMode === 'canvas' && canvasZenMode }]" @click="closeContextMenu" @contextmenu.prevent="openContextMenu($event, [{ label: '刷新当前视图', action: () => viewMode === 'plaza' ? refreshPlazaItems() : refreshTasks() }, { label: '连接设置', action: openSettings }, { label: `切换主题：${themeMode === 'dark' ? '浅色' : '深色'}`, action: toggleTheme }])">
+  <main class="page" :class="[`theme-${appliedThemeMode}`, { 'canvas-view': viewMode === 'canvas', 'canvas-zen-view': viewMode === 'canvas' && canvasZenMode }]" @click="closeContextMenu" @contextmenu.prevent="openPageContextMenu">
     <Transition name="canvas-toolbar-slide">
       <AppToolbar
         v-if="!(viewMode === 'canvas' && canvasZenMode)"
@@ -1645,14 +2062,30 @@ function showMessage(text: string) {
         :default-form="form"
         :models="models"
         :submitting="submitting"
+        :shared-canvas-ids="sharedCanvasIds"
+        :canvas-import="pendingCanvasImport"
         :run-node-action="runCanvasNode"
         :run-llm-action="runCanvasLLM"
         @select-task="selectedTask = $event"
         @run-node="runCanvasNode"
         @run-llm="runCanvasLLM"
+        @share-canvas="shareCanvasToPlaza"
+        @unshare-canvas="unshareCanvasFromPlaza"
         @zen-mode-change="canvasZenMode = $event"
+        @close-context-menu="closeContextMenu"
+        @ready="canvasFrameReady = true"
       />
     </KeepAlive>
+
+    <Transition name="canvas-loading-fade">
+      <div v-if="viewMode === 'canvas' && !canvasFrameReady" class="canvas-entry-loading">
+        <div class="canvas-entry-loading-panel glass-panel">
+          <div class="spinner" aria-hidden="true"></div>
+          <strong>正在载入画布</strong>
+          <span>准备画布框架...</span>
+        </div>
+      </div>
+    </Transition>
 
     <PlazaGrid
       v-if="viewMode === 'plaza'"
@@ -1661,7 +2094,8 @@ function showMessage(text: string) {
       :has-more-plaza-items="hasMorePlazaItems"
       @select-item="selectedPlazaItem = $event"
       @open-preview="openPreviewImage"
-      @reuse="reuseTask"
+      @context-menu="openPlazaContextMenu"
+      @reuse="reusePlazaItem"
       @toggle-like="togglePlazaLike"
       @load-more="loadMorePlazaItems"
     />
@@ -1694,17 +2128,23 @@ function showMessage(text: string) {
       @open-editable-preview="openEditablePreview"
       @remove-reused-reference="removeReusedReference"
       @remove-reference="removeReference"
+      @update-reference-frame-role="updateReferenceFrameRole"
       @remove-reference-video="removeReferenceVideo"
       @remove-reference-audio="removeReferenceAudio"
       @open-reference-video-modal="openReferenceVideoModal"
       @open-reference-audio-modal="openReferenceAudioModal"
+      @open-reference-asset-modal="openReferenceAssetURLModal"
+      @open-reference-asset-url-modal="openReferenceAssetURLModal"
+      @open-reference-media-preview="openReferenceMediaPreview"
       @open-size-modal="openSizeModal"
+      @open-video-size-modal="openVideoSizeModal"
       @reference-change="onReferenceChange"
+      @reference-asset-change="onReferenceAssetChange"
     />
 
-    <div v-if="contextMenu" class="context-menu" :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }" @click.stop @contextmenu.prevent>
+    <div v-if="contextMenu" class="context-menu" :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }" @click.stop @contextmenu.prevent.stop>
       <button v-for="item in contextMenu.items" :key="item.label" type="button" :class="{ danger: item.danger }" :disabled="item.disabled" @click="runContextAction(item)">
-        {{ item.label }}
+        <span>{{ item.label }}</span>
       </button>
     </div>
 
@@ -1730,7 +2170,46 @@ function showMessage(text: string) {
       @apply="applySize"
     />
 
-    <div v-if="showReferenceVideoModal" class="modal-backdrop" @click.self="showReferenceVideoModal = false">
+    <VideoSizeModal
+      v-if="showVideoSizeModal"
+      :current-size="currentVideoSizeLabel"
+      :draft-size="draftVideoSize"
+      :selected-resolution="videoSizeDraft.resolution"
+      :selected-ratio="videoSizeDraft.ratio"
+      :ratio-options="currentVideoRatioOptions"
+      :resolution-options="currentVideoResolutionOptions"
+      @close="showVideoSizeModal = false"
+      @select-resolution="videoSizeDraft.resolution = $event"
+      @select-ratio="videoSizeDraft.ratio = $event"
+      @apply="applyVideoSize"
+    />
+
+    <div v-if="showReferenceAssetURLModal" class="modal-backdrop" @click.self="showReferenceAssetURLModal = false" @wheel.self.prevent.stop>
+      <section class="video-url-modal light-modal">
+        <button class="modal-close" type="button" @click="showReferenceAssetURLModal = false"><AppIcon name="close" /></button>
+        <h2>添加参考</h2>
+        <p>{{ form.task_type === 'video_generation' && !supportsVideoDraft(form.model) ? '视频生成支持图片、视频、音频参考。' : '当前模型支持图片参考。' }}</p>
+        <div class="asset-modal-upload">
+          <label class="asset-upload-drop">
+            <AppIcon name="upload" />
+            <strong>上传参考</strong>
+            <span>{{ form.task_type === 'video_generation' && !supportsVideoDraft(form.model) ? '选择图片、视频或音频文件' : '选择图片文件' }}</span>
+            <input type="file" multiple :accept="form.task_type === 'video_generation' && !supportsVideoDraft(form.model) ? 'image/*,video/*,audio/*' : 'image/*'" @change="onReferenceAssetChange" />
+          </label>
+        </div>
+        <div class="asset-url-block">
+          <label>参考 URL<input v-model="referenceAssetURLDraft" type="url" placeholder="https://example.com/reference.png" @keyup.enter="addReferenceAssetFromURL" /></label>
+          <p v-if="form.task_type === 'video_generation' && !supportsVideoDraft(form.model)">会根据 URL 后缀自动识别图片、视频或音频；无法识别时按图片处理。</p>
+          <p v-else-if="form.task_type === 'video_generation'">当前模型只支持图片参考素材。</p>
+        </div>
+        <div class="modal-actions-row">
+          <button class="cancel" type="button" @click="showReferenceAssetURLModal = false"><AppIcon name="close" />取消</button>
+          <button class="confirm" type="button" :disabled="addingReferenceAssetURL" @click="addReferenceAssetFromURL"><AppIcon name="check" />{{ addingReferenceAssetURL ? '添加中' : '添加' }}</button>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="showReferenceVideoModal" class="modal-backdrop" @click.self="showReferenceVideoModal = false" @wheel.self.prevent.stop>
       <section class="video-url-modal light-modal">
         <button class="modal-close" type="button" @click="showReferenceVideoModal = false"><AppIcon name="close" /></button>
         <h2>添加参考视频</h2>
@@ -1743,7 +2222,7 @@ function showMessage(text: string) {
       </section>
     </div>
 
-    <div v-if="showReferenceAudioModal" class="modal-backdrop" @click.self="showReferenceAudioModal = false">
+    <div v-if="showReferenceAudioModal" class="modal-backdrop" @click.self="showReferenceAudioModal = false" @wheel.self.prevent.stop>
       <section class="video-url-modal light-modal">
         <button class="modal-close" type="button" @click="showReferenceAudioModal = false"><AppIcon name="close" /></button>
         <h2>添加参考音频</h2>
@@ -1776,7 +2255,7 @@ function showMessage(text: string) {
       :item="selectedPlazaItem"
       @close="selectedPlazaItem = null"
       @open-preview="openPreviewImage"
-      @reuse="reuseTask"
+      @reuse="reusePlazaItem"
       @open-result="openResultImage"
       @toggle-like="togglePlazaLike"
     />
@@ -1790,7 +2269,6 @@ function showMessage(text: string) {
       v-model:mask-tool="maskTool"
       v-model:mask-brush-size="maskBrushSize"
       :image="previewImage"
-      :mask-preview-url="maskPreviewURL"
       @close="closePreviewImage"
       @set-base-image="setMaskBaseImage"
       @set-canvas="setMaskCanvas"
@@ -1798,6 +2276,15 @@ function showMessage(text: string) {
       @clear-mask="clearMaskCanvas"
       @save-mask="saveMaskCanvas"
     />
+
+    <div v-if="previewMedia" class="modal-backdrop reference-media-backdrop" @click.self="previewMedia = null" @wheel.self.prevent.stop>
+      <section class="reference-media-modal light-modal">
+        <button class="modal-close" type="button" @click="previewMedia = null"><AppIcon name="close" /></button>
+        <h2>{{ previewMedia.label }}</h2>
+        <video v-if="previewMedia.type === 'video'" :src="previewMedia.url" controls autoplay playsinline preload="auto" />
+        <audio v-else :src="previewMedia.url" controls autoplay />
+      </section>
+    </div>
 
     <div v-if="message" class="toast">{{ message }}</div>
   </main>

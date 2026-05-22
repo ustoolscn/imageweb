@@ -24,6 +24,7 @@ export interface ImageForm {
   video_height: number
   video_duration: number
   generate_audio: boolean
+  video_draft: boolean
   watermark: boolean
   reference_video_urls: string
   reference_audio_urls: string
@@ -48,6 +49,7 @@ export type CanvasRunPayload = {
   video_resolution: ImageForm['video_resolution']
   video_duration: number
   generate_audio: boolean
+  video_draft: boolean
   watermark: boolean
 }
 

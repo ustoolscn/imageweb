@@ -83,6 +83,34 @@ export async function fetchSiteBrand(baseurl: string) {
   return request<SiteBrand>(`/api/site-brand?${params}`)
 }
 
+export async function fetchCanvases(apikey: string, baseurl: string) {
+  return request<{ canvases: unknown; updated_at: string }>(`/api/canvases?${new URLSearchParams({ apikey, baseurl })}`)
+}
+
+export async function saveCanvasesCloud(apikey: string, baseurl: string, canvases: unknown) {
+  return request<{ canvases: unknown; updated_at: string }>('/api/canvases', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apikey, baseurl, canvases }),
+  })
+}
+
+export async function shareCanvas(apikey: string, baseurl: string, canvasName: string, canvas: unknown): Promise<PlazaItem> {
+  return request<PlazaItem>('/api/canvases/share', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apikey, baseurl, canvas_name: canvasName, canvas }),
+  })
+}
+
+export async function unshareCanvas(apikey: string, baseurl: string, canvasID: string) {
+  return request<{ ok: boolean }>('/api/canvases/share', {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apikey, baseurl, canvas_id: canvasID }),
+  })
+}
+
 function toUploadedImage(data: unknown): UploadedImage {
   const response = data as {
     success?: boolean
@@ -107,7 +135,7 @@ function toUploadedImage(data: unknown): UploadedImage {
 }
 
 export async function fetchModels(baseurl: string, apikey: string) {
-  return request<{ data?: Array<{ id: string }>; object?: string }>('/api/models', {
+  return request<unknown>('/api/models', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ baseurl, apikey }),

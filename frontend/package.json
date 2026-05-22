@@ -10,10 +10,14 @@
     "@vue-flow/core": "^1.48.2",
     "@vue-flow/minimap": "^1.5.4",
     "@vue-flow/node-resizer": "^1.5.1",
+    "three": "^0.184.0",
     "typescript": "latest",
     "video.js": "^8.23.7",
     "vite": "latest",
     "vue": "latest",
     "vue-tsc": "latest"
+  },
+  "devDependencies": {
+    "@types/three": "^0.184.1"
   }
 }

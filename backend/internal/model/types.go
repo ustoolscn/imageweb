@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type TaskStatus string
 type TaskType string
@@ -21,6 +24,7 @@ type UploadedImage struct {
 	Filename           string  `json:"filename,omitempty"`
 	NodeID             string  `json:"node_id,omitempty"`
 	ReferenceLabel     string  `json:"reference_label,omitempty"`
+	VideoFrameRole     string  `json:"video_frame_role,omitempty"`
 	MaskReferenceLabel string  `json:"mask_reference_label,omitempty"`
 	OriginalSize       int64   `json:"original_size,omitempty"`
 	CompressedSize     int64   `json:"compressed_size,omitempty"`
@@ -82,6 +86,7 @@ type Task struct {
 	VideoHeight         int             `json:"video_height,omitempty"`
 	VideoDuration       int             `json:"video_duration,omitempty"`
 	GenerateAudio       bool            `json:"generate_audio"`
+	Draft               bool            `json:"draft"`
 	Watermark           bool            `json:"watermark"`
 	ErrorMessage        string          `json:"error_message"`
 	ElapsedMS           int64           `json:"elapsed_ms"`
@@ -117,7 +122,11 @@ type TaskUpdate struct {
 
 type PlazaItem struct {
 	ID                  string          `json:"id"`
+	ItemType            string          `json:"item_type"`
 	TaskID              string          `json:"task_id"`
+	CanvasName          string          `json:"canvas_name,omitempty"`
+	CanvasJSON          json.RawMessage `json:"canvas,omitempty"`
+	CanvasJSONText      string          `json:"-"`
 	TaskType            TaskType        `json:"task_type"`
 	Prompt              string          `json:"prompt"`
 	Model               string          `json:"model"`
@@ -142,6 +151,7 @@ type PlazaItem struct {
 	VideoHeight         int             `json:"video_height,omitempty"`
 	VideoDuration       int             `json:"video_duration,omitempty"`
 	GenerateAudio       bool            `json:"generate_audio"`
+	Draft               bool            `json:"draft"`
 	Watermark           bool            `json:"watermark"`
 	LikeCount           int             `json:"like_count"`
 	Liked               bool            `json:"liked"`
@@ -179,6 +189,7 @@ type CreateTaskRequest struct {
 	VideoHeight       int             `json:"video_height"`
 	VideoDuration     int             `json:"video_duration"`
 	GenerateAudio     bool            `json:"generate_audio"`
+	Draft             bool            `json:"draft"`
 	Watermark         bool            `json:"watermark"`
 }
 
@@ -201,6 +212,14 @@ type LLMRequest struct {
 type ShareTaskRequest struct {
 	APIKey  string `json:"apikey"`
 	BaseURL string `json:"baseurl"`
+}
+
+type ShareCanvasRequest struct {
+	APIKey     string          `json:"apikey"`
+	BaseURL    string          `json:"baseurl"`
+	CanvasID   string          `json:"canvas_id"`
+	CanvasName string          `json:"canvas_name"`
+	Canvas     json.RawMessage `json:"canvas"`
 }
 
 type LikePlazaRequest struct {
@@ -230,4 +249,15 @@ type SiteBrandResponse struct {
 	Icon    string `json:"icon"`
 	Allow2K bool   `json:"allow_2k"`
 	Allow4K bool   `json:"allow_4k"`
+}
+
+type CanvasState struct {
+	Canvases  json.RawMessage `json:"canvases"`
+	UpdatedAt time.Time       `json:"updated_at"`
+}
+
+type CanvasStateRequest struct {
+	APIKey   string          `json:"apikey"`
+	BaseURL  string          `json:"baseurl"`
+	Canvases json.RawMessage `json:"canvases"`
 }
