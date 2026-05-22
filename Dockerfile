@@ -1,9 +1,10 @@
 FROM node:22-alpine AS frontend
 WORKDIR /src/frontend
+ARG NPM_REGISTRY=https://registry.npmjs.org/
 COPY frontend/package*.json ./
-RUN npm config set registry https://registry.npmmirror.com/ \
+RUN npm config set registry "$NPM_REGISTRY" \
     && npm config set replace-registry-host always \
-    && npm ci --no-audit --no-fund --fetch-retries=5 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000
+    && npm ci --no-audit --no-fund --loglevel=info --fetch-retries=3 --fetch-retry-mintimeout=10000 --fetch-retry-maxtimeout=60000
 COPY frontend/ ./
 RUN npm run build
 
