@@ -59,7 +59,7 @@ Image Web 是一个前后端同仓库项目：
 - `frontend/package.json`：前端脚本和依赖。
 - `frontend/vite.config.ts`：Vite 配置，开发环境将 `/api` 代理到 `http://localhost:8080`。
 - `frontend/src/main.ts`：Vue 应用入口。
-- `frontend/src/App.vue`：主应用状态与流程中枢。管理 baseurl/apikey、任务、广场、画布视图、当前视图持久化、模型选择、生成表单、轮询、预览、蒙板编辑和各类弹窗。
+- `frontend/src/App.vue`：主应用状态与流程中枢。管理 baseurl/apikey、任务、广场、画布视图、当前视图持久化、新手教程显示状态、模型选择、生成表单、轮询、预览、蒙板编辑和各类弹窗。
 - `frontend/src/api.ts`：前端 API 封装，集中访问后端 `/api/*`。
 - `frontend/src/types.ts`：后端数据类型对应的前端类型。
 - `frontend/src/uiTypes.ts`：前端 UI 状态、表单和画布相关类型。
@@ -67,7 +67,8 @@ Image Web 是一个前后端同仓库项目：
 
 前端组件：
 
-- `AppToolbar.vue`：顶部工具栏、视图切换、筛选、搜索、主题切换等。
+- `AppToolbar.vue`：顶部工具栏、视图切换、筛选、搜索、新手教程入口、主题切换等。
+- `OnboardingModal.vue`：新手教程指引。首次打开自动显示，可通过工具栏帮助按钮再次打开；教程会按步骤高亮真实页面控件/区域，不使用模糊遮罩盖住被指示内容，并在需要时临时切换到任务、广场或画布视图；画布教程需要覆盖底部工具栏、节点连接、运行/固化、右键菜单、快捷键和素材栏；已读状态保存到 `localStorage` 的 `image_web_onboarding_seen_v1`。
 - `Composer.vue`：生成控制台，包含任务类型、模型、尺寸、参考素材、提交等输入。
 - `TaskGrid.vue` / `TaskDetailModal.vue`：任务列表与任务详情。
 - `PlazaGrid.vue` / `PlazaDetailModal.vue`：公开广场列表与详情。
@@ -97,7 +98,7 @@ Image Web 是一个前后端同仓库项目：
 
 ## 核心功能流
 
-1. 用户通过 URL 参数或设置弹窗提供 `baseurl` 和 `apikey`，前端保存到 `localStorage` 并清理 URL 中的敏感参数。
+1. 用户通过 URL 参数或设置弹窗提供 `baseurl` 和 `apikey`，前端保存到 `localStorage` 并清理 URL 中的敏感参数。首次打开应用会显示指引式新手教程，关闭后写入 `image_web_onboarding_seen_v1`，后续可从顶部工具栏帮助按钮再次打开；教程步骤会高亮具体控件，并可能临时切换当前视图以定位任务、广场和画布区域。教程背景必须保持透明不模糊，避免遮挡被指示的真实界面；教程在多个画布步骤之间移动时不能重复把 `canvasFrameReady` 重置为 false，否则 KeepAlive 的画布不会重新触发 `ready`，会卡在“正在载入画布”。
 2. 前端通过 `/api/site-brand`、`/api/models` 等接口读取站点品牌、模型和能力配置。
 3. 后端收到带 `baseurl + apikey` 的请求后，会解析/创建 `workspaces` 行：业务表只保存 `workspace_id`，API key 以 hash 做查找、以 `APP_CREDENTIAL_KEY` 派生密钥加密保存，worker 调度时再解密回填到 `Task.APIKey`。数据库连接默认带 `lock_timeout`、`statement_timeout` 和 `idle_in_transaction_session_timeout`，事务内也会设置同样保护；连接池保留空闲连接并延长空闲保留时间以服务远程 PostgreSQL，避免画布保存这类多条小 SQL 反复建连。
 4. 创建任务时，前端调用 `/api/tasks`；后端写入 `tasks`，状态为 `pending`，参考图片/视频/音频写入 `task_media_assets`。任务页图片生成的“数量”是前端批量提交次数，范围 1-5，不作为上游大模型参数；每次提交仍固定传 `n: 1`，数量为 5 时会创建 5 个独立任务。

@@ -7,6 +7,7 @@ import AppToolbar from './components/AppToolbar.vue'
 import CanvasWorkspace from './components/CanvasWorkspace.vue'
 import Composer from './components/Composer.vue'
 import ImageViewer from './components/ImageViewer.vue'
+import OnboardingModal from './components/OnboardingModal.vue'
 import PlazaDetailModal from './components/PlazaDetailModal.vue'
 import PlazaGrid from './components/PlazaGrid.vue'
 import SettingsModal from './components/SettingsModal.vue'
@@ -29,6 +30,7 @@ const NANO_BANANA_MODEL = 'nano-banana-2'
 const SEEDREAM_MODEL = 'doubao-seedream-5.0-lite'
 const DEFAULT_VIDEO_MODEL = 'doubao-seedance-2.0'
 const VIEW_MODE_STORAGE_KEY = 'image_web_view_mode'
+const ONBOARDING_STORAGE_KEY = 'image_web_onboarding_seen_v1'
 
 const savedModel = localStorage.getItem('image_web_model') || 'gpt-image-2'
 const savedTheme = parseSavedTheme(localStorage.getItem('image_web_theme'))
@@ -68,6 +70,7 @@ const submitting = ref(false)
 const baseURLBlocked = ref(false)
 const adminContactImage = ref('')
 const showAdminContact = ref(false)
+const showOnboardingModal = ref(false)
 const message = ref('')
 const clock = ref(Date.now())
 const showMobileComposer = ref(false)
@@ -298,6 +301,32 @@ function openSettings() {
   settingsDraft.baseurl = baseurl.value
   settingsDraft.apikey = apikey.value
   showSettingsModal.value = true
+}
+
+function openOnboarding() {
+  showOnboardingModal.value = true
+}
+
+function closeOnboarding() {
+  localStorage.setItem(ONBOARDING_STORAGE_KEY, '1')
+  showOnboardingModal.value = false
+}
+
+function openSettingsFromOnboarding() {
+  closeOnboarding()
+  openSettings()
+}
+
+function focusViewFromOnboarding(mode: ViewMode) {
+  if (mode === 'canvas' && hideCanvasForCompact.value) return
+  if (viewMode.value !== mode) switchView(mode)
+  if (mode === 'tasks') showMobileComposer.value = true
+  if (mode === 'canvas') canvasZenMode.value = false
+}
+
+function switchViewFromOnboarding(mode: ViewMode) {
+  closeOnboarding()
+  switchView(mode)
 }
 
 async function saveSettings(settings?: SettingsPayload) {
@@ -696,6 +725,9 @@ onMounted(() => {
     refreshTasks()
     startPolling()
     startClock()
+  }
+  if (localStorage.getItem(ONBOARDING_STORAGE_KEY) !== '1') {
+    showOnboardingModal.value = true
   }
   if (viewMode.value === 'plaza') ensurePlazaItemsFresh()
   window.addEventListener('scroll', onPageScroll, { passive: true })
@@ -1605,7 +1637,8 @@ function normalizeVideoForm() {
 }
 
 function switchView(mode: ViewMode) {
-  if (mode === 'canvas') canvasFrameReady.value = false
+  const previousMode = viewMode.value
+  if (mode === 'canvas' && previousMode !== 'canvas') canvasFrameReady.value = false
   viewMode.value = mode
   if (mode === 'plaza') ensurePlazaItemsFresh()
   if (mode === 'canvas' && hasConfig.value && !tasks.value.length) refreshTasks()
@@ -2183,6 +2216,7 @@ function showMessage(text: string) {
         :theme-mode="themeMode"
         :hide-canvas="hideCanvasForCompact"
         @open-settings="openSettings"
+        @open-onboarding="openOnboarding"
         @switch-view="switchView"
         @refresh-tasks="refreshTasks"
         @reset-tasks="resetTasks"
@@ -2317,6 +2351,16 @@ function showMessage(text: string) {
       :apikey="settingsDraft.apikey"
       @close="showSettingsModal = false"
       @save="saveSettings"
+    />
+
+    <OnboardingModal
+      v-if="showOnboardingModal"
+      :has-config="hasConfig"
+      :hide-canvas="hideCanvasForCompact"
+      @close="closeOnboarding"
+      @open-settings="openSettingsFromOnboarding"
+      @focus-view="focusViewFromOnboarding"
+      @switch-view="switchViewFromOnboarding"
     />
 
     <SizeModal

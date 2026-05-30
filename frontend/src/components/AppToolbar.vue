@@ -20,6 +20,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   openSettings: []
+  openOnboarding: []
   switchView: [mode: ViewMode]
   refreshTasks: []
   resetTasks: []
@@ -133,6 +134,7 @@ function updateStatus(value: string) {
           <AppIcon name="refresh" /><span class="toolbar-action-label">刷新</span>
         </button>
       </template>
+      <button class="ghost toolbar-help icon-only" title="新手教程" aria-label="新手教程" @click="emit('openOnboarding')"><AppIcon name="help" /></button>
       <button class="ghost theme-toggle icon-only" :title="`当前主题：${currentThemeLabel}`" :aria-label="`当前主题：${currentThemeLabel}`" @click="emit('toggleTheme')"><AppIcon :name="currentThemeIcon" /></button>
     </div>
   </header>
