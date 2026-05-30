@@ -3,13 +3,13 @@ import { computed, nextTick, onActivated, onMounted, onUnmounted, ref, watch } f
 import { ConnectionLineType, ConnectionMode, Handle, Position, VueFlow, useVueFlow, type Connection, type Edge, type EdgeChange, type EdgeMouseEvent, type EdgeUpdateEvent, type Node, type NodeChange, type NodeDragEvent, type ViewportTransform } from '@vue-flow/core'
 import { MiniMap } from '@vue-flow/minimap'
 import '@vue-flow/minimap/dist/style.css'
-import { fetchCanvases, listTasks, saveCanvasesCloud, uploadImage } from '../api'
+import { fetchCanvases, fetchVideoFrames, listTasks, patchCanvasesCloud, saveCanvasesCloud, uploadImage } from '../api'
+import type { CanvasPatchPayload } from '../api'
 import type { MediaAsset, Task, UploadedImage } from '../types'
 import type { CanvasLLMPayload, CanvasRunPayload, ImageForm } from '../uiTypes'
 import { normalizeVideoSettings, supportsVideoDraft, videoModelCapability, videoRatioLabel, videoRatioOptions, videoResolutionOptions } from '../lib/videoModels'
 import { nanoBananaRatios, nanoBananaSizeBaseOptions, nanoBananaSizeValue, parseNanoBananaSize, parseSeedreamSize, ratioOptions, seedreamRatios, seedreamSizeBaseOptions, seedreamSizeValue, sizeBaseOptions, sizeFromRatio } from '../lib/sizes'
 import { displayImageURL, isVideoTask } from '../lib/view'
-import { ensureVideoCover, videoCoverURL } from '../lib/videoCover'
 import AppIcon from './AppIcon.vue'
 import CanvasVideoPlayer from './CanvasVideoPlayer.vue'
 import InlineSelect from './InlineSelect.vue'
@@ -29,6 +29,8 @@ type CanvasElement = {
   media_type?: 'image' | 'video' | 'audio'
   media_url?: string
   media_thumbnail_url?: string
+  media_first_frame_url?: string
+  media_last_frame_url?: string
   media_filename?: string
   text?: string
   task_type?: ImageForm['task_type']
@@ -75,6 +77,10 @@ type CanvasElement = {
 
 type CanvasConnection = { id: string; from: string; to: string }
 type BoardCanvas = { id: string; name: string; elements: CanvasElement[]; connections: CanvasConnection[] }
+type CanvasLocalMeta = { updatedAt?: string; cloudUpdatedAt?: string; activeCanvasID?: string }
+type CanvasSaveState = 'loading' | 'local' | 'pending' | 'saving' | 'saved' | 'error'
+type CanvasDrawer = '' | 'board' | 'nodes' | 'view' | 'save'
+type CanvasCloudDelta = { full: boolean; canvases: BoardCanvas[]; patches: CanvasPatchPayload[]; deleted: string[] }
 type CanvasContextMenuItem = { label: string; icon?: string; action: () => void; disabled?: boolean; danger?: boolean }
 type CanvasContextMenuState = { x: number; y: number; items: CanvasContextMenuItem[] }
 type NodeValueType = 'text' | 'image' | 'video' | 'audio' | 'merge'
@@ -96,6 +102,7 @@ const props = defineProps<{
   models: string[]
   submitting: boolean
   sharedCanvasIds?: string[]
+  canvasTaskSnapshots?: Record<string, Task>
   canvasImport?: { token: number; canvas: unknown } | null
   runNodeAction?: (payload: CanvasRunPayload, applyTask: (task: Task) => void) => Promise<unknown> | void
   runLlmAction?: (payload: CanvasLLMPayload, applyResult: (text: string) => void) => Promise<unknown> | void
@@ -107,19 +114,25 @@ const emit = defineEmits<{
   runLlm: [payload: CanvasLLMPayload, applyResult: (text: string) => void]
   shareCanvas: [canvas: BoardCanvas]
   unshareCanvas: [canvasID: string]
+  taskRefsChange: [tasks: Task[], ids: string[]]
   zenModeChange: [enabled: boolean]
   closeContextMenu: []
   ready: []
 }>()
 
 const STORAGE_KEY = 'image_web_canvases'
+const STORAGE_META_KEY = 'image_web_canvases_meta'
+const STORAGE_SCOPED_PREFIX = `${STORAGE_KEY}:`
+const STORAGE_META_SCOPED_PREFIX = `${STORAGE_META_KEY}:`
 const IMAGE_MODEL_OPTIONS = ['gpt-image-2', 'nano-banana-2', 'doubao-seedream-5.0-lite']
 const VIDEO_MODEL_OPTIONS = ['doubao-seedance-2.0', 'doubao-seedance-1.5-pro']
 const ASSET_PAGE_SIZE = 30
 const MIN_ZOOM = 0.2
 const MAX_ZOOM = 3
-const canvases = ref<BoardCanvas[]>(loadCanvases())
-const activeCanvasID = ref(canvases.value[0]?.id || '')
+const CLOUD_SAVE_DEBOUNCE_MS = 5000
+const initialCanvasState = readLocalCanvasState()
+const canvases = ref<BoardCanvas[]>(initialCanvasState.canvases)
+const activeCanvasID = ref(validActiveCanvasID(initialCanvasState.canvases, initialCanvasState.meta.activeCanvasID))
 const canvasHistory = ref<string[]>([serializeCanvases(canvases.value)])
 const pan = ref({ x: 420, y: 220 })
 const zoom = ref(0.82)
@@ -149,6 +162,11 @@ const assetNextBeforeID = ref('')
 const assetError = ref('')
 const canvasContextMenu = ref<CanvasContextMenuState | null>(null)
 const canvasNotice = ref('')
+const canvasSaveState = ref<CanvasSaveState>(initialCanvasState.meta.updatedAt ? 'local' : 'saved')
+const canvasSaveDetail = ref(initialCanvasState.meta.updatedAt ? `本地 ${formatSaveTime(initialCanvasState.meta.updatedAt)}` : '本地空画布')
+const canvasLastSavedAt = ref(initialCanvasState.meta.updatedAt || '')
+const canvasLastCloudSavedAt = ref(initialCanvasState.meta.cloudUpdatedAt || '')
+const activeCanvasDrawer = ref<CanvasDrawer>('')
 const pendingFlowConnection = ref<{ nodeId: string; handleType: 'source' | 'target' } | null>(null)
 const suppressFlowConnectEnd = ref(false)
 const renameDialog = ref<{ canvasID: string; value: string } | null>(null)
@@ -164,6 +182,7 @@ const viewControlDrag = ref<ViewControlDragState>(null)
 const spacePanning = ref(false)
 const selectedNodeIDs = ref<Set<string>>(new Set())
 const hideInspectorDuringDrag = ref(false)
+const suppressHandleSelectionID = ref('')
 const modelMenuElementID = ref('')
 const showMiniMap = ref(true)
 const miniMapVisibleBeforeZen = ref(true)
@@ -206,20 +225,53 @@ let historyTimer = 0
 let cloudSaveTimer = 0
 let restoringHistory = false
 let loadingCloudCanvases = false
+let applyingStoredCanvases = false
+let applyingCloudCanvases = false
+let pendingCloudUpdatedAt = ''
+let activeCanvasStorageKey = currentCanvasStorageKeys().canvas
+let cloudSaveInFlight = false
+let cloudSaveQueuedDuringInFlight = false
 let lastCloudSavePayload = ''
 let lastCanvasImportToken = 0
 let readySequence = 0
+let dragFrame = 0
+let pendingDragPoint: { clientX: number; clientY: number } | null = null
 const handledCtrlWheelEvents = new WeakSet<WheelEvent>()
 const camera = { x: pan.value.x, y: pan.value.y, zoom: zoom.value }
 const flow = useVueFlow('canvas-flow')
 
 const activeCanvas = computed(() => canvases.value.find((canvas) => canvas.id === activeCanvasID.value) || canvases.value[0])
 const activeCanvasShared = computed(() => Boolean(activeCanvas.value && (props.sharedCanvasIds || []).includes(activeCanvas.value.id)))
+const canvasTaskRefs = computed(() => {
+  const byID = new Map<string, Task>()
+  for (const canvas of canvases.value) {
+    for (const element of canvas.elements) {
+      if (!element.task_id) continue
+      const task = taskForElement(element)
+      if (task?.id) byID.set(task.id, task)
+    }
+  }
+  return Array.from(byID.values())
+})
+const canvasTaskRefIDs = computed(() => {
+  const ids = new Set<string>()
+  for (const canvas of canvases.value) {
+    for (const element of canvas.elements) {
+      if (element.task_id) ids.add(element.task_id)
+    }
+  }
+  return Array.from(ids)
+})
+const canvasTaskRefsSignature = computed(() => JSON.stringify({
+  ids: canvasTaskRefIDs.value,
+  tasks: canvasTaskRefs.value.map(canvasTaskRefSignatureItem),
+}))
 const usableTasks = computed(() => props.tasks.filter(hasMediaAsset))
+const usableTaskAssetSignature = computed(() => usableTasks.value.map(assetTaskSignature).join('|'))
 const visibleAssetTasks = computed(() => {
   if (assetLoaded.value) return assetPages.value[assetPageIndex.value] || assetTasks.value
   const query = assetQuery.value.trim().toLowerCase()
-  const items = query ? usableTasks.value.filter(assetSearchMatches) : usableTasks.value
+  const items = (query ? usableTasks.value.filter(assetSearchMatches) : usableTasks.value).slice().sort(compareTasksNewestFirst)
   return items.slice(assetPageIndex.value * ASSET_PAGE_SIZE, (assetPageIndex.value + 1) * ASSET_PAGE_SIZE)
 })
 const assetPageCount = computed(() => Math.max(1, Math.ceil((assetTotal.value || 0) / ASSET_PAGE_SIZE)))
@@ -233,6 +285,19 @@ const canvasStyle = computed(() => ({
   '--canvas-y': `${pan.value.y}px`,
   '--canvas-zoom': String(zoom.value),
 }))
+const canvasSaveLabel = computed(() => {
+  if (canvasSaveState.value === 'loading') return '读取中'
+  if (canvasSaveState.value === 'pending') return '待同步'
+  if (canvasSaveState.value === 'saving') return '保存中'
+  if (canvasSaveState.value === 'saved') return '已保存'
+  if (canvasSaveState.value === 'error') return '保存失败'
+  return '本地保存'
+})
+const canvasSaveTitle = computed(() => {
+  const local = canvasLastSavedAt.value ? `本地：${formatSaveTime(canvasLastSavedAt.value)}` : '本地：尚未保存'
+  const cloud = canvasLastCloudSavedAt.value ? `云端：${formatSaveTime(canvasLastCloudSavedAt.value)}` : '云端：尚未同步'
+  return `${canvasSaveLabel.value}。${canvasSaveDetail.value || ''} ${local}；${cloud}`
+})
 const flowNodes = computed<Node[]>(() => {
   const elementNodes = (activeCanvas.value?.elements || []).map((element) => {
     const size = renderedNodeSize(element)
@@ -280,24 +345,31 @@ const flowConnectionLineOptions = {
   style: { stroke: 'rgba(230, 230, 230, .78)', strokeWidth: 2.5 },
 }
 watch(canvases, () => {
-  saveCanvases()
-  queueCloudCanvasSave()
-  if (!restoringHistory) queueCanvasHistorySnapshot()
+  if (applyingStoredCanvases) return
+  if (isTransientCanvasMutation()) return
+  const saved = applyingCloudCanvases
+    ? saveCanvases({ updatedAt: pendingCloudUpdatedAt || nowISO(), cloudUpdatedAt: pendingCloudUpdatedAt, state: 'saved', detail: '已载入云端保存' })
+    : saveCanvases()
+  if (!applyingCloudCanvases && (saved || (props.apikey && props.baseurl))) queueCloudCanvasSave()
+  if (!restoringHistory && !applyingCloudCanvases) queueCanvasHistorySnapshot()
 }, { deep: true })
-watch([() => props.apikey, () => props.baseurl], () => loadCloudCanvases(), { immediate: true })
+watch(activeCanvasID, () => {
+  saveCanvasMeta()
+  activeCanvasDrawer.value = ''
+  nextTick(() => focusActiveCanvasElements(180))
+})
+watch([() => props.apikey, () => props.baseurl], () => syncWorkspaceCanvases(), { immediate: true })
 watch([() => props.apikey, () => props.baseurl], () => queueAssetRefresh(), { immediate: true })
 watch(() => props.canvasImport?.token, (token) => {
   if (!token || token === lastCanvasImportToken || !props.canvasImport?.canvas) return
   lastCanvasImportToken = token
   importCanvasTemplate(props.canvasImport.canvas)
 }, { immediate: true })
-watch(usableTasks, (tasks) => syncUsableTasksToAssets(tasks), { deep: true })
-watch(assetTasks, (tasks) => {
-  tasks.forEach((task) => {
-    const video = task.result_videos?.[0]
-    if (isVideoTask(task) && video?.url && !video.thumbnail_url) ensureVideoCover(video.url).catch(() => {})
-  })
-}, { immediate: true, deep: true })
+watch(canvasTaskRefsSignature, () => {
+  syncElementTaskSnapshots()
+  emit('taskRefsChange', canvasTaskRefs.value.map(compactTaskSnapshot), canvasTaskRefIDs.value)
+}, { immediate: true })
+watch(usableTaskAssetSignature, () => syncUsableTasksToAssets(usableTasks.value))
 watch(showAssets, (visible) => {
   if (visible && !assetTasks.value.length) queueAssetRefresh()
 })
@@ -308,6 +380,9 @@ onMounted(() => {
   }, 1000)
   window.addEventListener('keydown', onCanvasKeyDown)
   window.addEventListener('keyup', onCanvasKeyUp)
+  window.addEventListener('pointerup', stopDrag)
+  window.addEventListener('pointercancel', stopDrag)
+  window.addEventListener('blur', stopDrag)
   window.addEventListener('wheel', preventBrowserZoomWheel, { capture: true, passive: false })
   window.addEventListener('app-context-menu-opened', closeCanvasContextMenu)
   queueCanvasReady()
@@ -327,6 +402,9 @@ onUnmounted(() => {
   activeMaskResizeObservers.clear()
   window.removeEventListener('keydown', onCanvasKeyDown)
   window.removeEventListener('keyup', onCanvasKeyUp)
+  window.removeEventListener('pointerup', stopDrag)
+  window.removeEventListener('pointercancel', stopDrag)
+  window.removeEventListener('blur', stopDrag)
   window.removeEventListener('wheel', preventBrowserZoomWheel, { capture: true })
   window.removeEventListener('app-context-menu-opened', closeCanvasContextMenu)
 })
@@ -337,6 +415,7 @@ async function queueCanvasReady() {
   await waitForAnimationFrame()
   await waitForAnimationFrame()
   await waitForCanvasFrame(sequence)
+  focusActiveCanvasElements(0)
   if (sequence === readySequence) emit('ready')
 }
 
@@ -501,21 +580,34 @@ function blurControl(event: Event) {
   if (event.currentTarget instanceof HTMLElement) event.currentTarget.blur()
 }
 
-function loadCanvases(): BoardCanvas[] {
+function toggleCanvasDrawer(drawer: CanvasDrawer, event?: Event) {
+  event?.stopPropagation()
+  activeCanvasDrawer.value = activeCanvasDrawer.value === drawer ? '' : drawer
+  if (event) blurControl(event)
+}
+
+function drawerGroupClass(drawer: Exclude<CanvasDrawer, ''>) {
+  return { 'drawer-open': activeCanvasDrawer.value === drawer }
+}
+
+function readLocalCanvasState(): { canvases: BoardCanvas[]; meta: CanvasLocalMeta } {
+  const keys = currentCanvasStorageKeys()
+  const scopedPayload = localStorage.getItem(keys.canvas)
+  const useLegacy = !scopedPayload && keys.canvas !== STORAGE_KEY
+  const payload = scopedPayload || (useLegacy ? localStorage.getItem(STORAGE_KEY) : '')
+  const meta = readCanvasMeta(useLegacy ? STORAGE_META_KEY : keys.meta)
   try {
-    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || '')
+    const parsed = JSON.parse(payload || '')
     if (Array.isArray(parsed) && parsed.length) {
-      return parsed.map((canvas, index) => ({
-        id: canvas.id || createID(),
-        name: canvas.name || `画布 ${index + 1}`,
-        elements: ensureElementBadges(Array.isArray(canvas.elements) ? canvas.elements.map((element: Partial<CanvasElement>, elementIndex: number) => normalizeElement(element, elementIndex)) : []),
-        connections: Array.isArray(canvas.connections) ? canvas.connections : [],
-      }))
+      const canvases = normalizeCanvases(parsed)
+      const nextMeta = { ...meta }
+      if (hasMeaningfulCanvases(canvases) && !nextMeta.updatedAt) nextMeta.updatedAt = nowISO()
+      return { canvases, meta: nextMeta }
     }
   } catch {
     // Use the default below.
   }
-  return [{ id: createID(), name: '画布 1', elements: [], connections: [] }]
+  return { canvases: [{ id: createID(), name: '画布 1', elements: [], connections: [] }], meta }
 }
 
 function normalizeCanvases(raw: unknown): BoardCanvas[] {
@@ -541,11 +633,13 @@ function normalizeElement(raw: Partial<CanvasElement>, index = 0): CanvasElement
     kind,
     badge: typeof raw.badge === 'string' ? raw.badge : '',
     task_id: raw.task_id,
-    task_snapshot: raw.task_snapshot && typeof raw.task_snapshot === 'object' ? raw.task_snapshot as Task : undefined,
+    task_snapshot: raw.task_snapshot && typeof raw.task_snapshot === 'object' ? compactTaskSnapshot(raw.task_snapshot as Task) : undefined,
     generated_params: Array.isArray(raw.generated_params) ? raw.generated_params.filter((item) => typeof item === 'string') : undefined,
     media_type: raw.media_type,
     media_url: raw.media_url || '',
     media_thumbnail_url: raw.media_thumbnail_url || '',
+    media_first_frame_url: raw.media_first_frame_url || '',
+    media_last_frame_url: raw.media_last_frame_url || '',
     media_filename: raw.media_filename || '',
     text: raw.text || '',
     task_type: raw.task_type || (kind === 'video' ? 'video_generation' : 'image_generation'),
@@ -614,26 +708,112 @@ function isMediaKind(kind: NodeKind) {
   return kind === 'image_media' || kind === 'video_media' || kind === 'audio_media'
 }
 
-function saveCanvases() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(canvases.value))
+function syncWorkspaceCanvases() {
+  const keys = currentCanvasStorageKeys()
+  if (keys.canvas !== activeCanvasStorageKey) {
+    activeCanvasStorageKey = keys.canvas
+    const state = readLocalCanvasState()
+    applyingStoredCanvases = true
+    canvases.value = state.canvases
+    activeCanvasID.value = validActiveCanvasID(state.canvases, state.meta.activeCanvasID)
+    canvasLastSavedAt.value = state.meta.updatedAt || ''
+    canvasLastCloudSavedAt.value = state.meta.cloudUpdatedAt || ''
+    lastCloudSavePayload = ''
+    canvasSaveState.value = state.meta.updatedAt ? 'local' : 'saved'
+    canvasSaveDetail.value = state.meta.updatedAt ? `本地 ${formatSaveTime(state.meta.updatedAt)}` : '本地空画布'
+    nextTick(() => {
+      applyingStoredCanvases = false
+    })
+  }
+  loadCloudCanvases()
+}
+
+function saveCanvases(options: { updatedAt?: string; cloudUpdatedAt?: string; state?: CanvasSaveState; detail?: string } = {}) {
+  const updatedAt = options.updatedAt || nowISO()
+  try {
+    localStorage.setItem(currentCanvasStorageKeys().canvas, JSON.stringify(canvases.value))
+    saveCanvasMeta({ updatedAt, cloudUpdatedAt: options.cloudUpdatedAt ?? canvasLastCloudSavedAt.value })
+    canvasLastSavedAt.value = updatedAt
+    if (options.cloudUpdatedAt) canvasLastCloudSavedAt.value = options.cloudUpdatedAt
+    if (options.state) {
+      canvasSaveState.value = options.state
+      canvasSaveDetail.value = options.detail || ''
+    } else if (props.apikey && props.baseurl) {
+      canvasSaveState.value = 'pending'
+      canvasSaveDetail.value = '本地已保存，等待云端同步'
+    } else {
+      canvasSaveState.value = 'local'
+      canvasSaveDetail.value = `本地 ${formatSaveTime(updatedAt)}`
+    }
+    return true
+  } catch (error) {
+    canvasSaveState.value = 'error'
+    canvasSaveDetail.value = error instanceof Error ? `本地保存失败：${error.message}` : '本地保存失败'
+    return false
+  }
+}
+
+function saveCanvasMeta(overrides: Partial<CanvasLocalMeta> = {}) {
+  const meta: CanvasLocalMeta = {
+    updatedAt: overrides.updatedAt ?? canvasLastSavedAt.value,
+    cloudUpdatedAt: overrides.cloudUpdatedAt ?? canvasLastCloudSavedAt.value,
+    activeCanvasID: activeCanvasID.value,
+  }
+  try {
+    localStorage.setItem(currentCanvasStorageKeys().meta, JSON.stringify(meta))
+  } catch (error) {
+    canvasSaveState.value = 'error'
+    canvasSaveDetail.value = error instanceof Error ? `保存状态记录失败：${error.message}` : '保存状态记录失败'
+  }
 }
 
 async function loadCloudCanvases() {
   if (!props.apikey || !props.baseurl) return
+  const previousState = canvasSaveState.value
+  const previousDetail = canvasSaveDetail.value
   try {
     loadingCloudCanvases = true
+    canvasSaveState.value = 'loading'
+    canvasSaveDetail.value = '正在读取云端画布'
     const result = await fetchCanvases(props.apikey, props.baseurl)
     const cloudCanvases = normalizeCanvases(result.canvases)
-    if (cloudCanvases.length && cloudCanvases.some((canvas) => canvas.elements.length || canvas.connections.length)) {
+    const cloudUpdatedAt = normalizeTimestamp(result.updated_at)
+    const cloudPayload = serializeCanvases(cloudCanvases)
+    const localPayload = serializeCanvases(canvases.value)
+    const cloudHasContent = hasMeaningfulCanvases(cloudCanvases)
+    const localHasContent = hasMeaningfulCanvases(canvases.value)
+    let localUpdatedAt = canvasLastSavedAt.value
+    if (localHasContent && !localUpdatedAt) {
+      localUpdatedAt = nowISO()
+      saveCanvases({ updatedAt: localUpdatedAt, state: 'pending', detail: '本地已保存，等待云端同步' })
+    }
+    lastCloudSavePayload = cloudPayload
+    canvasLastCloudSavedAt.value = cloudUpdatedAt
+    saveCanvasMeta({ cloudUpdatedAt })
+    if (cloudHasContent && (!localHasContent || timestampMS(cloudUpdatedAt) > timestampMS(localUpdatedAt))) {
+      applyingCloudCanvases = true
+      pendingCloudUpdatedAt = cloudUpdatedAt || nowISO()
       canvases.value = cloudCanvases
       if (!cloudCanvases.some((canvas) => canvas.id === activeCanvasID.value)) activeCanvasID.value = cloudCanvases[0]?.id || ''
-      lastCloudSavePayload = serializeCanvases(canvases.value)
-      saveCanvases()
-    } else {
+      canvasSaveState.value = 'saved'
+      canvasSaveDetail.value = `云端 ${formatSaveTime(pendingCloudUpdatedAt)}`
+      nextTick(() => {
+        applyingCloudCanvases = false
+        pendingCloudUpdatedAt = ''
+        focusActiveCanvasElements(180)
+      })
+    } else if (localHasContent && localPayload !== cloudPayload) {
+      canvasSaveState.value = 'pending'
+      canvasSaveDetail.value = '本地版本较新，等待云端同步'
       queueCloudCanvasSave()
+    } else {
+      canvasSaveState.value = localHasContent ? 'saved' : 'local'
+      canvasSaveDetail.value = localHasContent ? `云端 ${formatSaveTime(cloudUpdatedAt || localUpdatedAt)}` : '本地空画布'
     }
   } catch (error) {
     console.warn('[canvas-cloud] load failed', error)
+    canvasSaveState.value = hasMeaningfulCanvases(canvases.value) ? 'pending' : previousState
+    canvasSaveDetail.value = hasMeaningfulCanvases(canvases.value) ? '云端读取失败，本地内容已保留' : previousDetail
   } finally {
     loadingCloudCanvases = false
   }
@@ -642,23 +822,217 @@ async function loadCloudCanvases() {
 function queueCloudCanvasSave() {
   if (loadingCloudCanvases || !props.apikey || !props.baseurl) return
   window.clearTimeout(cloudSaveTimer)
-  cloudSaveTimer = window.setTimeout(() => saveCanvasesToCloud(), 900)
+  canvasSaveState.value = 'pending'
+  canvasSaveDetail.value = '本地已保存，等待云端同步'
+  cloudSaveTimer = window.setTimeout(() => saveCanvasesToCloud(), CLOUD_SAVE_DEBOUNCE_MS)
+}
+
+function persistCanvasNow() {
+  const saved = saveCanvases()
+  if (saved || (props.apikey && props.baseurl)) queueCloudCanvasSave()
 }
 
 async function saveCanvasesToCloud() {
   if (!props.apikey || !props.baseurl) return
+  if (cloudSaveInFlight) {
+    cloudSaveQueuedDuringInFlight = true
+    return
+  }
   const payload = serializeCanvases(canvases.value)
-  if (payload === lastCloudSavePayload) return
+  const delta = canvasCloudDelta()
+  const changeCount = canvasDeltaChangeCount(delta)
+  if (!changeCount) {
+    canvasSaveState.value = 'saved'
+    canvasSaveDetail.value = canvasLastCloudSavedAt.value ? `云端 ${formatSaveTime(canvasLastCloudSavedAt.value)}` : '云端已同步'
+    return
+  }
   try {
-    await saveCanvasesCloud(props.apikey, props.baseurl, canvases.value)
+    cloudSaveInFlight = true
+    canvasSaveState.value = 'saving'
+    canvasSaveDetail.value = delta.full ? '首次同步全部画布' : `正在同步 ${changeCount} 项变更`
+    const result = delta.full
+      ? await saveCanvasesCloud(props.apikey, props.baseurl, canvases.value)
+      : await patchCanvasesCloud(props.apikey, props.baseurl, delta.canvases, delta.deleted, delta.patches)
+    const savedAt = normalizeTimestamp(result.updated_at) || nowISO()
     lastCloudSavePayload = payload
+    canvasLastCloudSavedAt.value = savedAt
+    saveCanvasMeta({ cloudUpdatedAt: savedAt })
+    if (serializeCanvases(canvases.value) === payload) {
+      canvasSaveState.value = 'saved'
+      canvasSaveDetail.value = `云端 ${formatSaveTime(savedAt)}`
+    } else {
+      cloudSaveQueuedDuringInFlight = true
+    }
   } catch (error) {
     console.warn('[canvas-cloud] save failed', error)
+    canvasSaveState.value = 'error'
+    canvasSaveDetail.value = error instanceof Error ? `云端保存失败：${error.message}` : '云端保存失败，本地内容已保留'
+  } finally {
+    cloudSaveInFlight = false
+    if (cloudSaveQueuedDuringInFlight || serializeCanvases(canvases.value) !== lastCloudSavePayload) {
+      cloudSaveQueuedDuringInFlight = false
+      queueCloudCanvasSave()
+    }
   }
 }
 
 function serializeCanvases(value: BoardCanvas[]) {
   return JSON.stringify(value)
+}
+
+function canvasCloudDelta(): CanvasCloudDelta {
+  if (!lastCloudSavePayload) {
+    return { full: true, canvases: [...canvases.value], patches: [], deleted: [] }
+  }
+  const previous = canvasSnapshotMap(lastCloudSavePayload)
+  const current = new Map(canvases.value.map((canvas) => [canvas.id, canvas]))
+  const changedCanvases: BoardCanvas[] = []
+  const patches: CanvasPatchPayload[] = []
+  for (const canvas of canvases.value) {
+    const previousCanvas = previous.get(canvas.id)
+    if (!previousCanvas) {
+      changedCanvases.push(canvas)
+      continue
+    }
+    const patch = canvasItemDelta(previousCanvas, canvas)
+    if (hasCanvasPatchChanges(patch)) patches.push(patch)
+  }
+  const deleted = Array.from(previous.keys()).filter((id) => !current.has(id))
+  return { full: false, canvases: changedCanvases, patches, deleted }
+}
+
+function canvasSnapshotMap(payload: string) {
+  const snapshots = new Map<string, BoardCanvas>()
+  try {
+    const parsed = JSON.parse(payload)
+    if (!Array.isArray(parsed)) return snapshots
+    for (const canvas of parsed) {
+      if (!canvas || typeof canvas !== 'object' || typeof canvas.id !== 'string') continue
+      snapshots.set(canvas.id, normalizeCanvases([canvas])[0])
+    }
+  } catch {
+    // Treat unknown baseline as empty so the next sync sends the current canvases.
+  }
+  return snapshots
+}
+
+function canvasItemDelta(previous: BoardCanvas, current: BoardCanvas): CanvasPatchPayload {
+  const patch: CanvasPatchPayload = { id: current.id }
+  if (previous.name !== current.name) patch.name = current.name
+  const previousElements = itemSnapshotMap(previous.elements)
+  const currentElementIDs = new Set(current.elements.map((element) => element.id))
+  const elements = current.elements.filter((element) => previousElements.get(element.id) !== serializeCanvasItem(element))
+  const deletedElementIDs = Array.from(previousElements.keys()).filter((id) => !currentElementIDs.has(id))
+  if (elements.length) patch.elements = elements
+  if (deletedElementIDs.length) patch.deleted_element_ids = deletedElementIDs
+  const previousConnections = itemSnapshotMap(previous.connections)
+  const currentConnectionIDs = new Set(current.connections.map((connection) => connection.id))
+  const connections = current.connections.filter((connection) => previousConnections.get(connection.id) !== serializeCanvasItem(connection))
+  const deletedConnectionIDs = Array.from(previousConnections.keys()).filter((id) => !currentConnectionIDs.has(id))
+  if (connections.length) patch.connections = connections
+  if (deletedConnectionIDs.length) patch.deleted_connection_ids = deletedConnectionIDs
+  return patch
+}
+
+function itemSnapshotMap<T extends { id: string }>(items: T[]) {
+  const snapshots = new Map<string, string>()
+  for (const item of items) snapshots.set(item.id, serializeCanvasItem(item))
+  return snapshots
+}
+
+function serializeCanvasItem(item: unknown) {
+  return JSON.stringify(item)
+}
+
+function hasCanvasPatchChanges(patch: CanvasPatchPayload) {
+  return Object.prototype.hasOwnProperty.call(patch, 'name')
+    || Boolean(patch.elements?.length)
+    || Boolean(patch.deleted_element_ids?.length)
+    || Boolean(patch.connections?.length)
+    || Boolean(patch.deleted_connection_ids?.length)
+}
+
+function canvasDeltaChangeCount(delta: CanvasCloudDelta) {
+  if (delta.full) return delta.canvases.length
+  return delta.canvases.length
+    + delta.deleted.length
+    + delta.patches.reduce((total, patch) => total
+      + (Object.prototype.hasOwnProperty.call(patch, 'name') ? 1 : 0)
+      + (patch.elements?.length || 0)
+      + (patch.deleted_element_ids?.length || 0)
+      + (patch.connections?.length || 0)
+      + (patch.deleted_connection_ids?.length || 0), 0)
+}
+
+function currentCanvasStorageKeys() {
+  const suffix = workspaceStorageSuffix()
+  return suffix
+    ? { canvas: `${STORAGE_SCOPED_PREFIX}${suffix}`, meta: `${STORAGE_META_SCOPED_PREFIX}${suffix}` }
+    : { canvas: STORAGE_KEY, meta: STORAGE_META_KEY }
+}
+
+function workspaceStorageSuffix() {
+  const apiKey = props.apikey.trim()
+  const baseURL = normalizeStorageBaseURL(props.baseurl)
+  if (!apiKey || !baseURL) return ''
+  return hashStorageKey(`${apiKey}|${baseURL}`)
+}
+
+function normalizeStorageBaseURL(value: string) {
+  return value.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '')
+}
+
+function hashStorageKey(value: string) {
+  let hash = 2166136261
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(36)
+}
+
+function readCanvasMeta(key: string): CanvasLocalMeta {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(key) || '{}')
+    if (!parsed || typeof parsed !== 'object') return {}
+    const value = parsed as CanvasLocalMeta
+    return {
+      updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : '',
+      cloudUpdatedAt: typeof value.cloudUpdatedAt === 'string' ? value.cloudUpdatedAt : '',
+      activeCanvasID: typeof value.activeCanvasID === 'string' ? value.activeCanvasID : '',
+    }
+  } catch {
+    return {}
+  }
+}
+
+function validActiveCanvasID(items: BoardCanvas[], preferred = '') {
+  if (preferred && items.some((canvas) => canvas.id === preferred)) return preferred
+  return items[0]?.id || ''
+}
+
+function hasMeaningfulCanvases(items: BoardCanvas[]) {
+  return items.some((canvas) => canvas.elements.length || canvas.connections.length)
+}
+
+function nowISO() {
+  return new Date().toISOString()
+}
+
+function normalizeTimestamp(value: string) {
+  if (!value || value.startsWith('0001-01-01')) return ''
+  return value
+}
+
+function timestampMS(value = '') {
+  const time = Date.parse(value)
+  return Number.isFinite(time) ? time : 0
+}
+
+function formatSaveTime(value = '') {
+  const time = timestampMS(value)
+  if (!time) return '尚未同步'
+  return new Date(time).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
 function structuralElement(element: CanvasElement) {
@@ -726,6 +1100,8 @@ function mergeElementStructure(target: CanvasElement, current?: CanvasElement): 
     media_type: current.media_type,
     media_url: current.media_url,
     media_thumbnail_url: current.media_thumbnail_url,
+    media_first_frame_url: current.media_first_frame_url,
+    media_last_frame_url: current.media_last_frame_url,
     media_filename: current.media_filename,
     text: current.text,
     task_type: current.task_type,
@@ -822,7 +1198,7 @@ function shareActiveCanvas() {
   const canvas = JSON.parse(JSON.stringify(activeCanvas.value)) as BoardCanvas
   canvas.elements = canvas.elements.map((element) => {
     const task = taskForElement(element)
-    return task ? { ...element, task_snapshot: { ...task } } : element
+    return task ? { ...element, task_snapshot: compactTaskSnapshot(task) } : element
   })
   emit('shareCanvas', canvas)
 }
@@ -926,7 +1302,7 @@ async function refreshAssets() {
   assetPageIndex.value = 0
   assetPages.value = []
   if (!props.apikey || !props.baseurl) {
-    assetTasks.value = usableTasks.value.filter(assetSearchMatches)
+    assetTasks.value = usableTasks.value.filter(assetSearchMatches).slice().sort(compareTasksNewestFirst)
     assetLoaded.value = false
     assetHasMore.value = assetTasks.value.length > ASSET_PAGE_SIZE
     assetTotal.value = assetTasks.value.length
@@ -946,7 +1322,7 @@ async function refreshAssets() {
     assetNextBeforeID.value = result.next_before_id
   } catch (error) {
     assetError.value = error instanceof Error ? error.message : '素材加载失败'
-    assetTasks.value = usableTasks.value.filter(assetSearchMatches)
+    assetTasks.value = usableTasks.value.filter(assetSearchMatches).slice().sort(compareTasksNewestFirst)
     assetLoaded.value = false
     assetHasMore.value = assetTasks.value.length > ASSET_PAGE_SIZE
     assetTotal.value = assetTasks.value.length
@@ -1020,14 +1396,61 @@ function syncUsableTasksToAssets(tasks: Task[]) {
   const incoming = tasks.filter((task) => hasMediaAsset(task) && assetSearchMatches(task))
   if (!incoming.length) return
   const incomingByID = new Map(incoming.map((task) => [task.id, task]))
-  const existingIDs = new Set(assetTasks.value.map((task) => task.id))
-  const added = incoming.filter((task) => !existingIDs.has(task.id))
-  assetTasks.value = [
-    ...added,
-    ...assetTasks.value.map((task) => incomingByID.get(task.id) || task),
-  ].slice(0, ASSET_PAGE_SIZE)
-  assetPages.value = assetPages.value.map((page, index) => index === assetPageIndex.value ? assetTasks.value : page)
-  assetTotal.value = Math.max(assetTotal.value, assetTasks.value.length)
+  const knownIDs = new Set(assetPages.value.flat().map((task) => task.id))
+  assetTasks.value.forEach((task) => knownIDs.add(task.id))
+  const firstPage = assetPages.value[0] || []
+  const oldestFirstPageTime = firstPage.reduce((oldest, task) => {
+    const time = timestampMS(task.created_at)
+    return oldest ? Math.min(oldest, time) : time
+  }, 0)
+  const shouldAddToFirstPage = (task: Task) => {
+    if (knownIDs.has(task.id)) return false
+    if (!firstPage.length || firstPage.length < ASSET_PAGE_SIZE) return true
+    const time = timestampMS(task.created_at)
+    return Boolean(time && oldestFirstPageTime && time >= oldestFirstPageTime)
+  }
+  const newFirstPageTasks = incoming.filter(shouldAddToFirstPage)
+  let pages = assetPages.value.map((page) => page.map((task) => incomingByID.get(task.id) || task))
+  if (newFirstPageTasks.length) {
+    pages = pages.length ? pages : [[]]
+    pages[0] = mergeAssetTasks(pages[0], newFirstPageTasks)
+    assetTotal.value = Math.max(assetTotal.value + newFirstPageTasks.length, pages.flat().length)
+  }
+  assetPages.value = pages
+  assetTasks.value = pages[assetPageIndex.value] || assetTasks.value.map((task) => incomingByID.get(task.id) || task)
+}
+
+function mergeAssetTasks(existing: Task[], incoming: Task[]) {
+  const byID = new Map<string, Task>()
+  for (const task of existing) byID.set(task.id, task)
+  for (const task of incoming) byID.set(task.id, task)
+  return Array.from(byID.values()).sort(compareTasksNewestFirst)
+}
+
+function compareTasksNewestFirst(left: Task, right: Task) {
+  const timeDelta = timestampMS(right.created_at) - timestampMS(left.created_at)
+  return timeDelta || right.id.localeCompare(left.id)
+}
+
+function assetTaskSignature(task: Task) {
+  const image = task.result_images?.[0]
+  const video = task.result_videos?.[0]
+  const audio = firstAudioAsset(task)
+  return [
+    task.id,
+    task.task_type,
+    task.prompt,
+    task.final_prompt,
+    task.model,
+    image?.url || '',
+    image?.thumbnail_url || '',
+    video?.url || '',
+    video?.thumbnail_url || video?.first_frame_url || '',
+    video?.first_frame_url || '',
+    video?.last_frame_url || '',
+    audio?.url || '',
+    audio?.thumbnail_url || '',
+  ].join('\u001f')
 }
 
 function addTask(task: Task) {
@@ -1039,7 +1462,7 @@ function addTask(task: Task) {
   const image = task.result_images?.[0]
   const mediaType = video?.url ? 'video' : audio?.url ? 'audio' : 'image'
   const mediaURL = video?.url || audio?.url || image?.url || ''
-  const thumbnailURL = video?.thumbnail_url || audio?.thumbnail_url || image?.thumbnail_url || ''
+  const thumbnailURL = video?.thumbnail_url || video?.first_frame_url || audio?.thumbnail_url || image?.thumbnail_url || ''
   const filename = video?.filename || audio?.filename || image?.filename || assetLabel(task)
   const width = mediaType === 'video' ? 360 : mediaType === 'audio' ? 280 : 260
   const element: CanvasElement = {
@@ -1049,6 +1472,8 @@ function addTask(task: Task) {
     media_type: mediaType,
     media_url: mediaURL,
     media_thumbnail_url: thumbnailURL,
+    media_first_frame_url: video?.first_frame_url || '',
+    media_last_frame_url: video?.last_frame_url || '',
     media_filename: filename,
     video_clip_start: 0,
     video_clip_end: video?.duration || audio?.duration || 0,
@@ -1095,6 +1520,8 @@ function addMediaNode(kind: MediaNodeKind = 'image_media', position?: { x: numbe
     media_type: type,
     media_url: '',
     media_thumbnail_url: '',
+    media_first_frame_url: '',
+    media_last_frame_url: '',
     media_filename: '',
     video_clip_start: 0,
     video_clip_end: 0,
@@ -1132,6 +1559,8 @@ function chooseAssetNodeKind(element: CanvasElement, kind: MediaNodeKind) {
     media_type: type,
     media_url: '',
     media_thumbnail_url: '',
+    media_first_frame_url: '',
+    media_last_frame_url: '',
     media_filename: '',
     video_clip_start: 0,
     video_clip_end: 0,
@@ -1154,7 +1583,9 @@ async function uploadMediaIntoNode(event: Event, element: CanvasElement) {
     element.kind = mediaKindFromType(type)
     element.media_type = type
     element.media_url = uploaded.url
-    element.media_thumbnail_url = uploaded.thumbnail_url || ''
+    element.media_thumbnail_url = uploaded.thumbnail_url || uploaded.first_frame_url || ''
+    element.media_first_frame_url = uploaded.first_frame_url || ''
+    element.media_last_frame_url = uploaded.last_frame_url || ''
     element.media_filename = uploaded.filename || file.name
     element.video_clip_start = 0
     element.video_clip_end = 0
@@ -1200,12 +1631,30 @@ function commitMediaURLInput(element: CanvasElement) {
   element.media_type = type
   element.media_url = trimmed
   element.media_thumbnail_url = ''
+  element.media_first_frame_url = ''
+  element.media_last_frame_url = ''
   element.media_filename = filenameFromURL(trimmed) || (type === 'video' ? '视频 URL' : type === 'audio' ? '音频 URL' : '图片 URL')
   element.video_clip_start = 0
   element.video_clip_end = 0
   element.width = type === 'video' ? Math.max(element.width, 360) : type === 'audio' ? Math.max(element.width, 280) : element.width
   element.height = type === 'video' ? Math.max(element.height, 230) : type === 'audio' ? Math.max(element.height, 170) : element.height
   mediaUrlEditor.value = null
+  if (type === 'video') void enrichVideoElementFrames(element)
+}
+
+async function enrichVideoElementFrames(element: CanvasElement) {
+  if (!element.media_url || (element.media_first_frame_url && element.media_last_frame_url)) return
+  const url = element.media_url
+  try {
+    const frames = await fetchVideoFrames(url, element.media_filename || filenameFromURL(url) || 'video.mp4')
+    if (element.media_url !== url) return
+    element.media_thumbnail_url = element.media_thumbnail_url || frames.thumbnail_url || frames.first_frame_url || ''
+    element.media_first_frame_url = element.media_first_frame_url || frames.first_frame_url || ''
+    element.media_last_frame_url = element.media_last_frame_url || frames.last_frame_url || frames.first_frame_url || ''
+    persistCanvasNow()
+  } catch {
+    // URL 视频取帧失败时保留原始 URL，尾帧节点仍可在用户环境允许 CORS 时兜底抽帧。
+  }
 }
 
 function addUploadedMedia(uploaded: UploadedImage, type: 'image' | 'video' | 'audio', filename: string, point: { x: number; y: number }) {
@@ -1215,7 +1664,9 @@ function addUploadedMedia(uploaded: UploadedImage, type: 'image' | 'video' | 'au
     kind: mediaKindFromType(type),
     media_type: type,
     media_url: uploaded.url,
-    media_thumbnail_url: uploaded.thumbnail_url,
+    media_thumbnail_url: uploaded.thumbnail_url || uploaded.first_frame_url,
+    media_first_frame_url: uploaded.first_frame_url,
+    media_last_frame_url: uploaded.last_frame_url,
     media_filename: uploaded.filename || filename,
     video_clip_start: 0,
     video_clip_end: 0,
@@ -1415,9 +1866,11 @@ function updateCanvasImageModel(element: CanvasElement) {
     const parsed = parseSeedreamSize(element.size || '')
     element.size = seedreamSizeValue(parsed.imageSize, parsed.aspectRatio)
     if (element.output_format !== 'png') element.output_format = 'jpeg'
+    if (element.output_format !== 'png' && element.background === 'transparent') element.background = 'auto'
     return
   }
   if (isNanoBananaSize(element.size || '') || isSeedreamSize(element.size || '')) element.size = '1024x1024'
+  if (element.output_format !== 'png' && element.background === 'transparent') element.background = 'auto'
 }
 
 function isSeedreamSize(size: string) {
@@ -1487,10 +1940,6 @@ function updateGptImageRatio(element: CanvasElement, ratio: string) {
   element.size = sizeFromRatio(base, ratio)
 }
 
-function supportsTransparentBackground(element: CanvasElement) {
-  return (element.output_format || props.defaultForm.output_format) === 'png'
-}
-
 function supportsOutputCompression(element: CanvasElement) {
   const format = element.output_format || props.defaultForm.output_format
   return format === 'jpeg' || format === 'webp'
@@ -1503,10 +1952,6 @@ function updateCanvasOutputFormat(element: CanvasElement, value: string) {
 
 function canvasOutputFormatOptions(element: CanvasElement) {
   return isSeedreamElement(element) ? ['png', 'jpeg'] : ['png', 'jpeg', 'webp']
-}
-
-function canvasBackgroundOptions(element: CanvasElement) {
-  return supportsTransparentBackground(element) ? ['auto', 'transparent', 'opaque'] : ['auto', 'opaque']
 }
 
 function canvasVideoResolutionOptions(element: CanvasElement) {
@@ -1977,11 +2422,154 @@ function removeConnection(id: string) {
 }
 
 function taskForElement(element: CanvasElement) {
-  if (element.task_id) {
-    const task = props.tasks.find((item) => item.id === element.task_id) || assetTasks.value.find((item) => item.id === element.task_id)
-    if (task) return task
+  const candidates: Task[] = []
+  const pushTask = (task?: Task) => {
+    if (!task?.id) return
+    if (element.task_id && task.id !== element.task_id) return
+    if (!candidates.some((item) => item === task)) candidates.push(task)
   }
-  return element.task_snapshot
+  if (element.task_id) {
+    pushTask(element.task_snapshot)
+    pushTask(props.canvasTaskSnapshots?.[element.task_id])
+    pushTask(props.tasks.find((item) => item.id === element.task_id))
+    pushTask(assetTasks.value.find((item) => item.id === element.task_id))
+  } else {
+    pushTask(element.task_snapshot)
+  }
+  return bestTaskCandidate(candidates)
+}
+
+function bestTaskCandidate(candidates: Task[]) {
+  return candidates.reduce<Task | undefined>((best, task) => {
+    if (!best) return task
+    return compareTaskCompleteness(task, best) > 0 ? task : best
+  }, undefined)
+}
+
+function compareTaskCompleteness(left: Task, right: Task) {
+  const mediaDelta = taskMediaScore(left) - taskMediaScore(right)
+  if (mediaDelta) return mediaDelta
+  const statusDelta = taskStatusScore(left.status) - taskStatusScore(right.status)
+  if (statusDelta) return statusDelta
+  const timeDelta = timestampMS(left.updated_at) - timestampMS(right.updated_at)
+  if (timeDelta) return timeDelta
+  return left.id.localeCompare(right.id)
+}
+
+function taskMediaScore(task: Task) {
+  return snapshotImages(task.result_images).filter((image) => image?.url).length
+    + snapshotMedia(task.result_videos).filter((video) => video?.url).length
+    + snapshotMedia(task.reference_audios).filter((audio) => audio?.url).length
+}
+
+function taskStatusScore(status: Task['status']) {
+  if (status === 'succeeded') return 4
+  if (status === 'running') return 3
+  if (status === 'pending') return 2
+  if (status === 'failed') return 1
+  return 0
+}
+
+function syncElementTaskSnapshots() {
+  const byID = new Map<string, Task>()
+  for (const task of props.tasks) byID.set(task.id, task)
+  for (const [id, task] of Object.entries(props.canvasTaskSnapshots || {})) byID.set(id, task)
+  let changed = false
+  for (const canvas of canvases.value) {
+    for (const element of canvas.elements) {
+      if (!element.task_id) continue
+      const task = byID.get(element.task_id)
+      if (!task) continue
+      const previousTask = element.task_snapshot
+      if (JSON.stringify(canvasTaskRefSignatureItem(previousTask)) === JSON.stringify(canvasTaskRefSignatureItem(task))) continue
+      const snapshot = compactTaskSnapshot(task)
+      element.task_snapshot = snapshot
+      if (snapshot.status === 'succeeded') element.generated_params = taskParamChips(snapshot)
+      if (shouldAutoFreezeFromTaskUpdate(element, snapshot, previousTask)) element.frozen = true
+      changed = true
+    }
+  }
+  if (changed) persistCanvasNow()
+}
+
+function compactTaskSnapshot(task: Task): Task {
+  return {
+    ...task,
+    request_headers: '',
+    request_json: '',
+    response_headers: '',
+    response_json: '',
+    reference_images: compactSnapshotImages(task.reference_images),
+    reference_videos: compactSnapshotMedia(task.reference_videos),
+    reference_audios: compactSnapshotMedia(task.reference_audios),
+    result_images: compactSnapshotImages(task.result_images),
+    result_videos: compactSnapshotMedia(task.result_videos),
+  }
+}
+
+function snapshotImages(images?: UploadedImage[] | null): UploadedImage[] {
+  return Array.isArray(images) ? images : []
+}
+
+function snapshotMedia(items?: MediaAsset[] | null): MediaAsset[] {
+  return Array.isArray(items) ? items : []
+}
+
+function compactSnapshotImages(images?: UploadedImage[] | null): UploadedImage[] {
+  return snapshotImages(images).filter((image) => image?.url).map((image) => ({
+    url: image.url,
+    thumbnail_url: image.thumbnail_url || '',
+    filename: image.filename || '',
+    node_id: image.node_id || '',
+    reference_label: image.reference_label || '',
+    video_frame_role: image.video_frame_role || '',
+    mask_reference_label: image.mask_reference_label || '',
+    mask_url: image.mask_url && !image.mask_url.startsWith('data:') ? image.mask_url : '',
+    original_size: image.original_size,
+    compressed_size: image.compressed_size,
+    compression_ratio: image.compression_ratio,
+  }))
+}
+
+function compactSnapshotMedia(items?: MediaAsset[] | null): MediaAsset[] {
+  return snapshotMedia(items).filter((item) => item?.url).map((item) => ({
+    type: item.type || '',
+    url: item.url,
+    thumbnail_url: item.thumbnail_url || '',
+    first_frame_url: item.first_frame_url || '',
+    last_frame_url: item.last_frame_url || '',
+    filename: item.filename || '',
+    node_id: item.node_id || '',
+    reference_label: item.reference_label || '',
+    duration: item.duration,
+    clip_start: item.clip_start,
+    clip_end: item.clip_end,
+    width: item.width,
+    height: item.height,
+  }))
+}
+
+function shouldAutoFreezeFromTaskUpdate(element: CanvasElement, task: Task, previousTask?: Task) {
+  if (element.frozen || task.status !== 'succeeded' || !hasFrozenResult(element, task)) return false
+  if (!previousTask || previousTask.id !== task.id) return true
+  return previousTask.status !== 'succeeded' || !hasFrozenResult(element, previousTask)
+}
+
+function canvasTaskRefSignatureItem(task?: Task) {
+  return task ? {
+    id: task.id,
+    status: task.status,
+    created_at: task.created_at,
+    updated_at: task.updated_at,
+    started_at: task.started_at,
+    completed_at: task.completed_at,
+    elapsed_ms: task.elapsed_ms,
+    upstream_progress: task.upstream_progress,
+    queue_position: task.queue_position,
+    error_message: task.error_message,
+    result_images: snapshotImages(task.result_images).filter((image) => image?.url).map((image) => image.url).join('|'),
+    result_videos: snapshotMedia(task.result_videos).filter((video) => video?.url).map((video) => video.url).join('|'),
+  } : null
 }
 
 function generatedTask(element: CanvasElement) {
@@ -2022,16 +2610,16 @@ function isNodeRunning(element: CanvasElement) {
 function nodeHeaderRunLabel(element: CanvasElement) {
   const runtime = nodeRuntime(element)
   const task = generatedTask(element)
-  if (runtime?.status === 'running') return `运行中 ${formatDuration(runtimeNow.value - runtime.startedAt)}`
   if (task?.status === 'pending') return task.queue_position > 0 ? `排队中 #${task.queue_position}` : '排队中'
-  if (task?.status === 'running') return task.upstream_progress > 0 ? `生成中 ${task.upstream_progress}%` : '生成中'
+  if (task?.status === 'running') return taskRunningLabel(task)
+  if (runtime?.status === 'running') return `运行中 ${formatDuration(runtimeNow.value - runtime.startedAt)}`
   return '运行'
 }
 
-function hasFrozenResult(element: CanvasElement) {
+function hasFrozenResult(element: CanvasElement, task = taskForElement(element)) {
   if (element.kind === 'llm') return Boolean((element.text || '').trim())
-  if (element.kind === 'image') return Boolean(taskResultImage(element)?.url)
-  if (element.kind === 'video') return Boolean(taskResultVideo(element)?.url)
+  if (element.kind === 'image') return Boolean(task?.result_images?.[0]?.url || taskResultImage(element)?.url)
+  if (element.kind === 'video') return Boolean(task?.result_videos?.[0]?.url || taskResultVideo(element)?.url)
   if (element.kind === 'tail_frame') return Boolean(localUploadedImage(element)?.url)
   return false
 }
@@ -2039,21 +2627,30 @@ function hasFrozenResult(element: CanvasElement) {
 function nodeProgressLabel(element: CanvasElement) {
   const runtime = nodeRuntime(element)
   const task = generatedTask(element)
-  if (runtime?.status === 'running') return `运行中 ${formatDuration(runtimeNow.value - runtime.startedAt)}`
   if (element.frozen) return hasFrozenResult(element) ? '已固化' : '已固化但无结果'
   if (task?.status === 'pending') return task.queue_position > 0 ? `排队中 #${task.queue_position}` : '排队中'
-  if (task?.status === 'running') return task.upstream_progress > 0 ? `生成中 ${task.upstream_progress}%` : '生成中'
+  if (task?.status === 'running') return taskRunningLabel(task)
   if (task?.status === 'succeeded') return `完成 ${formatTaskElapsed(task)}`
   if (task?.status === 'failed') return task.error_message || '失败'
+  if (runtime?.status === 'running') return `运行中 ${formatDuration(runtimeNow.value - runtime.startedAt)}`
   if (runtime?.status === 'succeeded') return `完成 ${formatDuration((runtime.endedAt || runtimeNow.value) - runtime.startedAt)}`
   if (runtime?.status === 'failed') return runtime.message || '失败'
   return ''
 }
 
+function taskRunningLabel(task: Task) {
+  const pieces = ['生成中']
+  if (task.upstream_progress > 0) pieces.push(`${task.upstream_progress}%`)
+  const elapsed = formatTaskRunningElapsed(task)
+  if (elapsed) pieces.push(elapsed)
+  return pieces.join(' ')
+}
+
 function generatedParamChips(element: CanvasElement) {
   if (isNodeRunning(element)) return []
-  if (Array.isArray(element.generated_params)) return element.generated_params
   const task = generatedTask(element)
+  const storedParams = Array.isArray(element.generated_params) ? element.generated_params.filter(Boolean) : []
+  if (storedParams.length) return storedParams
   return task?.status === 'succeeded' ? taskParamChips(task) : []
 }
 
@@ -2072,7 +2669,6 @@ function taskParamChips(task: Task) {
   if (task.quality) chips.push(`质量 ${optionLabel(task.quality)}`)
   if (task.output_format) chips.push(`格式 ${optionLabel(task.output_format)}`)
   if (task.output_format === 'jpeg' || task.output_format === 'webp') chips.push(`压缩 ${task.output_compression}`)
-  if (task.background) chips.push(`背景 ${optionLabel(task.background)}`)
   if (task.moderation) chips.push(`审核 ${optionLabel(task.moderation)}`)
   if (task.input_fidelity) chips.push(`保真 ${optionLabel(task.input_fidelity)}`)
   if (task.n > 1) chips.push(`数量 ${task.n}`)
@@ -2098,6 +2694,12 @@ function formatTaskElapsed(task: Task) {
   return ''
 }
 
+function formatTaskRunningElapsed(task: Task) {
+  const startTime = timestampMS(task.started_at || '') || timestampMS(task.created_at || '')
+  if (!startTime) return ''
+  return formatDuration(runtimeNow.value - startTime)
+}
+
 function formatDuration(ms: number) {
   const seconds = Math.max(0, Math.floor(ms / 1000))
   const minutes = Math.floor(seconds / 60)
@@ -2115,7 +2717,9 @@ function localMediaAsset(element: CanvasElement): MediaAsset | undefined {
   return {
     type: mediaType || 'video',
     url: element.media_url,
-    thumbnail_url: element.media_thumbnail_url,
+    thumbnail_url: element.media_thumbnail_url || element.media_first_frame_url,
+    first_frame_url: element.media_first_frame_url,
+    last_frame_url: element.media_last_frame_url,
     filename: element.media_filename,
   }
 }
@@ -2228,6 +2832,7 @@ function zoomNodeImage(event: WheelEvent, element: CanvasElement) {
 
 function startNodeImagePan(event: PointerEvent, element: CanvasElement) {
   if (event.button !== 0) return
+  selectCanvasElement(element, event)
   event.preventDefault()
   event.stopPropagation()
   const view = imageView(element)
@@ -2375,7 +2980,7 @@ function assetPromptTitle(task: Task) {
 
 function taskVideoCover(task: Task) {
   const video = task.result_videos?.[0]
-  return video?.thumbnail_url || videoCoverURL(video?.url)
+  return video?.thumbnail_url || video?.first_frame_url || ''
 }
 
 function mentionCandidates(element: CanvasElement) {
@@ -3288,72 +3893,6 @@ function videoFrameFilename(element: CanvasElement, seconds: number) {
   return `${nodeBadge(element) || 'VIDEO'}-tail-${time}s.png`
 }
 
-function dataURLToFile(dataURL: string, filename: string) {
-  const [header, data] = dataURL.split(',')
-  const mime = header.match(/^data:(.*?);base64$/)?.[1] || 'image/png'
-  const bytes = atob(data || '')
-  const buffer = new Uint8Array(bytes.length)
-  for (let index = 0; index < bytes.length; index += 1) buffer[index] = bytes.charCodeAt(index)
-  return new File([buffer], filename, { type: mime })
-}
-
-function captureVideoFrame(url: string, seconds: number, fromTail = false) {
-  return new Promise<string>((resolve, reject) => {
-    const video = document.createElement('video')
-    let settled = false
-    const timer = window.setTimeout(() => fail('视频加载或定位超时，请确认视频地址可播放并支持拖动进度'), 15000)
-    const cleanup = () => {
-      window.clearTimeout(timer)
-      video.pause()
-      video.removeAttribute('src')
-      video.load()
-    }
-    const fail = (message = '取帧失败，请确认视频可访问并允许跨域读取') => {
-      if (settled) return
-      settled = true
-      cleanup()
-      reject(new Error(message))
-    }
-    const finish = () => {
-      if (settled) return
-      try {
-        const width = video.videoWidth || 1280
-        const height = video.videoHeight || 720
-        const canvas = document.createElement('canvas')
-        canvas.width = width
-        canvas.height = height
-        const ctx = canvas.getContext('2d')
-        if (!ctx) throw new Error('无法创建取帧画布')
-        ctx.drawImage(video, 0, 0, width, height)
-        settled = true
-        const dataURL = canvas.toDataURL('image/png')
-        cleanup()
-        resolve(dataURL)
-      } catch (error) {
-        const message = error instanceof DOMException && error.name === 'SecurityError'
-          ? '浏览器禁止导出该视频帧，请检查视频文件 GET/Range 响应和最终跳转地址是否都带有 CORS 头'
-          : error instanceof Error
-            ? error.message
-            : '取帧失败'
-        fail(message)
-      }
-    }
-    video.crossOrigin = 'anonymous'
-    video.muted = true
-    video.playsInline = true
-    video.preload = 'auto'
-    video.addEventListener('error', () => fail('视频加载失败，请确认视频地址可访问且浏览器可播放该编码'), { once: true })
-    video.addEventListener('loadedmetadata', () => {
-      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : seconds
-      const targetTime = fromTail ? Math.max(0, duration - 0.05) : seconds
-      video.currentTime = clamp(targetTime, 0, Math.max(0, duration - 0.05))
-    }, { once: true })
-    video.addEventListener('seeked', finish, { once: true })
-    video.src = url
-    video.load()
-  })
-}
-
 function prepareMaskCanvas(event: Event, element: CanvasElement) {
   const img = event.target as HTMLImageElement
   const wrap = img.closest('.canvas-mask-editor')
@@ -3366,6 +3905,7 @@ function prepareMaskCanvas(event: Event, element: CanvasElement) {
   if (element.mask_data_url) {
     const ctx = canvas.getContext('2d')
     const mask = new Image()
+    mask.crossOrigin = 'anonymous'
     mask.onload = () => ctx?.drawImage(mask, 0, 0, canvas.width, canvas.height)
     mask.src = element.mask_data_url
   }
@@ -3594,6 +4134,12 @@ function toggleFrozen(element: CanvasElement) {
   element.frozen = !element.frozen
 }
 
+function freezeGeneratedElement(element: CanvasElement, task?: Task) {
+  if (!isRunnableKind(element.kind) || !hasFrozenResult(element, task)) return
+  element.frozen = true
+  persistCanvasNow()
+}
+
 async function runGenerateNode(element: CanvasElement) {
   syncActiveEditable()
   if (element.kind === 'mask' || element.kind === 'audio' || element.frozen) return
@@ -3603,6 +4149,7 @@ async function runGenerateNode(element: CanvasElement) {
   try {
     if (element.kind === 'tail_frame') {
       await runTailFrameNode(element)
+      freezeGeneratedElement(element)
       nodeRunState.value = { ...nodeRunState.value, [element.id]: { ...nodeRunState.value[element.id], status: 'succeeded', endedAt: Date.now() } }
       return
     }
@@ -3622,6 +4169,7 @@ async function runGenerateNode(element: CanvasElement) {
       }
       if (props.runLlmAction) await props.runLlmAction(payload, applyResult)
       else emit('runLlm', payload, applyResult)
+      freezeGeneratedElement(element)
       nodeRunState.value = { ...nodeRunState.value, [element.id]: { ...nodeRunState.value[element.id], status: 'succeeded', endedAt: Date.now() } }
       return
     }
@@ -3653,8 +4201,10 @@ async function runGenerateNode(element: CanvasElement) {
     const applyTask = (task: Task) => {
       latestTask = task
       element.task_id = task.id
-      element.task_snapshot = { ...task }
+      element.task_snapshot = compactTaskSnapshot(task)
       element.generated_params = task.status === 'succeeded' ? taskParamChips(task) : []
+      if (task.status === 'succeeded') freezeGeneratedElement(element, task)
+      persistCanvasNow()
     }
     if (props.runNodeAction) await props.runNodeAction(payload, applyTask)
     else emit('runNode', payload, applyTask)
@@ -3764,17 +4314,30 @@ function collectUpstreamIDs(element: CanvasElement, blocked: Set<string>, seen =
 
 async function runTailFrameNode(element: CanvasElement) {
   const sourceElement = connectedInputs(element).find((item) => outputTypes(item).includes('video'))
-  const source = sourceElement ? localMediaAsset(sourceElement) || taskResultVideo(sourceElement) : undefined
+  let source = sourceElement ? localMediaAsset(sourceElement) || taskResultVideo(sourceElement) : undefined
   if (!source?.url) throw new Error('尾帧节点没有可用的上游视频')
-  const duration = source.duration || sourceElement?.video_duration || videoDurationByNodeID.value[sourceElement?.id || ''] || 0
-  const seconds = Math.max(0, Number(duration) - 0.05)
-  const filename = videoFrameFilename(sourceElement || element, seconds)
-  const dataURL = await captureVideoFrame(source.url, seconds, true)
-  const uploaded = await uploadImage(dataURLToFile(dataURL, filename))
-  element.media_type = 'image'
-  element.media_url = uploaded.url
-  element.media_thumbnail_url = uploaded.thumbnail_url || uploaded.url
-  element.media_filename = uploaded.filename || filename
+  if (!source.last_frame_url) {
+    try {
+      const frames = await fetchVideoFrames(source.url, source.filename || videoFrameFilename(sourceElement || element, 0))
+      source = { ...source, thumbnail_url: source.thumbnail_url || frames.thumbnail_url || frames.first_frame_url, first_frame_url: frames.first_frame_url, last_frame_url: frames.last_frame_url || frames.first_frame_url }
+      if (sourceElement && sourceElement.media_url === source.url) {
+        sourceElement.media_thumbnail_url = sourceElement.media_thumbnail_url || source.thumbnail_url || ''
+        sourceElement.media_first_frame_url = source.first_frame_url || ''
+        sourceElement.media_last_frame_url = source.last_frame_url || ''
+      }
+    } catch {
+      throw new Error('后端无法抽取该视频尾帧，请确认视频地址可访问且服务器已安装 ffmpeg')
+    }
+  }
+  if (source.last_frame_url) {
+    const filename = videoFrameFilename(sourceElement || element, source.duration || sourceElement?.video_duration || 0)
+    element.media_type = 'image'
+    element.media_url = source.last_frame_url
+    element.media_thumbnail_url = source.last_frame_url
+    element.media_filename = filename
+    return
+  }
+  throw new Error('该视频没有可用的尾帧图片')
 }
 
 function screenToWorld(clientX: number, clientY: number) {
@@ -3906,6 +4469,10 @@ function onFlowNodesChange(changes: NodeChange[]) {
   for (const change of changes) {
     if (change.type !== 'select') continue
     if (nextSelected === selectedNodeIDs.value) nextSelected = new Set(selectedNodeIDs.value)
+    if (suppressHandleSelectionID.value && change.id === suppressHandleSelectionID.value) {
+      nextSelected.delete(change.id)
+      continue
+    }
     if (change.selected) {
       nextSelected.add(change.id)
       selectedNow.push(change.id)
@@ -3973,6 +4540,7 @@ function startNodeDrag(event: PointerEvent, element: CanvasElement) {
   event.preventDefault()
     ; (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
   const target = event.altKey ? duplicateElement(element) : element
+  selectCanvasElement(target)
   hideInspectorDuringDrag.value = true
   dragState.value = { type: 'node', id: target.id, startX: event.clientX, startY: event.clientY, originX: target.x, originY: target.y }
 }
@@ -3980,11 +4548,39 @@ function startNodeDrag(event: PointerEvent, element: CanvasElement) {
 function onCanvasNodePointerDown(event: PointerEvent, element: CanvasElement) {
   closeMentionMenu()
   if (spacePanning.value) return
+  if (isCanvasHandleTarget(event.target)) {
+    suppressHandleSelection(element)
+    return
+  }
   event.stopPropagation()
+  if (event.button === 0) selectCanvasElement(element, event)
   if (event.button !== 0 || !event.altKey) return
   if (!(event.target instanceof HTMLElement) || !event.target.closest('.canvas-node-drag')) return
   event.stopImmediatePropagation()
   startNodeDrag(event, element)
+}
+
+function isCanvasHandleTarget(target: EventTarget | null) {
+  return target instanceof HTMLElement && Boolean(target.closest('.canvas-flow-handle'))
+}
+
+function suppressHandleSelection(element: CanvasElement) {
+  suppressHandleSelectionID.value = element.id
+  selectedNodeIDs.value = new Set(Array.from(selectedNodeIDs.value).filter((id) => id !== element.id))
+  modelMenuElementID.value = ''
+  window.setTimeout(() => {
+    if (suppressHandleSelectionID.value === element.id) suppressHandleSelectionID.value = ''
+  }, 0)
+}
+
+function selectCanvasElement(element: CanvasElement, event?: PointerEvent) {
+  const additive = Boolean(event?.shiftKey || event?.ctrlKey || event?.metaKey)
+  const next = additive ? new Set(selectedNodeIDs.value) : new Set<string>()
+  if (additive && next.has(element.id)) next.delete(element.id)
+  else next.add(element.id)
+  selectedNodeIDs.value = next
+  bringElementToFront(element)
+  hideInspectorDuringDrag.value = false
 }
 
 function maxCanvasZIndex() {
@@ -4003,6 +4599,8 @@ function duplicateElement(element: CanvasElement) {
     ...element,
     id: createID(),
     badge: '',
+    video_first_frame_source_id: '',
+    video_last_frame_source_id: '',
     x: element.x + 28,
     y: element.y + 28,
     zIndex: maxCanvasZIndex() + 2000,
@@ -4119,6 +4717,8 @@ function createElementForConnectionTarget(kind: NodeKind, point: { x: number; y:
       media_type: 'image',
       media_url: '',
       media_thumbnail_url: '',
+      media_first_frame_url: '',
+      media_last_frame_url: '',
       media_filename: '',
       text: '尾帧',
       x: point.x - minSize.width / 2,
@@ -4142,6 +4742,8 @@ function createElementForConnectionTarget(kind: NodeKind, point: { x: number; y:
       media_type: type,
       media_url: '',
       media_thumbnail_url: '',
+      media_first_frame_url: '',
+      media_last_frame_url: '',
       media_filename: '',
       text: '',
       video_clip_start: 0,
@@ -4207,22 +4809,54 @@ function onPointerMove(event: PointerEvent) {
     flow.setViewport(viewport)
     return
   }
+  queueDragPoint(event)
+}
+
+function queueDragPoint(event: PointerEvent) {
+  pendingDragPoint = { clientX: event.clientX, clientY: event.clientY }
+  if (dragFrame) return
+  dragFrame = window.requestAnimationFrame(() => {
+    dragFrame = 0
+    flushDragPoint()
+  })
+}
+
+function flushDragPoint(point = pendingDragPoint) {
+  const state = dragState.value
+  if (!point || !state || state.type === 'pan' || !activeCanvas.value) return
+  pendingDragPoint = null
   const element = elementByID(state.id)
   if (!element) return
   if (state.type === 'node') {
-    element.x = state.originX + (event.clientX - state.startX) / camera.zoom
-    element.y = state.originY + (event.clientY - state.startY) / camera.zoom
+    element.x = state.originX + (point.clientX - state.startX) / camera.zoom
+    element.y = state.originY + (point.clientY - state.startY) / camera.zoom
   } else {
     const min = minNodeSize(element.kind)
-    element.width = Math.max(min.width, state.originWidth + (event.clientX - state.startX) / camera.zoom)
-    element.height = Math.max(min.height, state.originHeight + (event.clientY - state.startY) / camera.zoom)
+    element.width = Math.max(min.width, state.originWidth + (point.clientX - state.startX) / camera.zoom)
+    element.height = Math.max(min.height, state.originHeight + (point.clientY - state.startY) / camera.zoom)
   }
 }
 
-function stopDrag(event?: PointerEvent) {
-  const wasNodeDrag = dragState.value?.type === 'node'
+function stopDrag(event?: PointerEvent | Event) {
+  if (event instanceof PointerEvent) flushDragPoint({ clientX: event.clientX, clientY: event.clientY })
+  else flushDragPoint()
+  if (dragFrame) {
+    window.cancelAnimationFrame(dragFrame)
+    dragFrame = 0
+  }
+  pendingDragPoint = null
+  const state = dragState.value
   dragState.value = null
-  if (wasNodeDrag) hideInspectorDuringDrag.value = false
+  hideInspectorDuringDrag.value = false
+  if (state?.type === 'node' || state?.type === 'resize') {
+    persistCanvasNow()
+    queueCanvasHistorySnapshot()
+  }
+}
+
+function isTransientCanvasMutation() {
+  const type = dragState.value?.type
+  return type === 'node' || type === 'resize'
 }
 
 function onCanvasWheel(event: WheelEvent) {
@@ -4262,7 +4896,52 @@ function setZoom(value: number) {
 }
 
 function resetView() {
-  flow.setViewport({ x: 420, y: 220, zoom: 0.82 }, { duration: 160 })
+  focusActiveCanvasElements(160)
+}
+
+function focusActiveCanvasElements(duration = 160) {
+  const elements = activeCanvas.value?.elements || []
+  if (!elements.length) {
+    setCanvasViewport({ x: 420, y: 220, zoom: 0.82 }, duration)
+    return
+  }
+  const bounds = elements.reduce((box, element) => {
+    const size = renderedNodeSize(element)
+    const left = element.x
+    const top = element.y
+    const right = element.x + size.width
+    const bottom = element.y + size.height
+    return {
+      left: Math.min(box.left, left),
+      top: Math.min(box.top, top),
+      right: Math.max(box.right, right),
+      bottom: Math.max(box.bottom, bottom),
+    }
+  }, { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity })
+  const frame = document.querySelector<HTMLElement>('.canvas-flow')?.getBoundingClientRect()
+  const assetInset = showAssets.value ? 280 : 0
+  const width = Math.max(320, (frame?.width || window.innerWidth) - assetInset)
+  const height = Math.max(260, frame?.height || window.innerHeight)
+  const padding = width < 720 ? 56 : 104
+  const boundsWidth = Math.max(1, bounds.right - bounds.left)
+  const boundsHeight = Math.max(1, bounds.bottom - bounds.top)
+  const nextZoom = clamp(Math.min((width - padding * 2) / boundsWidth, (height - padding * 2) / boundsHeight), MIN_ZOOM, 1.08)
+  const centerX = bounds.left + boundsWidth / 2
+  const centerY = bounds.top + boundsHeight / 2
+  setCanvasViewport({
+    x: width / 2 - centerX * nextZoom,
+    y: height / 2 - centerY * nextZoom,
+    zoom: nextZoom,
+  }, duration)
+}
+
+function setCanvasViewport(viewport: ViewportTransform, duration = 0) {
+  pan.value = { x: viewport.x, y: viewport.y }
+  zoom.value = viewport.zoom
+  camera.x = viewport.x
+  camera.y = viewport.y
+  camera.zoom = viewport.zoom
+  flow.setViewport(viewport, { duration })
 }
 
 function toggleMiniMap(event?: Event) {
@@ -4441,11 +5120,17 @@ function clamp(value: number, min: number, max: number) {
 </script>
 
 <template>
-  <section class="canvas-workspace" :class="{ 'space-panning': spacePanning, 'zen-mode': zenMode, 'assets-open': showAssets }" @click="canvasContextMenu = null" @contextmenu.prevent.stop="openCanvasContextMenu" @wheel.capture="onCanvasWheel" @pointerdown.capture="onCanvasPointerDownCapture" @pointermove="onPointerMove" @pointerup="stopDrag" @pointercancel="stopDrag">
+  <section class="canvas-workspace" :class="{ 'space-panning': spacePanning, 'zen-mode': zenMode, 'assets-open': showAssets }" @click="canvasContextMenu = null; activeCanvasDrawer = ''" @contextmenu.prevent.stop="openCanvasContextMenu" @wheel.capture="onCanvasWheel" @pointerdown.capture="onCanvasPointerDownCapture" @pointermove="onPointerMove" @pointerup="stopDrag" @pointercancel="stopDrag">
     <div class="canvas-topbar glass-panel" :class="{ 'zen-collapsed': zenMode }" @pointerdown.stop>
       <div class="canvas-console-track">
         <div class="canvas-console-content" :aria-hidden="zenMode">
-          <div class="canvas-switcher">
+          <div class="canvas-drawer-tabs">
+            <button type="button" :class="{ active: activeCanvasDrawer === 'board' }" title="画布管理" @click="toggleCanvasDrawer('board', $event)"><AppIcon name="gallery" /><span>画布</span></button>
+            <button type="button" :class="{ active: activeCanvasDrawer === 'nodes' }" title="节点工具" @click="toggleCanvasDrawer('nodes', $event)"><AppIcon name="sparkles" /><span>节点</span></button>
+            <button type="button" :class="{ active: activeCanvasDrawer === 'view' }" title="视图工具" @click="toggleCanvasDrawer('view', $event)"><AppIcon name="resetView" /><span>视图</span></button>
+            <button type="button" class="canvas-save-tab" :class="[`is-${canvasSaveState}`, { active: activeCanvasDrawer === 'save' }]" :title="canvasSaveTitle" @click="toggleCanvasDrawer('save', $event)"><span aria-hidden="true"></span><strong>{{ canvasSaveLabel }}</strong></button>
+          </div>
+          <div class="canvas-switcher canvas-console-group canvas-group-board" :class="drawerGroupClass('board')">
             <InlineSelect class="toolbar-status-select canvas-board-select" label="画布" :model-value="activeCanvasID" :options="canvasOptions" @update:model-value="activeCanvasID = $event" />
             <button type="button" title="新建画布" @click="createCanvas"><AppIcon name="add" /></button>
             <button type="button" title="重命名画布" @click="openRenameCanvas"><AppIcon name="pencil" /></button>
@@ -4453,8 +5138,13 @@ function clamp(value: number, min: number, max: number) {
             <button type="button" title="更新广场分享" :disabled="!activeCanvas || !activeCanvasShared" @click="shareActiveCanvas"><AppIcon name="upload" /></button>
             <button type="button" title="删除画布" :disabled="canvases.length <= 1" @click="openDeleteCanvas"><AppIcon name="close" /></button>
           </div>
+          <div class="canvas-save-status canvas-console-group canvas-group-save" :class="[`is-${canvasSaveState}`, drawerGroupClass('save')]" :title="canvasSaveTitle">
+            <span aria-hidden="true"></span>
+            <strong>{{ canvasSaveLabel }}</strong>
+            <small>{{ canvasSaveDetail }}</small>
+          </div>
           <span class="canvas-tool-divider" aria-hidden="true"></span>
-          <div class="canvas-switcher canvas-node-tools">
+          <div class="canvas-switcher canvas-node-tools canvas-console-group canvas-group-nodes" :class="drawerGroupClass('nodes')">
             <button type="button" title="添加文字提示词" @click="addPromptNode()"><AppIcon name="text" /></button>
             <button type="button" title="添加媒体节点" @click="addAssetNode()"><AppIcon name="gallery" /></button>
             <button type="button" title="添加汇合节点" @click="addMergeNode()"><AppIcon name="merge" /></button>
@@ -4462,7 +5152,7 @@ function clamp(value: number, min: number, max: number) {
             <button type="button" class="canvas-run-button" title="按连接顺序运行整张画布" :disabled="runningWorkflow" @click="runCanvasWorkflow"><AppIcon :name="runningWorkflow ? 'stop' : 'play'" /></button>
           </div>
           <span class="canvas-tool-divider" aria-hidden="true"></span>
-          <div class="canvas-zoom-controls">
+          <div class="canvas-zoom-controls canvas-console-group canvas-group-view" :class="drawerGroupClass('view')">
             <button type="button" title="撤回上一步 Ctrl+Z" :disabled="!canUndo" @click="undoCanvasChange"><AppIcon name="undo" /></button>
             <button type="button" title="全局自动整理" @click="autoArrangeCanvas"><AppIcon name="grid" /></button>
             <button type="button" title="缩小" @click="setZoom(zoom - 0.1)"><AppIcon name="zoomOut" /></button>
@@ -4522,7 +5212,7 @@ function clamp(value: number, min: number, max: number) {
 
         <div v-if="element.kind === 'prompt'" class="canvas-prompt-node">
           <div class="canvas-rich-editor" contenteditable="true" :data-node-id="element.id"
-            data-placeholder="输入这里要使用的文字提示词，可输入 @ 引用连接节点素材..." @pointerdown.stop
+            data-placeholder="输入这里要使用的文字提示词，可输入 @ 引用连接节点素材..." @pointerdown.stop="selectCanvasElement(element, $event)"
             @mousedown.stop @click.stop @wheel.stop @input="onPromptTextInput($event, element)"
             @keyup="onPromptTextInput($event, element)" @keydown="onRichEditorKeydown($event, element)"
             @compositionstart="onEditorCompositionStart($event, element)"
@@ -4602,7 +5292,7 @@ function clamp(value: number, min: number, max: number) {
               :class="{ error: canvasImageStatus(element, localUploadedImage(element)?.url) === 'error' }">
               {{ canvasImageStatus(element, localUploadedImage(element)?.url) === 'error' ? '图片加载失败' : '图片加载中' }}
             </div>
-            <img :src="localUploadedImage(element)?.url" alt="尾帧图片" :style="imageZoomStyle(element)" draggable="false"
+            <img :src="localUploadedImage(element)?.url" alt="尾帧图片" :style="imageZoomStyle(element)" draggable="false" crossorigin="anonymous"
               @load="markCanvasImageLoaded(element, localUploadedImage(element)?.url)"
               @error="markCanvasImageError(element, localUploadedImage(element)?.url)" />
           </div>
@@ -4617,7 +5307,7 @@ function clamp(value: number, min: number, max: number) {
             :class="[`tool-${element.mask_tool || 'brush'}`, { panning: imagePanState?.elementID === element.id }]"
             @pointerdown.stop @wheel="zoomNodeImage($event, element)" @pointerenter="activeMaskElementID = element.id"
             @pointerleave="hideMaskCursor(element)">
-            <img :src="originalImageURL(maskSourceImage(element))" alt="蒙版上游图片"
+            <img :src="originalImageURL(maskSourceImage(element))" alt="蒙版上游图片" crossorigin="anonymous"
               :style="imageZoomStyle(element)" draggable="false" @load="prepareMaskCanvas($event, element)" />
             <canvas :style="imageZoomStyle(element)" @pointerdown.stop="startMaskPointer($event, element)"
               @pointermove.stop="moveMaskPointer($event, element)" @pointerup.stop="stopMaskPointer($event, element)"
@@ -4648,7 +5338,7 @@ function clamp(value: number, min: number, max: number) {
 
         <div v-else-if="isProcessKind(element.kind)" class="canvas-generate-node">
           <div v-if="element.kind === 'llm'" class="canvas-rich-editor canvas-llm-editor" contenteditable="true"
-            :data-node-id="element.id" data-placeholder="运行后展示、编辑 LLM 输出，可输入 @ 引用连接节点素材..." @pointerdown.stop
+            :data-node-id="element.id" data-placeholder="运行后展示、编辑 LLM 输出，可输入 @ 引用连接节点素材..." @pointerdown.stop="selectCanvasElement(element, $event)"
             @wheel.stop @input="onPromptTextInput($event, element)" @keyup="onPromptTextInput($event, element)"
             @compositionstart="onEditorCompositionStart($event, element)"
             @compositionend="onEditorCompositionEnd($event, element)"
@@ -4672,7 +5362,7 @@ function clamp(value: number, min: number, max: number) {
                   :class="{ error: canvasImageStatus(element, originalImageURL(generatedTask(element)?.result_images?.[0])) === 'error' }">
                   {{ canvasImageStatus(element, originalImageURL(generatedTask(element)?.result_images?.[0])) === 'error' ? '图片加载失败' : '图片加载中' }}
                 </div>
-                <img :src="originalImageURL(generatedTask(element)?.result_images?.[0])" alt="生成结果"
+                <img :src="originalImageURL(generatedTask(element)?.result_images?.[0])" alt="生成结果" crossorigin="anonymous"
                   :style="imageZoomStyle(element)" draggable="false"
                   @load="markCanvasImageLoaded(element, originalImageURL(generatedTask(element)?.result_images?.[0]))"
                   @error="markCanvasImageError(element, originalImageURL(generatedTask(element)?.result_images?.[0]))" />
@@ -4734,7 +5424,7 @@ function clamp(value: number, min: number, max: number) {
                 :class="{ error: canvasImageStatus(element, element.media_url) === 'error' }">
                 {{ canvasImageStatus(element, element.media_url) === 'error' ? '图片加载失败' : '图片加载中' }}
               </div>
-              <img :src="element.media_url" alt="画布素材" decoding="async" :style="imageZoomStyle(element)" draggable="false"
+              <img :src="element.media_url" alt="画布素材" decoding="async" :style="imageZoomStyle(element)" draggable="false" crossorigin="anonymous"
                 @load="markCanvasImageLoaded(element, element.media_url)" @error="markCanvasImageError(element, element.media_url)" />
             </div>
             <form v-if="mediaUrlEditor?.elementID === element.id"
@@ -4773,7 +5463,7 @@ function clamp(value: number, min: number, max: number) {
               :class="{ error: canvasImageStatus(element, originalImageURL(taskForElement(element)!.result_images?.[0])) === 'error' }">
               {{ canvasImageStatus(element, originalImageURL(taskForElement(element)!.result_images?.[0])) === 'error' ? '图片加载失败' : '图片加载中' }}
             </div>
-            <img :src="originalImageURL(taskForElement(element)!.result_images?.[0])" alt="生成素材"
+            <img :src="originalImageURL(taskForElement(element)!.result_images?.[0])" alt="生成素材" crossorigin="anonymous"
               :style="imageZoomStyle(element)" draggable="false" @dblclick="emit('selectTask', taskForElement(element)!)"
               @load="markCanvasImageLoaded(element, originalImageURL(taskForElement(element)!.result_images?.[0]))"
               @error="markCanvasImageError(element, originalImageURL(taskForElement(element)!.result_images?.[0]))" />
@@ -4978,14 +5668,6 @@ function clamp(value: number, min: number, max: number) {
           <div class="canvas-inline-title">
             <strong>高级</strong>
           </div>
-          <div class="canvas-mini-row">
-            <span>背景</span>
-            <div class="canvas-pill-grid">
-              <button v-for="background in canvasBackgroundOptions(element)" :key="background" type="button" class="canvas-pill-choice" :class="{ active: (element.background || props.defaultForm.background) === background }" :title="optionHint('background', background)" @click="element.background = background">
-                {{ optionLabel(background) }}
-              </button>
-            </div>
-          </div>
           <label v-if="supportsOutputCompression(element)" class="canvas-slider-field">
             <span><strong>压缩</strong><em>{{ element.output_compression ?? props.defaultForm.output_compression ?? 80 }}</em></span>
             <input v-model.number="element.output_compression" type="range" min="0" max="100" />
@@ -5129,10 +5811,13 @@ function clamp(value: number, min: number, max: number) {
         <div class="asset-list-scroll">
           <button v-for="task in visibleAssetTasks" :key="task.id" type="button" class="asset-row"
             :title="assetPromptTitle(task)" @click="addTask(task)">
-            <img v-if="isVideoTask(task) && taskVideoCover(task)" :src="taskVideoCover(task)" alt="视频封面" />
-            <span v-else-if="isVideoTask(task)" class="asset-prompt-icon">视频</span>
+            <span v-if="isVideoTask(task)" class="asset-video-thumb">
+              <img v-if="taskVideoCover(task)" :src="taskVideoCover(task)" alt="视频封面" crossorigin="anonymous" />
+              <span v-else class="asset-prompt-icon">视频</span>
+              <span class="asset-video-play" aria-hidden="true"><AppIcon name="play" :size="14" /></span>
+            </span>
             <span v-else-if="firstAudioAsset(task)" class="asset-prompt-icon">音频</span>
-            <img v-else :src="originalImageURL(task.result_images?.[0])" alt="素材" />
+            <img v-else :src="originalImageURL(task.result_images?.[0])" alt="素材" crossorigin="anonymous" />
             <span>
               <strong>{{ assetLabel(task) }}</strong>
               <small>{{ task.prompt || task.model }}</small>

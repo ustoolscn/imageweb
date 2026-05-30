@@ -5,7 +5,6 @@ import { canvasPreviewMedia } from '../lib/canvasPreview'
 import { imageSizeLabel } from '../lib/sizes'
 import { formatTime, isVideoTask, taskReferenceImages } from '../lib/view'
 import { videoRatioLabel } from '../lib/videoModels'
-import { ensureVideoCover, videoCoverURL } from '../lib/videoCover'
 import AppIcon from './AppIcon.vue'
 
 const props = defineProps<{
@@ -33,9 +32,9 @@ const mediaTransform = computed(() => ({
   transform: `translate(calc(-50% + ${mediaPan.value.x}px), calc(-50% + ${mediaPan.value.y}px)) scale(${mediaZoom.value})`,
 }))
 const detailVideo = computed(() => props.item.result_videos?.[0])
-const detailVideoCover = computed(() => detailVideo.value?.thumbnail_url || videoCoverURL(detailVideo.value?.url))
+const detailVideoCover = computed(() => detailVideo.value?.thumbnail_url || detailVideo.value?.first_frame_url || '')
 const canvasPreview = computed(() => canvasPreviewMedia(props.item))
-const canvasDetailVideoCover = computed(() => canvasPreview.value?.type === 'video' ? canvasPreview.value.thumbnail_url || videoCoverURL(canvasPreview.value.url) : '')
+const canvasDetailVideoCover = computed(() => canvasPreview.value?.type === 'video' ? canvasPreview.value.thumbnail_url || '' : '')
 const canvasNodeCount = computed(() => {
   const canvas = props.item.canvas as { elements?: unknown[] } | undefined
   return Array.isArray(canvas?.elements) ? canvas.elements.length : 0
@@ -96,8 +95,6 @@ onMounted(() => {
   document.body.style.overflow = 'hidden'
   document.documentElement.style.overflow = 'hidden'
   window.addEventListener('keydown', closeOnEscape)
-  if (detailVideo.value?.url && !detailVideo.value.thumbnail_url) ensureVideoCover(detailVideo.value.url).catch(() => {})
-  if (canvasPreview.value?.type === 'video' && canvasPreview.value.url && !canvasPreview.value.thumbnail_url) ensureVideoCover(canvasPreview.value.url).catch(() => {})
   nextTick(() => {
     const video = videoRef.value
     if (!video) return
@@ -132,8 +129,8 @@ onBeforeUnmount(() => {
         @pointercancel="stopMediaPan"
       >
         <template v-if="item.item_type === 'canvas'">
-          <video v-if="canvasPreview?.type === 'video' && canvasPreview.url" class="detail-video ready" :poster="canvasDetailVideoCover" :src="canvasPreview.url" controls playsinline preload="metadata" :style="mediaTransform" />
-          <img v-else-if="canvasPreview?.url" :src="canvasPreview.url" :alt="canvasPreview.label || '画布预览'" loading="lazy" decoding="async" draggable="false" :style="mediaTransform" />
+          <video v-if="canvasPreview?.type === 'video' && canvasPreview.url" class="detail-video ready" :poster="canvasDetailVideoCover" :src="canvasPreview.url" controls playsinline preload="metadata" crossorigin="anonymous" :style="mediaTransform" />
+          <img v-else-if="canvasPreview?.url" :src="canvasPreview.url" :alt="canvasPreview.label || '画布预览'" loading="lazy" decoding="async" draggable="false" crossorigin="anonymous" :style="mediaTransform" />
           <div v-else class="detail-canvas-preview">
             <AppIcon name="canvas" :size="54" />
             <strong>{{ item.canvas_name || '广场画布' }}</strong>
@@ -141,14 +138,14 @@ onBeforeUnmount(() => {
           </div>
         </template>
         <template v-else-if="isVideoTask(item) && detailVideo?.url">
-          <img v-if="!videoReady && detailVideoCover" class="detail-video-poster" :src="detailVideoCover" alt="视频封面" draggable="false" />
+          <img v-if="!videoReady && detailVideoCover" class="detail-video-poster" :src="detailVideoCover" alt="视频封面" draggable="false" crossorigin="anonymous" />
           <div v-if="!videoReady" class="detail-video-loading">
             <span></span>
             <strong>正在加载视频</strong>
           </div>
-          <video ref="videoRef" class="detail-video" :class="{ ready: videoReady }" :src="detailVideo.url" :controls="videoReady" autoplay playsinline preload="auto" :style="mediaTransform" @loadeddata="videoReady = true" @canplay="videoReady = true" />
+          <video ref="videoRef" class="detail-video" :class="{ ready: videoReady }" :src="detailVideo.url" :controls="videoReady" autoplay playsinline preload="auto" crossorigin="anonymous" :style="mediaTransform" @loadeddata="videoReady = true" @canplay="videoReady = true" />
         </template>
-        <img v-else-if="item.result_images?.[0]?.url" :src="item.result_images[0].url" alt="广场作品" loading="lazy" decoding="async" draggable="false" :style="mediaTransform" />
+        <img v-else-if="item.result_images?.[0]?.url" :src="item.result_images[0].url" alt="广场作品" loading="lazy" decoding="async" draggable="false" crossorigin="anonymous" :style="mediaTransform" />
       </div>
       <div class="detail-info" :class="{ open: showInfo }" @wheel.stop>
         <div class="detail-section detail-input-section">
@@ -159,7 +156,7 @@ onBeforeUnmount(() => {
           <div class="section-title">参考图片</div>
           <div class="detail-references">
             <button v-for="(image, index) in taskReferenceImages(item)" :key="`${image.url}-${index}`" type="button" @click="emit('openPreview', image.url, image.filename || `参考图 ${index + 1}`, $event, image.mask_url)">
-              <img :src="image.url" :alt="image.filename || '参考图'" loading="lazy" decoding="async" />
+              <img :src="image.url" :alt="image.filename || '参考图'" loading="lazy" decoding="async" crossorigin="anonymous" />
               <span>{{ image.filename || `参考 ${index + 1}` }}{{ image.mask_url ? ' · 蒙板' : '' }}</span>
             </button>
           </div>

@@ -21,6 +21,8 @@ const (
 type UploadedImage struct {
 	URL                string  `json:"url"`
 	ThumbnailURL       string  `json:"thumbnail_url,omitempty"`
+	FirstFrameURL      string  `json:"first_frame_url,omitempty"`
+	LastFrameURL       string  `json:"last_frame_url,omitempty"`
 	Filename           string  `json:"filename,omitempty"`
 	NodeID             string  `json:"node_id,omitempty"`
 	ReferenceLabel     string  `json:"reference_label,omitempty"`
@@ -36,6 +38,8 @@ type MediaAsset struct {
 	Type           string `json:"type,omitempty"`
 	URL            string `json:"url"`
 	ThumbnailURL   string `json:"thumbnail_url,omitempty"`
+	FirstFrameURL  string `json:"first_frame_url,omitempty"`
+	LastFrameURL   string `json:"last_frame_url,omitempty"`
 	Filename       string `json:"filename,omitempty"`
 	NodeID         string `json:"node_id,omitempty"`
 	ReferenceLabel string `json:"reference_label,omitempty"`
@@ -48,6 +52,7 @@ type MediaAsset struct {
 
 type Task struct {
 	ID                  string          `json:"id"`
+	WorkspaceID         string          `json:"-"`
 	APIKey              string          `json:"-"`
 	BaseURL             string          `json:"baseurl"`
 	TaskType            TaskType        `json:"task_type"`
@@ -124,6 +129,7 @@ type PlazaItem struct {
 	ID                  string          `json:"id"`
 	ItemType            string          `json:"item_type"`
 	TaskID              string          `json:"task_id"`
+	CanvasID            string          `json:"canvas_id,omitempty"`
 	CanvasName          string          `json:"canvas_name,omitempty"`
 	CanvasJSON          json.RawMessage `json:"canvas,omitempty"`
 	CanvasJSONText      string          `json:"-"`
@@ -256,8 +262,29 @@ type CanvasState struct {
 	UpdatedAt time.Time       `json:"updated_at"`
 }
 
+type CanvasSaveResponse struct {
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 type CanvasStateRequest struct {
 	APIKey   string          `json:"apikey"`
 	BaseURL  string          `json:"baseurl"`
 	Canvases json.RawMessage `json:"canvases"`
+}
+
+type CanvasPatchRequest struct {
+	APIKey           string            `json:"apikey"`
+	BaseURL          string            `json:"baseurl"`
+	Canvases         []json.RawMessage `json:"canvases"`
+	CanvasPatches    []CanvasItemPatch `json:"canvas_patches"`
+	DeletedCanvasIDs []string          `json:"deleted_canvas_ids"`
+}
+
+type CanvasItemPatch struct {
+	ID                   string            `json:"id"`
+	Name                 *string           `json:"name,omitempty"`
+	Elements             []json.RawMessage `json:"elements,omitempty"`
+	DeletedElementIDs    []string          `json:"deleted_element_ids,omitempty"`
+	Connections          []json.RawMessage `json:"connections,omitempty"`
+	DeletedConnectionIDs []string          `json:"deleted_connection_ids,omitempty"`
 }

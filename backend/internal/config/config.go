@@ -11,6 +11,7 @@ type Config struct {
 	Port                     string
 	DataDir                  string
 	DatabaseDSN              string
+	AppCredentialKey         string
 	ImageHostProvider        string
 	ImageHostUploadURL       string
 	ImageHostAuthHeader      string
@@ -29,6 +30,7 @@ func Load() Config {
 		Port:                     getEnv("PORT", "8080"),
 		DataDir:                  dataDir,
 		DatabaseDSN:              getEnv("DATABASE_DSN", "postgres://image_web:image_web@localhost:5432/image_web?sslmode=disable"),
+		AppCredentialKey:         getEnv("APP_CREDENTIAL_KEY", ""),
 		ImageHostProvider:        getEnv("IMAGE_HOST_PROVIDER", "http-json"),
 		ImageHostUploadURL:       getEnv("IMAGE_HOST_UPLOAD_URL", "https://2bad.lujilujilujilujiluji.com/"),
 		ImageHostAuthHeader:      getEnv("IMAGE_HOST_AUTH_HEADER", "Authorization"),

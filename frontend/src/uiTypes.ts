@@ -18,6 +18,7 @@ export interface ImageForm {
   moderation: string
   input_fidelity: string
   n: number
+  batch_count: number
   video_ratio: string
   video_resolution: '480p' | '720p' | '1080p'
   video_width: number

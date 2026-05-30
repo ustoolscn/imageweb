@@ -15,7 +15,9 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -27,7 +29,7 @@ import (
 )
 
 type uploader interface {
-	UploadReader(ctx context.Context, filename string, reader io.Reader) (model.UploadedImage, error)
+	UploadReader(ctx context.Context, filename, contentType string, reader io.Reader) (model.UploadedImage, error)
 }
 
 type Client struct {
@@ -82,7 +84,7 @@ func New(cfg config.Config) *Client {
 	}}
 }
 
-func (c *Client) UploadReader(ctx context.Context, filename string, reader io.Reader) (model.UploadedImage, error) {
+func (c *Client) UploadReader(ctx context.Context, filename, contentType string, reader io.Reader) (model.UploadedImage, error) {
 	if c == nil || c.uploader == nil {
 		return model.UploadedImage{}, fmt.Errorf("图床未配置")
 	}
@@ -90,15 +92,25 @@ func (c *Client) UploadReader(ctx context.Context, filename string, reader io.Re
 	if err != nil {
 		return model.UploadedImage{}, err
 	}
-	image, err := c.uploader.UploadReader(ctx, filename, bytes.NewReader(data))
+	uploadContentType := normalizeUploadContentType(filename, contentType, data)
+	image, err := c.uploader.UploadReader(ctx, filename, uploadContentType, bytes.NewReader(data))
 	if err != nil {
 		return model.UploadedImage{}, err
+	}
+	if isVideoUpload(filename, uploadContentType) {
+		frames, err := c.extractVideoFramesFromBytes(ctx, filename, data)
+		if err == nil {
+			image.FirstFrameURL = frames.FirstFrameURL
+			image.LastFrameURL = frames.LastFrameURL
+			image.ThumbnailURL = frames.ThumbnailURL
+		}
+		return image, nil
 	}
 	thumb, err := createThumbnail(data, 480)
 	if err != nil {
 		return image, nil
 	}
-	thumbnail, err := c.uploader.UploadReader(ctx, thumbnailFilename(filename), bytes.NewReader(thumb))
+	thumbnail, err := c.uploader.UploadReader(ctx, thumbnailFilename(filename), "image/jpeg", bytes.NewReader(thumb))
 	if err != nil {
 		return image, nil
 	}
@@ -112,16 +124,127 @@ func (c *Client) UploadFile(ctx context.Context, path string) (model.UploadedIma
 		return model.UploadedImage{}, err
 	}
 	defer file.Close()
-	return c.UploadReader(ctx, filepath.Base(path), file)
+	return c.UploadReader(ctx, filepath.Base(path), contentTypeFromFilename(path), file)
 }
 
-func (u *httpUploader) UploadReader(ctx context.Context, filename string, reader io.Reader) (model.UploadedImage, error) {
+func (c *Client) ExtractVideoFramesFromFile(ctx context.Context, path, filename string) (model.MediaAsset, error) {
+	if c == nil || c.uploader == nil {
+		return model.MediaAsset{}, fmt.Errorf("图床未配置")
+	}
+	if strings.TrimSpace(filename) == "" {
+		filename = filepath.Base(path)
+	}
+	return c.extractAndUploadVideoFrames(ctx, path, filename)
+}
+
+func (c *Client) ExtractVideoFramesFromURL(ctx context.Context, videoURL, filename string) (model.MediaAsset, error) {
+	if c == nil || c.uploader == nil {
+		return model.MediaAsset{}, fmt.Errorf("图床未配置")
+	}
+	videoURL = strings.TrimSpace(videoURL)
+	if videoURL == "" {
+		return model.MediaAsset{}, fmt.Errorf("缺少视频地址")
+	}
+	if strings.TrimSpace(filename) == "" {
+		filename = filenameFromURL(videoURL, "video.mp4")
+	}
+	return c.extractAndUploadVideoFrames(ctx, videoURL, filename)
+}
+
+func (c *Client) extractVideoFramesFromBytes(ctx context.Context, filename string, data []byte) (model.MediaAsset, error) {
+	temp, err := os.CreateTemp("", "image-web-upload-video-*"+filepath.Ext(filename))
+	if err != nil {
+		return model.MediaAsset{}, err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		return model.MediaAsset{}, err
+	}
+	if err := temp.Close(); err != nil {
+		return model.MediaAsset{}, err
+	}
+	return c.extractAndUploadVideoFrames(ctx, tempPath, filename)
+}
+
+func (c *Client) extractAndUploadVideoFrames(ctx context.Context, source, filename string) (model.MediaAsset, error) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return model.MediaAsset{}, fmt.Errorf("ffmpeg 未安装，无法抽取视频帧")
+	}
+	dir, err := os.MkdirTemp("", "image-web-video-frames-*")
+	if err != nil {
+		return model.MediaAsset{}, err
+	}
+	defer os.RemoveAll(dir)
+
+	firstPath := filepath.Join(dir, "first-frame.jpg")
+	lastPath := filepath.Join(dir, "last-frame.jpg")
+	if err := extractVideoFrame(ctx, source, firstPath, false); err != nil {
+		return model.MediaAsset{}, err
+	}
+	first, err := c.uploadFrameFile(ctx, firstPath, frameFilename(filename, "first"))
+	if err != nil {
+		return model.MediaAsset{}, err
+	}
+
+	last := first
+	if err := extractVideoFrame(ctx, source, lastPath, true); err == nil {
+		if uploaded, err := c.uploadFrameFile(ctx, lastPath, frameFilename(filename, "last")); err == nil {
+			last = uploaded
+		}
+	}
+	return model.MediaAsset{
+		Type:          "video",
+		ThumbnailURL:  first.URL,
+		FirstFrameURL: first.URL,
+		LastFrameURL:  last.URL,
+	}, nil
+}
+
+func extractVideoFrame(ctx context.Context, source, output string, tail bool) error {
+	commandCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	args := []string{"-hide_banner", "-loglevel", "error", "-y", "-threads", "1"}
+	if tail {
+		args = append(args, "-sseof", "-0.1")
+	}
+	args = append(args,
+		"-i", source,
+		"-an",
+		"-frames:v", "1",
+		"-vf", "scale=480:480:force_original_aspect_ratio=decrease",
+		"-q:v", "4",
+		output,
+	)
+	cmd := exec.CommandContext(commandCtx, "ffmpeg", args...)
+	if outputData, err := cmd.CombinedOutput(); err != nil {
+		if commandCtx.Err() != nil {
+			return fmt.Errorf("视频抽帧超时")
+		}
+		return fmt.Errorf("视频抽帧失败：%s", strings.TrimSpace(string(outputData)))
+	}
+	return nil
+}
+
+func (c *Client) uploadFrameFile(ctx context.Context, path, filename string) (model.UploadedImage, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return model.UploadedImage{}, err
+	}
+	return c.uploader.UploadReader(ctx, filename, "image/jpeg", bytes.NewReader(data))
+}
+
+func (u *httpUploader) UploadReader(ctx context.Context, filename, contentType string, reader io.Reader) (model.UploadedImage, error) {
 	if strings.TrimSpace(u.UploadURL) == "" {
 		return model.UploadedImage{}, fmt.Errorf("缺少图床上传地址")
 	}
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile(defaultString(u.FieldName, "file"), filename)
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", formDataContentDisposition(defaultString(u.FieldName, "file"), filename))
+	header.Set("Content-Type", defaultString(contentType, "application/octet-stream"))
+	part, err := writer.CreatePart(header)
 	if err != nil {
 		return model.UploadedImage{}, err
 	}
@@ -157,7 +280,7 @@ func (u *httpUploader) UploadReader(ctx context.Context, filename string, reader
 	return parseUploadResponse(data, defaultString(u.ResponseURLPath, "url"))
 }
 
-func (u *localUploader) UploadReader(ctx context.Context, filename string, reader io.Reader) (model.UploadedImage, error) {
+func (u *localUploader) UploadReader(ctx context.Context, filename, contentType string, reader io.Reader) (model.UploadedImage, error) {
 	if strings.TrimSpace(u.Dir) == "" {
 		return model.UploadedImage{}, fmt.Errorf("缺少本地图床目录")
 	}
@@ -256,6 +379,74 @@ func uniqueFilename(filename string) string {
 	return fmt.Sprintf("%s-%s%s", hex.EncodeToString(buf), name, ext)
 }
 
+func normalizeUploadContentType(filename, contentType string, data []byte) string {
+	contentType = strings.TrimSpace(strings.Split(contentType, ";")[0])
+	if contentType != "" && contentType != "application/octet-stream" {
+		return contentType
+	}
+	if inferred := contentTypeFromFilename(filename); inferred != "" {
+		return inferred
+	}
+	if len(data) > 0 {
+		return http.DetectContentType(data)
+	}
+	return "application/octet-stream"
+}
+
+func contentTypeFromFilename(filename string) string {
+	switch strings.ToLower(filepath.Ext(filename)) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".webp":
+		return "image/webp"
+	case ".gif":
+		return "image/gif"
+	case ".mp4", ".m4v":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".mov":
+		return "video/quicktime"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".wav":
+		return "audio/wav"
+	case ".m4a":
+		return "audio/mp4"
+	case ".aac":
+		return "audio/aac"
+	case ".ogg":
+		return "audio/ogg"
+	case ".flac":
+		return "audio/flac"
+	default:
+		return ""
+	}
+}
+
+func isVideoUpload(filename, contentType string) bool {
+	contentType = strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	if strings.HasPrefix(contentType, "video/") {
+		return true
+	}
+	switch strings.ToLower(filepath.Ext(filename)) {
+	case ".mp4", ".m4v", ".webm", ".mov":
+		return true
+	default:
+		return false
+	}
+}
+
+func formDataContentDisposition(fieldName, filename string) string {
+	return fmt.Sprintf(`form-data; name="%s"; filename="%s"`, escapeMultipartQuotes(fieldName), escapeMultipartQuotes(filepath.Base(filename)))
+}
+
+func escapeMultipartQuotes(value string) string {
+	return strings.NewReplacer("\\", "\\\\", `"`, `\"`, "\r", " ", "\n", " ").Replace(value)
+}
+
 func createThumbnail(data []byte, maxSize int) ([]byte, error) {
 	if maxSize <= 0 {
 		maxSize = 480
@@ -270,15 +461,18 @@ func createThumbnail(data []byte, maxSize int) ([]byte, error) {
 	if width <= 0 || height <= 0 {
 		return nil, fmt.Errorf("invalid image size")
 	}
-	if width <= maxSize && height <= maxSize {
-		return data, nil
-	}
-	targetWidth := maxSize
-	targetHeight := maxSize
+	targetWidth := width
+	targetHeight := height
 	if width >= height {
-		targetHeight = height * maxSize / width
+		if width > maxSize {
+			targetWidth = maxSize
+			targetHeight = height * maxSize / width
+		}
 	} else {
-		targetWidth = width * maxSize / height
+		if height > maxSize {
+			targetHeight = maxSize
+			targetWidth = width * maxSize / height
+		}
 	}
 	if targetWidth <= 0 {
 		targetWidth = 1
@@ -309,6 +503,24 @@ func thumbnailFilename(filename string) string {
 		name = "image"
 	}
 	return name + "-thumb.jpg"
+}
+
+func frameFilename(filename, role string) string {
+	ext := filepath.Ext(filename)
+	name := strings.TrimSuffix(filepath.Base(filename), ext)
+	if name == "" {
+		name = "video"
+	}
+	return name + "-" + role + "-frame.jpg"
+}
+
+func filenameFromURL(value, fallback string) string {
+	parts := strings.Split(strings.TrimSpace(value), "?")
+	name := filepath.Base(parts[0])
+	if name == "." || name == "/" || name == "" {
+		return fallback
+	}
+	return name
 }
 
 func joinURL(baseURL, name string) string {

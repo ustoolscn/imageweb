@@ -3,6 +3,8 @@ export type TaskStatus = 'pending' | 'running' | 'succeeded' | 'failed'
 export interface UploadedImage {
   url: string
   thumbnail_url?: string
+  first_frame_url?: string
+  last_frame_url?: string
   filename?: string
   node_id?: string
   reference_label?: string
@@ -18,6 +20,8 @@ export interface MediaAsset {
   type?: 'video' | 'audio' | string
   url: string
   thumbnail_url?: string
+  first_frame_url?: string
+  last_frame_url?: string
   filename?: string
   node_id?: string
   reference_label?: string
@@ -110,6 +114,7 @@ export interface PlazaItem {
   id: string
   item_type?: 'task' | 'canvas'
   task_id: string
+  canvas_id?: string
   canvas_name?: string
   canvas?: unknown
   task_type: 'image_generation' | 'video_generation'

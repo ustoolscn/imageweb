@@ -23,7 +23,7 @@ type App struct {
 }
 
 func New(ctx context.Context, cfg config.Config) (*App, error) {
-	store, err := db.Open(cfg.DatabaseDSN)
+	store, err := db.Open(cfg.DatabaseDSN, cfg.AppCredentialKey)
 	if err != nil {
 		return nil, err
 	}

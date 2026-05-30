@@ -4,7 +4,6 @@ import type { Task } from '../types'
 import { imageSizeLabel } from '../lib/sizes'
 import { canShareTask, formatTime, isFavorite, isVideoTask, maskBaseURL, queueText, statusText, taskReferenceImages, timeText } from '../lib/view'
 import { videoRatioLabel } from '../lib/videoModels'
-import { ensureVideoCover, videoCoverURL } from '../lib/videoCover'
 import AppIcon from './AppIcon.vue'
 
 const props = defineProps<{
@@ -37,7 +36,7 @@ const mediaTransform = computed(() => ({
   transform: `translate(calc(-50% + ${mediaPan.value.x}px), calc(-50% + ${mediaPan.value.y}px)) scale(${mediaZoom.value})`,
 }))
 const detailVideo = computed(() => props.task.result_videos?.[0])
-const detailVideoCover = computed(() => detailVideo.value?.thumbnail_url || videoCoverURL(detailVideo.value?.url))
+const detailVideoCover = computed(() => detailVideo.value?.thumbnail_url || detailVideo.value?.first_frame_url || '')
 
 function clampZoom(value: number) {
   return Math.min(6, Math.max(1, value))
@@ -90,7 +89,6 @@ onMounted(() => {
   document.body.style.overflow = 'hidden'
   document.documentElement.style.overflow = 'hidden'
   window.addEventListener('keydown', closeOnEscape)
-  if (detailVideo.value?.url && !detailVideo.value.thumbnail_url) ensureVideoCover(detailVideo.value.url).catch(() => {})
   nextTick(() => {
     const video = videoRef.value
     if (!video) return
@@ -125,14 +123,14 @@ onBeforeUnmount(() => {
         @pointercancel="stopMediaPan"
       >
         <template v-if="isVideoTask(task) && detailVideo?.url">
-          <img v-if="!videoReady && detailVideoCover" class="detail-video-poster" :src="detailVideoCover" alt="视频封面" draggable="false" />
+          <img v-if="!videoReady && detailVideoCover" class="detail-video-poster" :src="detailVideoCover" alt="视频封面" draggable="false" crossorigin="anonymous" />
           <div v-if="!videoReady" class="detail-video-loading">
             <span></span>
             <strong>正在加载视频</strong>
           </div>
-          <video ref="videoRef" class="detail-video" :class="{ ready: videoReady }" :src="detailVideo.url" :controls="videoReady" autoplay playsinline preload="auto" :style="mediaTransform" @loadeddata="videoReady = true" @canplay="videoReady = true" />
+          <video ref="videoRef" class="detail-video" :class="{ ready: videoReady }" :src="detailVideo.url" :controls="videoReady" autoplay playsinline preload="auto" crossorigin="anonymous" :style="mediaTransform" @loadeddata="videoReady = true" @canplay="videoReady = true" />
         </template>
-        <img v-else-if="task.result_images?.[0]?.url" :src="task.result_images[0].url" alt="生成结果" loading="lazy" decoding="async" draggable="false" :style="mediaTransform" />
+        <img v-else-if="task.result_images?.[0]?.url" :src="task.result_images[0].url" alt="生成结果" loading="lazy" decoding="async" draggable="false" crossorigin="anonymous" :style="mediaTransform" />
         <div v-else class="detail-state">
           <span>{{ task.status === 'failed' ? '!' : '...' }}</span>
           <p>{{ task.error_message || statusText(task.status) }}</p>
@@ -147,7 +145,7 @@ onBeforeUnmount(() => {
           <div class="section-title">参考图片</div>
           <div class="detail-references">
             <button v-for="(image, index) in taskReferenceImages(task)" :key="`${image.url}-${index}`" type="button" @click="emit('openPreview', image.url, image.filename || `参考图 ${index + 1}`, $event, image.mask_url)">
-              <img :src="image.url" :alt="image.filename || '参考图'" loading="lazy" decoding="async" />
+              <img :src="image.url" :alt="image.filename || '参考图'" loading="lazy" decoding="async" crossorigin="anonymous" />
               <span>{{ image.filename || `参考 ${index + 1}` }}{{ image.mask_url ? ' · 蒙板' : '' }}</span>
             </button>
           </div>

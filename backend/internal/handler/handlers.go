@@ -36,6 +36,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/models", h.models)
 	mux.HandleFunc("/api/llm", h.llm)
 	mux.HandleFunc("/api/upload", h.upload)
+	mux.HandleFunc("/api/video-frames", h.videoFrames)
 	mux.HandleFunc("/api/mask-preview", h.maskPreview)
 	mux.HandleFunc("/api/canvases", h.canvases)
 	mux.HandleFunc("/api/canvases/share", h.shareCanvas)
@@ -64,9 +65,72 @@ func (h *Handler) canvases(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, state)
+	case http.MethodPatch:
+		var req model.CanvasPatchRequest
+		if !decodeJSONLimit(w, r, &req, 64<<20) {
+			return
+		}
+		if req.APIKey == "" || req.BaseURL == "" {
+			writeError(w, http.StatusBadRequest, "缺少 baseurl 或 apikey")
+			return
+		}
+		for _, canvas := range req.Canvases {
+			if !json.Valid(canvas) {
+				writeError(w, http.StatusBadRequest, "画布数据不是有效 JSON")
+				return
+			}
+			var raw struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(canvas, &raw); err != nil || strings.TrimSpace(raw.ID) == "" {
+				writeError(w, http.StatusBadRequest, "画布数据必须包含 id")
+				return
+			}
+		}
+		for _, patch := range req.CanvasPatches {
+			if strings.TrimSpace(patch.ID) == "" {
+				writeError(w, http.StatusBadRequest, "画布补丁必须包含 id")
+				return
+			}
+			for _, element := range patch.Elements {
+				if !json.Valid(element) {
+					writeError(w, http.StatusBadRequest, "画布节点补丁不是有效 JSON")
+					return
+				}
+				var raw struct {
+					ID string `json:"id"`
+				}
+				if err := json.Unmarshal(element, &raw); err != nil || strings.TrimSpace(raw.ID) == "" {
+					writeError(w, http.StatusBadRequest, "画布节点补丁必须包含 id")
+					return
+				}
+			}
+			for _, connection := range patch.Connections {
+				if !json.Valid(connection) {
+					writeError(w, http.StatusBadRequest, "画布连线补丁不是有效 JSON")
+					return
+				}
+				var raw struct {
+					ID string `json:"id"`
+				}
+				if err := json.Unmarshal(connection, &raw); err != nil || strings.TrimSpace(raw.ID) == "" {
+					writeError(w, http.StatusBadRequest, "画布连线补丁必须包含 id")
+					return
+				}
+			}
+		}
+		if !h.allowBaseURL(w, r, req.BaseURL) {
+			return
+		}
+		state, err := h.Store.PatchCanvasState(r.Context(), req.APIKey, req.BaseURL, req.Canvases, req.CanvasPatches, req.DeletedCanvasIDs)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, model.CanvasSaveResponse{UpdatedAt: state.UpdatedAt})
 	case http.MethodPut:
 		var req model.CanvasStateRequest
-		if !decodeJSON(w, r, &req) {
+		if !decodeJSONLimit(w, r, &req, 64<<20) {
 			return
 		}
 		if req.APIKey == "" || req.BaseURL == "" {
@@ -90,7 +154,7 @@ func (h *Handler) canvases(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, state)
+		writeJSON(w, http.StatusOK, model.CanvasSaveResponse{UpdatedAt: state.UpdatedAt})
 	default:
 		methodNotAllowed(w)
 	}
@@ -117,7 +181,7 @@ func (h *Handler) shareCanvas(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "缺少画布 id")
 			return
 		}
-		if err := h.Store.UnshareCanvasFromPlaza(r.Context(), req.CanvasID); err != nil {
+		if err := h.Store.UnshareCanvasFromPlaza(r.Context(), req.APIKey, req.BaseURL, req.CanvasID); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -253,12 +317,50 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	image, err := h.ImageHost.UploadReader(r.Context(), header.Filename, file)
+	image, err := h.ImageHost.UploadReader(r.Context(), header.Filename, header.Header.Get("Content-Type"), file)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "url": image.URL, "data": image})
+}
+
+func (h *Handler) videoFrames(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if h.ImageHost == nil {
+		writeError(w, http.StatusInternalServerError, "图床未配置")
+		return
+	}
+	var req struct {
+		URL      string `json:"url"`
+		Filename string `json:"filename"`
+	}
+	if !decodeJSONLimit(w, r, &req, 8<<10) {
+		return
+	}
+	req.URL = strings.TrimSpace(req.URL)
+	if req.URL == "" {
+		writeError(w, http.StatusBadRequest, "缺少视频地址")
+		return
+	}
+	parsed, err := url.Parse(req.URL)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		writeError(w, http.StatusBadRequest, "视频地址无效")
+		return
+	}
+	frames, err := h.ImageHost.ExtractVideoFramesFromURL(r.Context(), req.URL, req.Filename)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	frames.URL = req.URL
+	if frames.Filename == "" {
+		frames.Filename = defaultString(req.Filename, filenameFromURL(req.URL, "reference-video.mp4"))
+	}
+	writeJSON(w, http.StatusOK, frames)
 }
 
 func (h *Handler) maskPreview(w http.ResponseWriter, r *http.Request) {
@@ -743,6 +845,7 @@ func (h *Handler) retryTask(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	newTask := *oldTask
 	newTask.ID = uuid.NewString()
+	newTask.APIKey = apiKey
 	newTask.BaseURL = strings.TrimSpace(baseURL)
 	newTask.Status = model.TaskPending
 	newTask.FinalPrompt = ""
@@ -848,8 +951,12 @@ func maskBaseURL(value string) string {
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
+	return decodeJSONLimit(w, r, target, 2<<20)
+}
+
+func decodeJSONLimit(w http.ResponseWriter, r *http.Request, target any, limit int64) bool {
 	defer r.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+	data, err := io.ReadAll(io.LimitReader(r.Body, limit))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "读取请求失败")
 		return false
@@ -880,6 +987,24 @@ func defaultString(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func filenameFromURL(value, fallback string) string {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil {
+		return fallback
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	if path == "" {
+		return fallback
+	}
+	if index := strings.LastIndex(path, "/"); index >= 0 {
+		path = path[index+1:]
+	}
+	if path == "" {
+		return fallback
+	}
+	return path
 }
 
 func cleanMediaAssets(items []model.MediaAsset, assetType string) []model.MediaAsset {

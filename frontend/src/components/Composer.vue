@@ -47,6 +47,7 @@ const referenceAssetIcons = computed(() => showVideoFrameRoles.value ? ['image']
 const promptEditor = ref<HTMLDivElement | null>(null)
 const mentionMenu = ref<{ query: string; start: number; end: number; activeIndex: number } | null>(null)
 const suppressMentionMenuAfterDelete = ref(false)
+const promptComposing = ref(false)
 const builtinImageModels = ['gpt-image-2', 'nano-banana-2', 'doubao-seedream-5.0-lite']
 const builtinVideoModels = ['doubao-seedance-2.0', 'doubao-seedance-1.5-pro']
 const imageModelOptions = computed(() => [...builtinImageModels])
@@ -60,7 +61,6 @@ const videoModelOptions = computed(() => {
 })
 const isNanoBanana = computed(() => props.form.model === 'nano-banana-2')
 const isSeedream = computed(() => props.form.model === 'doubao-seedream-5.0-lite')
-const supportsTransparentBackground = computed(() => props.form.output_format === 'png')
 const supportsOutputCompression = computed(() => props.form.output_format === 'jpeg' || props.form.output_format === 'webp')
 const sizeLabel = computed(() => '尺寸')
 const videoSizeLabel = computed(() => `${props.form.video_resolution.toUpperCase()} ${videoRatioLabel(props.form.video_ratio)}`)
@@ -74,11 +74,6 @@ const formatOptions = computed(() => [
   { value: 'png', label: 'png', caption: '无损图片' },
   { value: 'jpeg', label: 'jpeg', caption: '较小体积' },
   ...(!isSeedream.value ? [{ value: 'webp', label: 'webp', caption: '高压缩图片' }] : []),
-])
-const backgroundOptions = computed(() => [
-  { value: 'auto', label: 'auto', caption: '自动背景' },
-  ...(supportsTransparentBackground.value ? [{ value: 'transparent', label: 'transparent', caption: '透明背景' }] : []),
-  { value: 'opaque', label: 'opaque', caption: '不透明背景' },
 ])
 const moderationOptions = [
   { value: 'low', label: 'low', caption: '低审核' },
@@ -138,6 +133,7 @@ function textValue(event: Event) {
 
 function onPromptInput(event: Event) {
   const target = event.currentTarget as HTMLElement
+  if (promptComposing.value || (event as InputEvent).isComposing) return
   const cursor = editorCaretOffset(target)
   const text = editorPlainText(target)
   emit('updateField', 'prompt', text)
@@ -151,6 +147,7 @@ function onPromptInput(event: Event) {
 }
 
 function onPromptKeyup(event: KeyboardEvent) {
+  if (promptComposing.value || event.isComposing) return
   if (event.key === 'Backspace' || event.key === 'Delete') {
     mentionMenu.value = null
     suppressMentionMenuAfterDelete.value = false
@@ -161,6 +158,7 @@ function onPromptKeyup(event: KeyboardEvent) {
 }
 
 function onPromptKeydown(event: KeyboardEvent) {
+  if (promptComposing.value || event.isComposing) return
   if (event.key === 'Backspace' || event.key === 'Delete') {
     handlePromptDelete(event)
     return
@@ -178,6 +176,21 @@ function onPromptKeydown(event: KeyboardEvent) {
   } else if (event.key === 'Escape') {
     mentionMenu.value = null
   }
+}
+
+function onPromptCompositionStart() {
+  promptComposing.value = true
+  mentionMenu.value = null
+}
+
+function onPromptCompositionEnd(event: CompositionEvent) {
+  promptComposing.value = false
+  const target = event.currentTarget as HTMLElement
+  const cursor = editorCaretOffset(target)
+  const text = editorPlainText(target)
+  emit('updateField', 'prompt', text)
+  updateMentionMenu(target, cursor, text)
+  nextTick(() => setEditorCaret(cursor))
 }
 
 function handlePromptDelete(event: KeyboardEvent) {
@@ -426,7 +439,7 @@ function nextFrameRole(current: UploadedImage['video_frame_role'], target: Uploa
 
     <div class="prompt-row">
       <div class="composer-prompt-wrap">
-        <div ref="promptEditor" class="composer-rich-prompt" contenteditable="true" :data-placeholder="form.task_type === 'video_generation' ? '描述你想生成的视频，可输入 @ 引用参考...' : '描述你想生成的图片，可输入 @ 引用参考...'" @input="onPromptInput" @keyup="onPromptKeyup" @keydown="onPromptKeydown" @paste="onPromptPasteLocal" v-html="highlightedPrompt"></div>
+        <div ref="promptEditor" class="composer-rich-prompt" contenteditable="true" :data-placeholder="form.task_type === 'video_generation' ? '描述你想生成的视频，可输入 @ 引用参考...' : '描述你想生成的图片，可输入 @ 引用参考...'" @input="onPromptInput" @keyup="onPromptKeyup" @keydown="onPromptKeydown" @compositionstart="onPromptCompositionStart" @compositionend="onPromptCompositionEnd" @paste="onPromptPasteLocal" v-html="highlightedPrompt"></div>
         <div v-if="mentionMenu && mentionCandidates.length" class="composer-mention-menu">
           <button v-for="(item, index) in mentionCandidates" :key="item.label" type="button" :class="{ active: mentionMenu.activeIndex === index }" @pointerenter="mentionMenu.activeIndex = index" @mousedown.prevent="insertMention(item.label)">
             <strong>@{{ item.label }}</strong>
@@ -439,7 +452,7 @@ function nextFrameRole(current: UploadedImage['video_frame_role'], target: Uploa
 
     <div v-if="reusedReferenceImages.length || referenceImages.length || referenceVideos.length || referenceAudios.length" class="preview-strip">
       <div v-for="({ image, label, masked, frameRoleLabel }, index) in reusedReferenceImagesWithLabels" :key="image.url" class="input-thumb reused">
-        <img :src="displayImageURL(image)" alt="参考图" loading="lazy" decoding="async" @click="emit('openEditablePreview', 'reused', index, image.url, label, $event)" />
+        <img :src="displayImageURL(image)" alt="参考图" loading="lazy" decoding="async" crossorigin="anonymous" @click="emit('openEditablePreview', 'reused', index, image.url, label, $event)" />
         <span>{{ label }}{{ frameRoleLabel ? ` · ${frameRoleLabel}` : '' }}{{ masked ? ' · 蒙版' : '' }}</span>
         <div v-if="showVideoFrameRoles" class="frame-role-controls">
           <button type="button" :class="{ active: image.video_frame_role === 'first_frame' }" @click.stop="emit('updateReferenceFrameRole', 'reused', index, nextFrameRole(image.video_frame_role, 'first_frame'))">首</button>
@@ -448,7 +461,7 @@ function nextFrameRole(current: UploadedImage['video_frame_role'], target: Uploa
         <button type="button" @click="emit('removeReusedReference', index)"><AppIcon name="close" :size="12" /></button>
       </div>
       <div v-for="({ image, label, masked, frameRoleLabel }, index) in referenceImagesWithLabels" :key="image.preview_url" class="input-thumb" :class="{ uploading: image.uploading, failed: image.upload_error }">
-        <img :src="image.preview_url" alt="参考图" @click="emit('openEditablePreview', 'new', index, image.preview_url, label, $event)" />
+        <img :src="image.preview_url" alt="参考图" crossorigin="anonymous" @click="emit('openEditablePreview', 'new', index, image.preview_url, label, $event)" />
         <span>{{ label }}{{ frameRoleLabel ? ` · ${frameRoleLabel}` : '' }}{{ masked ? ' · 蒙版' : '' }}{{ image.uploading ? ' · 上传中' : '' }}{{ image.upload_error ? ' · 上传失败' : '' }}</span>
         <div v-if="showVideoFrameRoles" class="frame-role-controls">
           <button type="button" :class="{ active: image.video_frame_role === 'first_frame' }" @click.stop="emit('updateReferenceFrameRole', 'new', index, nextFrameRole(image.video_frame_role, 'first_frame'))">首</button>
@@ -458,7 +471,7 @@ function nextFrameRole(current: UploadedImage['video_frame_role'], target: Uploa
       </div>
       <div v-for="(video, index) in referenceVideos" :key="video.reference_label || video.url || `video-${index}`" class="input-thumb video-thumb" :class="{ uploading: video.loading, failed: video.error }">
         <button type="button" class="media-thumb-open" :disabled="!video.url" @click="emit('openReferenceMediaPreview', 'video', video.url, referenceLabel(video, `视频${index + 1}`), $event)">
-          <img v-if="video.cover_url" :src="video.cover_url" alt="参考视频封面" />
+          <img v-if="video.cover_url" :src="video.cover_url" alt="参考视频封面" crossorigin="anonymous" />
           <span v-else class="audio-mark">视频</span>
         </button>
         <span>{{ referenceLabel(video, `视频${index + 1}`) }}{{ video.loading ? ' · 上传中' : '' }}{{ video.error ? ' · 失败' : '' }}</span>
@@ -484,7 +497,7 @@ function nextFrameRole(current: UploadedImage['video_frame_role'], target: Uploa
           <InlineSelect v-if="!isNanoBanana && !isSeedream" label="质量" :model-value="form.quality" :options="qualityOptions" @update:model-value="emit('updateField', 'quality', $event)" />
           <InlineSelect v-if="!isNanoBanana" label="格式" :model-value="form.output_format" :options="formatOptions" @update:model-value="emit('updateField', 'output_format', $event)" />
           <label v-if="!isNanoBanana && !isSeedream && supportsOutputCompression" class="composer-number-field"><span>压缩</span><input :value="form.output_compression" type="number" min="0" max="100" @input="emit('updateField', 'output_compression', numberValue($event))" /></label>
-          <InlineSelect v-if="!isSeedream" label="背景" :model-value="form.background" :options="backgroundOptions" @update:model-value="emit('updateField', 'background', $event)" />
+          <label class="composer-number-field"><span>数量</span><input :value="form.batch_count" type="number" min="1" max="5" step="1" @input="emit('updateField', 'batch_count', numberValue($event))" /></label>
           <InlineSelect v-if="!isSeedream" label="审核" :model-value="form.moderation" :options="moderationOptions" @update:model-value="emit('updateField', 'moderation', $event)" />
           <InlineSelect v-if="!isNanoBanana && !isSeedream" label="保真" :model-value="form.input_fidelity" :options="fidelityOptions" @update:model-value="emit('updateField', 'input_fidelity', $event)" />
         </div>

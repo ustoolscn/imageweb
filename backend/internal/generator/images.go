@@ -150,9 +150,11 @@ func buildPayload(task *model.Task, finalPrompt string) (map[string]any, error) 
 		"size":           size,
 		"quality":        normalizeGPTImage2Quality(task.Quality),
 		"output_format":  normalizeOutputFormat(task.OutputFormat),
-		"background":     normalizeGPTImage2Background(task.Background),
 		"moderation":     normalizeModeration(task.Moderation),
 		"input_fidelity": normalizeInputFidelity(task.InputFidelity),
+	}
+	if !isGPTImage2Model(task) {
+		payload["background"] = normalizeGPTImage2Background(task.Background)
 	}
 	if payload["output_format"] == "webp" || payload["output_format"] == "jpeg" {
 		payload["output_compression"] = clamp(task.OutputCompression, 0, 100)
@@ -174,6 +176,10 @@ func isNanoBananaModel(task *model.Task) bool {
 func isSeedreamLiteModel(task *model.Task) bool {
 	model := strings.TrimSpace(imageModel(task))
 	return strings.EqualFold(model, "doubao-seedream-5.0-lite")
+}
+
+func isGPTImage2Model(task *model.Task) bool {
+	return strings.EqualFold(imageModel(task), "gpt-image-2")
 }
 
 func (c *Client) generateSeedreamLite(ctx context.Context, task *model.Task, finalPrompt string) (GenerateResult, error) {
@@ -659,7 +665,8 @@ func (c *Client) materializeNanoBananaImages(task *model.Task, responseData []by
 			if inlineData == nil || strings.TrimSpace(inlineData.Data) == "" {
 				continue
 			}
-			file, err := c.materializeInlineImage(task.ID, len(files), inlineData.mimeType(), inlineData.Data)
+			index := len(files)
+			file, err := c.materializeInlineImage(task.ID, index, inlineData.mimeType(), inlineData.Data)
 			if err != nil {
 				return files, err
 			}
@@ -1044,8 +1051,10 @@ func buildEditRequestSummary(task *model.Task, finalPrompt string) (map[string]s
 		"size":          size,
 		"quality":       normalizeGPTImage2Quality(task.Quality),
 		"output_format": format,
-		"background":    normalizeGPTImage2Background(task.Background),
 		"moderation":    normalizeModeration(task.Moderation),
+	}
+	if !isGPTImage2Model(task) {
+		payload["background"] = normalizeGPTImage2Background(task.Background)
 	}
 	if task.Stream {
 		payload["stream"] = "true"

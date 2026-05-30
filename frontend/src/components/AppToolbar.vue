@@ -77,7 +77,7 @@ function updateStatus(value: string) {
   <header class="toolbar glass-panel">
     <div class="brand">
       <div class="brand-logo">
-        <img v-if="siteIcon.startsWith('http://') || siteIcon.startsWith('https://')" :src="siteIcon" alt="站点图标" />
+        <img v-if="siteIcon.startsWith('http://') || siteIcon.startsWith('https://')" :src="siteIcon" alt="站点图标" crossorigin="anonymous" />
         <span v-else>{{ siteIcon }}</span>
       </div>
       <div class="brand-copy">

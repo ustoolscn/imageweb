@@ -412,7 +412,7 @@ onUnmounted(() => {
           :class="{ zoomed: zoom > 1, dragging: isDragging, 'tool-pan': maskTool === 'pan' }"
           @wheel="onWheel"
         >
-          <img :ref="setBaseImage" :src="image.url" :alt="image.label" :style="zoomStyle" @load="emit('imageLoad')" />
+          <img :ref="setBaseImage" :src="image.url" :alt="image.label" :style="zoomStyle" crossorigin="anonymous" @load="emit('imageLoad')" />
           <canvas :ref="setCanvas" :style="zoomStyle" @pointerdown.stop.prevent="startMaskPaint" @pointermove.stop.prevent="moveMaskPaint" @pointerup.stop.prevent="stopMaskPaint" @pointercancel.stop.prevent="stopMaskPaint" />
         </div>
         <div class="mask-tools">
@@ -439,8 +439,8 @@ onUnmounted(() => {
       >
         <div v-if="!imageLoaded" class="image-viewer-placeholder">加载原图中</div>
         <div class="zoom-content" :style="zoomStyle">
-          <img :src="image.url" :alt="image.label" @load="markImageLoaded" />
-          <img v-if="readonlyMaskOverlayUrl" class="readonly-mask-overlay" :src="readonlyMaskOverlayUrl" alt="蒙板" />
+          <img :src="image.url" :alt="image.label" crossorigin="anonymous" @load="markImageLoaded" />
+          <img v-if="readonlyMaskOverlayUrl" class="readonly-mask-overlay" :src="readonlyMaskOverlayUrl" alt="蒙板" crossorigin="anonymous" />
         </div>
       </div>
       <div
@@ -455,7 +455,7 @@ onUnmounted(() => {
         @dblclick="resetZoom"
       >
         <div v-if="!imageLoaded" class="image-viewer-placeholder">加载原图中</div>
-        <img class="zoom-content" :style="zoomStyle" :src="image.url" :alt="image.label" @load="markImageLoaded" />
+        <img class="zoom-content" :style="zoomStyle" :src="image.url" :alt="image.label" crossorigin="anonymous" @load="markImageLoaded" />
       </div>
       <div v-if="!image.editable" class="zoom-controls" @click.stop>
         <span>{{ Math.round(zoom * 100) }}%</span>

@@ -12,6 +12,7 @@
 - 支持参考图上传、复用任务配置、图片预览放大。
 - 上传参考图和生成结果都会转存到图床后保存。
 - 后端自动生成缩略图，列表、广场和参考图区域优先加载缩略图，降低弱网下的图片加载压力。
+- 视频素材会在上传、URL 导入或生成完成时固化首帧/尾帧图片，列表、广场和画布使用这些图片做封面和尾帧输入，不再由浏览器临时跨域读取视频抽帧。
 - Docker 一键部署，允许 iframe 嵌入。
 
 ## 使用方式
@@ -58,6 +59,7 @@ http://localhost:8080
 默认 Docker Compose 只启动 `image-web` 服务：
 
 - 图片会转存到配置的图床；应用临时文件使用系统临时目录，不需要额外挂载持久化目录。
+- 镜像内置 `ffmpeg`，用于视频首帧/尾帧抽取；每次只抽取最长边约 480px 的 JPEG，失败不会阻断原视频保存。若本地直接 `go run ./cmd/server`，需要自行安装 `ffmpeg` 并确保命令在 `PATH` 中，否则后端不会生成 `thumbnail_url`、`first_frame_url`、`last_frame_url`。
 - 使用 `docker-compose.postgres.yml` 时会额外启动 `postgres`，并把 PostgreSQL 数据保存在 Docker volume：`postgres-data`。
 
 ## 环境变量
@@ -66,6 +68,7 @@ http://localhost:8080
 | --- | --- | --- |
 | `PORT` | `8080` | 后端监听端口 |
 | `DATABASE_DSN` | 无 | PostgreSQL 连接串；远程数据库部署必填 |
+| `APP_CREDENTIAL_KEY` | 无 | 加密保存上游 API Key 的应用密钥；必填，部署后需保持稳定 |
 | `IMAGE_HOST_PROVIDER` | `http-json` | 图床适配器：`http-json` / `local` |
 | `IMAGE_HOST_UPLOAD_URL` | `https://2bad.lujilujilujilujiluji.com/` | HTTP 图床上传接口 |
 | `IMAGE_HOST_AUTH_HEADER` | `Authorization` | HTTP 图床鉴权 header 名；留空则不发送 |
@@ -113,32 +116,39 @@ IMAGE_HOST_PUBLIC_BASE_URL=https://your-domain.com/uploads/
 
 后端在上传参考图和生成结果时，会额外生成最长边约 480px 的缩略图，并通过同一图床适配器上传。缩略图生成或上传失败不会阻断原图保存；前端会在列表、广场、详情参考图等小图场景优先使用 `thumbnail_url`，点击预览、下载、复用配置和蒙板编辑仍使用原图 `url`。
 
+视频素材会额外保存 `first_frame_url` 和 `last_frame_url`。本地上传视频、URL 导入视频和生成完成的视频都会尽量抽取这两个字段，其中 URL 视频通过后端 `/api/video-frames` 拉取并抽帧，避免浏览器因 CORS 无法读取远程视频；画布尾帧节点优先直接使用 `last_frame_url`。
+
 ## 数据库配置
 
-当前项目只支持 PostgreSQL。后端启动时会通过 `DATABASE_DSN` 连接数据库，并自动创建所需表和索引。
+当前项目只支持 PostgreSQL。后端启动时会通过 `DATABASE_DSN` 连接数据库，并按最新 schema 自动创建所需表和索引；如果检测到旧 schema，会直接拒绝启动，请使用空库或重建数据库。
 
 默认 Docker Compose 不启动 PostgreSQL，请在 `.env` 中配置远程数据库连接：
 
 ```env
 DATABASE_DSN=postgres://user:password@host:5432/image_web?sslmode=require
+APP_CREDENTIAL_KEY=change-me-to-a-random-secret-at-least-32-chars
 ```
 
 如果使用内置 PostgreSQL，叠加 `docker-compose.postgres.yml`，连接信息固定在该文件中：
 
 ```env
 DATABASE_DSN=postgres://image_web:image_web@postgres:5432/image_web?sslmode=disable
+APP_CREDENTIAL_KEY=change-me-to-a-random-secret-at-least-32-chars
 ```
 
 直接编译或 `go run` 部署时，改成你的 PostgreSQL 地址；本机数据库通常使用 `localhost`，Supabase 等云数据库通常需要 `sslmode=require`：
 
 ```env
 DATABASE_DSN=postgres://user:password@localhost:5432/image_web?sslmode=disable
+APP_CREDENTIAL_KEY=change-me-to-a-random-secret-at-least-32-chars
 # Supabase pooler 示例：postgresql://user:password@host:6543/postgres?sslmode=require&default_query_exec_mode=simple_protocol
 ```
 
 项目提供 `.env.example`，部署时复制为 `.env` 并修改即可。`.env` 会被 `.gitignore` 忽略，适合保存数据库密码等本地配置。
 
-旧 SQLite / MySQL 数据不会自动迁移到 PostgreSQL；如果需要迁移历史数据，请单独导出旧数据并导入 PostgreSQL。
+`APP_CREDENTIAL_KEY` 用于 AES-GCM 加密用户通过页面传入的上游 API Key。生产环境请设置为随机长字符串，并在升级、重启、重建容器时保持不变；如果更换该值，历史任务所属 workspace 中保存的 API Key 将无法解密，后台运行/轮询任务会失败。
+
+数据库当前采用 workspace + 任务拆表结构：`workspaces` 保存 `base_url + api_key_hash` 和加密后的 API Key，`tasks` 保存轻量任务状态与参数，`task_sources` 保存请求/响应源数据，`task_media_assets` 保存参考素材和结果素材及视频首尾帧字段，`canvases` 一张画布一行，`plaza_items` / `plaza_likes` 保存广场分享与点赞。旧 SQLite / MySQL 数据、旧 PostgreSQL 宽表结构不会自动迁移；如果需要历史数据，请单独导出并按新结构导入。
 
 ## 本地开发
 
@@ -210,7 +220,7 @@ go test ./...
 
 ## 注意事项
 
-- 后端会以明文保存 `apikey`，用于任务归属查询和后台异步生成。
+- 后端不会在任务/画布表中明文保存 `apikey`；workspace 表只保存 hash 和加密后的 API Key。
 - 当前只支持 PostgreSQL；请不要再配置 SQLite / MySQL 相关变量。
 - 请不要把 `.env`、`data/`、`node_modules/` 或构建产物提交到仓库。
 - 当前项目的 `.gitignore` 已默认排除这些本地文件。

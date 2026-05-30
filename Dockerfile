@@ -16,7 +16,7 @@ COPY backend/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/image-web ./cmd/server
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates ffmpeg
 WORKDIR /app
 COPY --from=backend /out/image-web /app/image-web
 COPY --from=frontend /src/frontend/dist /app/static

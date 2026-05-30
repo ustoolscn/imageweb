@@ -54,6 +54,8 @@ function syncSource() {
 }
 
 function configureVideoElement(video: HTMLVideoElement) {
+  video.crossOrigin = 'anonymous'
+  video.setAttribute('crossorigin', 'anonymous')
   video.disablePictureInPicture = true
   video.setAttribute('disablepictureinpicture', '')
   video.setAttribute('controlsList', 'noremoteplayback')
@@ -74,6 +76,6 @@ function emitDuration() {
 
 <template>
   <div class="canvas-video-player" @pointerdown.stop>
-    <video ref="videoEl" class="video-js vjs-big-play-centered" playsinline disablepictureinpicture controlslist="noremoteplayback"></video>
+    <video ref="videoEl" class="video-js vjs-big-play-centered" playsinline crossorigin="anonymous" disablepictureinpicture controlslist="noremoteplayback"></video>
   </div>
 </template>

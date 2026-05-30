@@ -18,6 +18,8 @@ type CanvasElementLike = {
   media_type?: unknown
   media_url?: unknown
   media_thumbnail_url?: unknown
+  media_first_frame_url?: unknown
+  media_last_frame_url?: unknown
   media_filename?: unknown
   width?: unknown
   height?: unknown
@@ -101,7 +103,7 @@ function localMediaFromElement(element: CanvasElementLike): CanvasPreviewMedia |
     return {
       type: 'video',
       url,
-      thumbnail_url: stringValue(element.media_thumbnail_url),
+      thumbnail_url: stringValue(element.media_thumbnail_url) || stringValue(element.media_first_frame_url),
       label: stringValue(element.media_filename) || '画布视频',
     }
   }
@@ -133,7 +135,7 @@ function videoPreview(video: MediaAsset, element: CanvasElementLike): CanvasPrev
   return {
     type: 'video',
     url: video.url,
-    thumbnail_url: video.thumbnail_url,
+    thumbnail_url: video.thumbnail_url || video.first_frame_url,
     label: video.filename || stringValue(element.kind) || '画布视频',
     width: positiveNumber(video.width) || positiveNumber(element.task_snapshot?.video_width),
     height: positiveNumber(video.height) || positiveNumber(element.task_snapshot?.video_height),

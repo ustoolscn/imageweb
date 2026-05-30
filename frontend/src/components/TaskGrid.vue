@@ -1,10 +1,9 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { ref } from 'vue'
 import type { Task } from '../types'
 import { canOpenSource, canShareTask, displayImageURL, isFavorite, isVideoTask, queueText, statusClass, statusText, taskReferenceImages, timeText } from '../lib/view'
 import { imageSizeLabel } from '../lib/sizes'
 import { videoRatioLabel } from '../lib/videoModels'
-import { ensureVideoCover, videoCoverURL } from '../lib/videoCover'
 import AppIcon from './AppIcon.vue'
 
 const loadedImages = ref(new Set<string>())
@@ -42,15 +41,8 @@ function isImageLoaded(url?: string) {
 
 function taskVideoCover(task: Task) {
   const video = task.result_videos?.[0]
-  return video?.thumbnail_url || videoCoverURL(video?.url)
+  return video?.thumbnail_url || video?.first_frame_url || ''
 }
-
-watch(() => props.tasks, (tasks) => {
-  tasks.forEach((task) => {
-    const video = task.result_videos?.[0]
-    if (isVideoTask(task) && video?.url && !video.thumbnail_url) ensureVideoCover(video.url).catch(() => {})
-  })
-}, { immediate: true, deep: true })
 </script>
 
 <template>
@@ -79,7 +71,7 @@ watch(() => props.tasks, (tasks) => {
       <article v-for="task in tasks" :key="task.id" class="task-card" :class="statusClass(task.status)" @click="emit('selectTask', task)" @contextmenu.prevent.stop="emit('contextMenu', task, $event)">
         <div class="preview" :class="task.status">
           <template v-if="isVideoTask(task) && task.result_videos?.[0]?.url">
-            <img v-if="taskVideoCover(task)" class="preview-video" :src="taskVideoCover(task)" alt="视频封面" loading="lazy" decoding="async" />
+            <img v-if="taskVideoCover(task)" class="preview-video" :src="taskVideoCover(task)" alt="视频封面" loading="lazy" decoding="async" crossorigin="anonymous" />
             <div v-else class="task-image-placeholder">读取封面</div>
             <span class="preview-play-indicator" aria-hidden="true">
               <span></span>
@@ -87,7 +79,7 @@ watch(() => props.tasks, (tasks) => {
           </template>
           <div v-else-if="task.result_images?.[0]?.url" class="preview-image-wrap" :class="{ loaded: isImageLoaded(displayImageURL(task.result_images[0])) }">
             <div class="task-image-placeholder">加载中</div>
-            <img :src="displayImageURL(task.result_images[0])" alt="生成结果" loading="lazy" decoding="async" @load="markImageLoaded(displayImageURL(task.result_images[0]))" />
+            <img :src="displayImageURL(task.result_images[0])" alt="生成结果" loading="lazy" decoding="async" crossorigin="anonymous" @load="markImageLoaded(displayImageURL(task.result_images[0]))" />
           </div>
           <div v-else class="state-mark">
             <span v-if="task.status === 'running'" class="spinner"></span>
@@ -107,7 +99,7 @@ watch(() => props.tasks, (tasks) => {
           <div v-if="taskReferenceImages(task).length" class="card-references">
             <span class="ref-label">参考</span>
             <button v-for="(image, index) in taskReferenceImages(task).slice(0, 2)" :key="`${image.url}-${index}`" type="button" class="ref-thumb" @click="emit('openPreview', image.url, image.filename || `参考图 ${index + 1}`, $event, image.mask_url)">
-              <img :src="displayImageURL(image)" :alt="image.filename || '参考图'" loading="lazy" decoding="async" />
+              <img :src="displayImageURL(image)" :alt="image.filename || '参考图'" loading="lazy" decoding="async" crossorigin="anonymous" />
             </button>
             <span v-if="taskReferenceImages(task).length > 2" class="ref-more">+{{ taskReferenceImages(task).length - 2 }}</span>
           </div>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { APIError, createTask, deleteTask, fetchModels, fetchSiteBrand, fetchTaskUpdates, getTask, listPlazaItems, listTasks, retryTask, runLLM, setPlazaLike, setTaskFavorite, shareCanvas, shareTask, unshareCanvas, unshareTask, uploadImage } from './api'
+import { APIError, createTask, deleteTask, fetchModels, fetchSiteBrand, fetchTaskUpdates, fetchVideoFrames, getTask, listPlazaItems, listTasks, retryTask, runLLM, setPlazaLike, setTaskFavorite, shareCanvas, shareTask, unshareCanvas, unshareTask, uploadImage } from './api'
 import AdminContactModal from './components/AdminContactModal.vue'
 import AppIcon from './components/AppIcon.vue'
 import AppToolbar from './components/AppToolbar.vue'
@@ -28,16 +28,18 @@ const videoModels = ['doubao-seedance-2.0', 'doubao-seedance-1.5-pro']
 const NANO_BANANA_MODEL = 'nano-banana-2'
 const SEEDREAM_MODEL = 'doubao-seedream-5.0-lite'
 const DEFAULT_VIDEO_MODEL = 'doubao-seedance-2.0'
+const VIEW_MODE_STORAGE_KEY = 'image_web_view_mode'
 
 const savedModel = localStorage.getItem('image_web_model') || 'gpt-image-2'
 const savedTheme = parseSavedTheme(localStorage.getItem('image_web_theme'))
+const savedViewMode = parseSavedViewMode(localStorage.getItem(VIEW_MODE_STORAGE_KEY))
 const baseurl = ref(localStorage.getItem('image_web_baseurl') || '')
 const apikey = ref(localStorage.getItem('image_web_apikey') || '')
 const tasks = ref<Task[]>([])
 const totalTasks = ref(0)
 const plazaItems = ref<PlazaItem[]>([])
 const totalPlazaItems = ref(0)
-const viewMode = ref<ViewMode>('tasks')
+const viewMode = ref<ViewMode>(savedViewMode)
 const canvasZenMode = ref(false)
 const canvasFrameReady = ref(false)
 const hideCanvasForCompact = ref(false)
@@ -86,6 +88,8 @@ const selectedTask = ref<Task | null>(null)
 const selectedPlazaItem = ref<PlazaItem | null>(null)
 const pendingCanvasImport = ref<{ token: number; canvas: unknown } | null>(null)
 const sourceTask = ref<Task | null>(null)
+const canvasTaskSnapshots = ref<Record<string, Task>>({})
+const canvasTaskIDs = ref<string[]>([])
 const previewImage = ref<PreviewImage | null>(null)
 const previewMedia = ref<{ type: 'video' | 'audio'; url: string; label: string } | null>(null)
 const contextMenu = ref<{ x: number; y: number; items: Array<{ label: string; action: () => void; disabled?: boolean; danger?: boolean }> } | null>(null)
@@ -102,11 +106,23 @@ let pollTimer: number | undefined
 let clockTimer: number | undefined
 let systemThemeQuery: MediaQueryList | undefined
 let compactCanvasQuery: MediaQueryList | undefined
+let taskUpdatePromise: Promise<void> | null = null
+let taskUpdateInFlightIDs = new Set<string>()
+let lastTaskUpdateAt = 0
+const TASK_PROGRESS_POLL_INTERVAL_MS = 10000
+const PLAZA_CACHE_TTL_MS = 60000
+const canvasTaskDetailLoadingIDs = new Set<string>()
 const maskPreviewCache = new Map<string, string>()
 const maskPreviewPending = new Map<string, Promise<string>>()
+let lastPlazaRefreshAt = 0
+let plazaRefreshPromise: Promise<void> | null = null
 
 function parseSavedTheme(value: string | null): ThemeMode {
   return value === 'light' || value === 'dark' || value === 'system' ? value : 'system'
+}
+
+function parseSavedViewMode(value: string | null): ViewMode {
+  return value === 'tasks' || value === 'canvas' || value === 'plaza' ? value : 'tasks'
 }
 
 function getSystemThemeMode(): AppliedThemeMode {
@@ -135,6 +151,7 @@ const form = reactive<ImageForm>({
   moderation: 'low',
   input_fidelity: 'high',
   n: 1,
+  batch_count: 1,
   video_ratio: '16:9',
   video_resolution: '720p',
   video_width: 1280,
@@ -165,7 +182,6 @@ const referenceLabelCounters = reactive({ image: 1, video: 1, audio: 1 })
 
 const hasConfig = computed(() => Boolean(baseurl.value && apikey.value))
 const sharedCanvasIds = computed(() => plazaItems.value.filter((item) => item.item_type === 'canvas').map(plazaCanvasID).filter(Boolean))
-const runningCount = computed(() => tasks.value.filter((task) => task.status === 'pending' || task.status === 'running').length)
 const visibleSubtitle = computed(() => viewMode.value === 'plaza' ? `公开广场 · 已加载 ${plazaItems.value.length} 条 · 总计 ${totalPlazaItems.value} 条` : (hasConfig.value ? `${maskBaseURL(baseurl.value)} · 已加载 ${tasks.value.length} 条 · 总计 ${totalTasks.value} 条` : '通过 URL 传入 baseurl 和 apikey 后开始使用'))
 const draftSize = computed(() => sizeFromRatio(sizeDraft.base, sizeDraft.ratio))
 const isNanoBananaForm = computed(() => form.model === NANO_BANANA_MODEL)
@@ -203,6 +219,7 @@ watch(themeMode, (theme) => {
 }, { immediate: true })
 
 watch(viewMode, (mode) => {
+  localStorage.setItem(VIEW_MODE_STORAGE_KEY, mode)
   if (mode !== 'canvas') canvasZenMode.value = false
   if (mode !== 'canvas') canvasFrameReady.value = false
   if (mode === 'canvas' && hideCanvasForCompact.value) viewMode.value = 'tasks'
@@ -330,6 +347,10 @@ function updateFormField(field: keyof ImageForm, value: string | number | boolea
     if (field === 'video_draft') normalizeVideoForm()
     return
   }
+  if (field === 'batch_count') {
+    form.batch_count = clampTaskBatchCount(value)
+    return
+  }
   if (field === 'output_compression' || field === 'n' || field === 'video_duration') {
     form[field] = Number(value)
     if (field === 'video_duration') normalizeVideoForm()
@@ -349,6 +370,7 @@ function updateFormField(field: keyof ImageForm, value: string | number | boolea
   if (field === 'prompt' || field === 'model' || field === 'size' || field === 'quality' || field === 'output_format' || field === 'background' || field === 'moderation' || field === 'input_fidelity' || field === 'reference_video_urls' || field === 'reference_audio_urls') {
     form[field] = text
     if (field === 'model') syncModelSize(text)
+    if (field === 'model' && text !== NANO_BANANA_MODEL && form.output_format !== 'png' && form.background === 'transparent') form.background = 'auto'
     if (field === 'model' && !supportsVideoDraft(text)) form.video_draft = false
     if (field === 'output_format' && form.model === SEEDREAM_MODEL && text === 'webp') form.output_format = 'jpeg'
     if (field === 'output_format' && text !== 'png' && form.background === 'transparent') form.background = 'auto'
@@ -371,6 +393,7 @@ function syncModelSize(model: string) {
     sizeDraft.ratio = parsed.aspectRatio
     form.size = seedreamSizeValue(sizeDraft.base, sizeDraft.ratio)
     form.output_format = form.output_format === 'png' ? 'png' : 'jpeg'
+    if (form.output_format !== 'png' && form.background === 'transparent') form.background = 'auto'
     pendingSizeSync.value = form.size
     return
   }
@@ -485,10 +508,120 @@ async function toggleFavorite(task: Task, event?: Event) {
 
 function patchTask(updated: Partial<Task> & { id: string }) {
   const index = tasks.value.findIndex((task) => task.id === updated.id)
-  const patched = index >= 0 ? { ...tasks.value[index], ...updated } : selectedTask.value?.id === updated.id ? { ...selectedTask.value, ...updated } : null
+  const canvasSnapshot = canvasTaskSnapshots.value[updated.id]
+  const patched = index >= 0
+    ? { ...tasks.value[index], ...updated }
+    : selectedTask.value?.id === updated.id
+      ? { ...selectedTask.value, ...updated }
+      : canvasSnapshot
+        ? { ...canvasSnapshot, ...updated }
+        : null
   if (index >= 0 && patched) tasks.value[index] = patched
   if (selectedTask.value?.id === updated.id && patched) selectedTask.value = patched
+  if (patched && (canvasSnapshot || canvasTaskIDs.value.includes(updated.id))) canvasTaskSnapshots.value = { ...canvasTaskSnapshots.value, [updated.id]: compactTaskForCanvas(patched) }
   if (patched) prefetchTaskMasks([patched])
+}
+
+function clampTaskBatchCount(value: unknown) {
+  const count = Math.trunc(Number(value))
+  if (!Number.isFinite(count)) return 1
+  return Math.min(5, Math.max(1, count))
+}
+
+function syncCanvasTaskRefs(snapshots: Task[], ids: string[] = []) {
+  const snapshotIDs = snapshots.map((task) => task?.id).filter((id): id is string => Boolean(id))
+  const allIDs = Array.from(new Set([
+    ...ids.filter(Boolean),
+    ...snapshotIDs,
+  ]))
+  canvasTaskIDs.value = allIDs
+  const next: Record<string, Task> = {}
+  for (const id of allIDs) {
+    const currentTask = tasks.value.find((task) => task.id === id)
+    const currentSnapshot = canvasTaskSnapshots.value[id]
+    const baseTask = currentSnapshot || currentTask
+    if (baseTask) next[id] = compactTaskForCanvas({ ...baseTask, ...(currentTask || {}) })
+  }
+  for (const task of snapshots) {
+    if (!task?.id) continue
+    next[task.id] = compactTaskForCanvas({ ...(next[task.id] || task), ...task })
+  }
+  canvasTaskSnapshots.value = next
+  const unfinishedIDs = Object.values(next)
+    .filter((task) => task.status === 'pending' || task.status === 'running')
+    .map((task) => task.id)
+  if (unfinishedIDs.length && apikey.value && !baseURLBlocked.value) {
+    void refreshTaskUpdates(unfinishedIDs, { minInterval: TASK_PROGRESS_POLL_INTERVAL_MS })
+  }
+  const existing = new Set(tasks.value.map((task) => task.id))
+  const unresolvedIDs = allIDs.filter((id) => !next[id] && !existing.has(id))
+  if (unresolvedIDs.length) fetchCanvasTaskDetails(unresolvedIDs)
+}
+
+function fetchCanvasTaskDetails(ids: string[]) {
+  if (!apikey.value || !baseurl.value || baseURLBlocked.value) return
+  for (const id of ids) {
+    if (canvasTaskDetailLoadingIDs.has(id)) continue
+    canvasTaskDetailLoadingIDs.add(id)
+    getTask(id, apikey.value, baseurl.value)
+      .then((task) => {
+        const index = tasks.value.findIndex((item) => item.id === task.id)
+        if (index >= 0) tasks.value[index] = { ...tasks.value[index], ...task }
+        if (canvasTaskIDs.value.includes(task.id)) {
+          canvasTaskSnapshots.value = { ...canvasTaskSnapshots.value, [task.id]: compactTaskForCanvas({ ...(canvasTaskSnapshots.value[task.id] || task), ...task }) }
+        }
+        prefetchTaskMasks([task])
+      })
+      .catch((error) => {
+        console.warn('[canvas-task] detail fetch failed', id, error)
+      })
+      .finally(() => {
+        canvasTaskDetailLoadingIDs.delete(id)
+      })
+  }
+}
+
+function compactTaskForCanvas(task: Task): Task {
+  return {
+    ...task,
+    request_headers: '',
+    request_json: '',
+    response_headers: '',
+    response_json: '',
+    reference_images: compactImages(task.reference_images),
+    reference_videos: compactMedia(task.reference_videos),
+    reference_audios: compactMedia(task.reference_audios),
+    result_images: compactImages(task.result_images),
+    result_videos: compactMedia(task.result_videos),
+  }
+}
+
+function compactImages(images?: UploadedImage[] | null): UploadedImage[] {
+  return (Array.isArray(images) ? images : []).filter((image) => image?.url).map((image) => ({
+    url: image.url,
+    thumbnail_url: image.thumbnail_url || '',
+    filename: image.filename || '',
+    mask_url: image.mask_url && !image.mask_url.startsWith('data:') ? image.mask_url : '',
+    original_size: image.original_size,
+    compressed_size: image.compressed_size,
+    compression_ratio: image.compression_ratio,
+  }))
+}
+
+function compactMedia(items?: MediaAsset[] | null): MediaAsset[] {
+  return (Array.isArray(items) ? items : []).filter((item) => item?.url).map((item) => ({
+    type: item.type || '',
+    url: item.url,
+    thumbnail_url: item.thumbnail_url || '',
+    first_frame_url: item.first_frame_url || '',
+    last_frame_url: item.last_frame_url || '',
+    filename: item.filename || '',
+    duration: item.duration,
+    clip_start: item.clip_start,
+    clip_end: item.clip_end,
+    width: item.width,
+    height: item.height,
+  }))
 }
 
 function openPreviewImage(url: string, label: string, event?: Event, maskUrl = '') {
@@ -564,11 +697,12 @@ onMounted(() => {
     startPolling()
     startClock()
   }
+  if (viewMode.value === 'plaza') ensurePlazaItemsFresh()
   window.addEventListener('scroll', onPageScroll, { passive: true })
 })
 
 onUnmounted(() => {
-  if (pollTimer) window.clearInterval(pollTimer)
+  if (pollTimer) window.clearTimeout(pollTimer)
   if (clockTimer) window.clearInterval(clockTimer)
   systemThemeQuery?.removeEventListener('change', syncSystemThemeMode)
   compactCanvasQuery?.removeEventListener('change', syncCompactCanvasMode)
@@ -714,11 +848,23 @@ async function refreshPlazaItems(limit = Math.max(30, plazaItems.value.length)) 
     nextPlazaBeforeCreatedAt.value = result.next_before_created_at
     nextPlazaBeforeID.value = result.next_before_id
     nextPlazaBeforeLikeCount.value = result.next_before_like_count
+    lastPlazaRefreshAt = Date.now()
   } catch (error) {
     showMessage(error instanceof Error ? error.message : '广场加载失败')
   } finally {
     loading.value = false
   }
+}
+
+function ensurePlazaItemsFresh() {
+  const stale = !lastPlazaRefreshAt || Date.now() - lastPlazaRefreshAt > PLAZA_CACHE_TTL_MS
+  if (plazaItems.value.length && !stale) return Promise.resolve()
+  if (plazaRefreshPromise) return plazaRefreshPromise
+  const refresh = plazaItems.value.length ? refreshPlazaItems() : resetPlazaItems()
+  plazaRefreshPromise = refresh.finally(() => {
+    plazaRefreshPromise = null
+  })
+  return plazaRefreshPromise
 }
 
 async function resetPlazaItems() {
@@ -772,19 +918,60 @@ async function loadMorePlazaItems() {
 }
 
 function startPolling() {
-  if (pollTimer) window.clearInterval(pollTimer)
-  pollTimer = window.setInterval(() => {
-    refreshUnfinishedTasks()
-  }, runningCount.value > 0 ? 2500 : 8000)
+  scheduleNextTaskPoll(TASK_PROGRESS_POLL_INTERVAL_MS)
+}
+
+function scheduleNextTaskPoll(delay = taskPollInterval()) {
+  if (pollTimer) window.clearTimeout(pollTimer)
+  pollTimer = window.setTimeout(async () => {
+    pollTimer = undefined
+    await refreshUnfinishedTasks()
+    if (hasConfig.value && !baseURLBlocked.value) scheduleNextTaskPoll()
+  }, delay)
+}
+
+function taskPollInterval() {
+  return TASK_PROGRESS_POLL_INTERVAL_MS
 }
 
 async function refreshUnfinishedTasks() {
   if (!apikey.value || baseURLBlocked.value) return
-  const ids = tasks.value.filter((task) => task.status === 'pending' || task.status === 'running').map((task) => task.id)
+  const canvasIDs = Object.values(canvasTaskSnapshots.value)
+    .filter((task) => task.status === 'pending' || task.status === 'running')
+    .map((task) => task.id)
+  const ids = [
+    ...tasks.value.filter((task) => task.status === 'pending' || task.status === 'running').map((task) => task.id),
+    ...canvasIDs,
+  ]
+  await refreshTaskUpdates(ids)
+}
+
+async function refreshTaskUpdates(ids: string[], options: { minInterval?: number } = {}) {
+  ids = Array.from(new Set(ids.filter(Boolean)))
   if (!ids.length) return
+  if (taskUpdatePromise && ids.every((id) => taskUpdateInFlightIDs.has(id))) return taskUpdatePromise
+  if (taskUpdatePromise) await taskUpdatePromise
+  const minInterval = options.minInterval || 0
+  if (minInterval > 0 && lastTaskUpdateAt > 0 && Date.now() - lastTaskUpdateAt < minInterval) return
+  taskUpdateInFlightIDs = new Set(ids)
+  taskUpdatePromise = (async () => {
+    try {
+      const updates = await fetchTaskUpdates(apikey.value, baseurl.value, ids)
+      lastTaskUpdateAt = Date.now()
+      for (const update of updates) patchTask(update)
+    } catch (error) {
+      handleRequestError(error, '任务更新失败')
+    }
+  })().finally(() => {
+    taskUpdatePromise = null
+    taskUpdateInFlightIDs = new Set()
+  })
+  return taskUpdatePromise
+}
+
+async function refreshTaskUpdate(id: string) {
   try {
-    const updates = await fetchTaskUpdates(apikey.value, baseurl.value, ids)
-    for (const update of updates) patchTask(update)
+    await refreshTaskUpdates([id], { minInterval: TASK_PROGRESS_POLL_INTERVAL_MS })
   } catch (error) {
     handleRequestError(error, '任务更新失败')
   }
@@ -799,7 +986,7 @@ function onPageScroll() {
 
 function stopPolling() {
   if (!pollTimer) return
-  window.clearInterval(pollTimer)
+  window.clearTimeout(pollTimer)
   pollTimer = undefined
 }
 
@@ -856,8 +1043,8 @@ async function submitTask(mode: ImageForm['task_type'] = form.task_type) {
       return
     }
     const taskType = isVideo ? 'video_generation' : 'image_generation'
-    const taskCount = 1
-    const createdTasks: Task[] = []
+    const taskCount = isVideo ? 1 : clampTaskBatchCount(form.batch_count)
+    const createRequests: Promise<Task>[] = []
     for (let index = 0; index < taskCount; index++) {
       const basePayload: Pick<CreateTaskPayload, 'apikey' | 'baseurl' | 'task_type' | 'prompt' | 'model' | 'reference_images'> = {
         apikey: apikey.value,
@@ -897,18 +1084,20 @@ async function submitTask(mode: ImageForm['task_type'] = form.task_type) {
         n: 1,
       }
       console.info('[task-submit] createTask payload', createPayload)
-      const created = await createTask(createPayload)
-      console.info('[task-submit] created task', {
-        id: created.id,
-        task_type: created.task_type,
-        model: created.model,
-        video_ratio: created.video_ratio,
-        video_width: created.video_width,
-        video_height: created.video_height,
-        video_duration: created.video_duration,
-      })
-      createdTasks.push(created)
+      createRequests.push(createTask(createPayload).then((created) => {
+        console.info('[task-submit] created task', {
+          id: created.id,
+          task_type: created.task_type,
+          model: created.model,
+          video_ratio: created.video_ratio,
+          video_width: created.video_width,
+          video_height: created.video_height,
+          video_duration: created.video_duration,
+        })
+        return created
+      }))
     }
+    const createdTasks = await Promise.all(createRequests)
     form.prompt = ''
     if (!isVideo) {
       referenceImages.value = []
@@ -921,7 +1110,7 @@ async function submitTask(mode: ImageForm['task_type'] = form.task_type) {
     tasks.value.unshift(...createdTasks.filter((task) => !existing.has(task.id)))
     totalTasks.value += createdTasks.length
     await refreshUnfinishedTasks()
-    showMessage('任务已提交，生成会在后台继续执行')
+    showMessage(createdTasks.length > 1 ? `${createdTasks.length} 个任务已提交，生成会在后台继续执行` : '任务已提交，生成会在后台继续执行')
   } catch (error) {
     showMessage(error instanceof Error ? error.message : '提交失败')
   } finally {
@@ -1042,13 +1231,21 @@ async function runCanvasNode(payload: CanvasRunPayload, applyTask?: (task: Task)
 }
 
 async function waitForCanvasTask(id: string) {
-  let latest = tasks.value.find((task) => task.id === id)
+  let latest = trackedTask(id)
   for (;;) {
     if (latest?.status === 'succeeded' || latest?.status === 'failed') return latest
-    await delay(2500)
-    latest = await getTask(id, apikey.value, baseurl.value)
-    patchTask(latest)
+    await delay(TASK_PROGRESS_POLL_INTERVAL_MS)
+    await refreshTaskUpdate(id)
+    latest = trackedTask(id)
+    if (!latest) {
+      latest = await getTask(id, apikey.value, baseurl.value)
+      patchTask(latest)
+    }
   }
+}
+
+function trackedTask(id: string) {
+  return tasks.value.find((task) => task.id === id) || canvasTaskSnapshots.value[id]
 }
 
 function delay(ms: number) {
@@ -1086,7 +1283,9 @@ function toVideoAsset(video: PendingReferenceVideo): MediaAsset {
   return {
     type: 'video',
     url: video.url,
-    thumbnail_url: video.cover_url || video.thumbnail_url,
+    thumbnail_url: video.cover_url || video.thumbnail_url || video.first_frame_url,
+    first_frame_url: video.first_frame_url,
+    last_frame_url: video.last_frame_url,
     filename: video.filename,
     reference_label: video.reference_label,
     duration: video.duration,
@@ -1408,7 +1607,7 @@ function normalizeVideoForm() {
 function switchView(mode: ViewMode) {
   if (mode === 'canvas') canvasFrameReady.value = false
   viewMode.value = mode
-  if (mode === 'plaza' && !plazaItems.value.length) resetPlazaItems()
+  if (mode === 'plaza') ensurePlazaItemsFresh()
   if (mode === 'canvas' && hasConfig.value && !tasks.value.length) refreshTasks()
 }
 
@@ -1482,9 +1681,17 @@ async function uploadReferenceMediaFile(file: File, type: 'video' | 'audio') {
   try {
     const uploaded = await uploadImage(file)
     if (!list.value[index]) return
-    list.value[index] = { ...list.value[index], url: uploaded.url, filename: uploaded.filename || file.name, loading: false }
+    list.value[index] = {
+      ...list.value[index],
+      url: uploaded.url,
+      thumbnail_url: uploaded.thumbnail_url || uploaded.first_frame_url,
+      first_frame_url: uploaded.first_frame_url,
+      last_frame_url: uploaded.last_frame_url,
+      filename: uploaded.filename || file.name,
+      loading: false,
+    }
     if (type === 'video') {
-      const cover = await captureVideoCover(uploaded.url).catch(() => '')
+      const cover = uploaded.first_frame_url || uploaded.thumbnail_url
       if (cover && referenceVideos.value[index]) referenceVideos.value[index] = { ...referenceVideos.value[index], cover_url: cover, thumbnail_url: cover }
     }
   } catch (error) {
@@ -1601,9 +1808,16 @@ async function addReferenceVideoFromURL() {
   const index = referenceVideos.value.length - 1
   showReferenceVideoModal.value = false
   try {
-    const cover = await captureVideoCover(url)
+    const frames = await fetchVideoFrames(url, item.filename)
     if (referenceVideos.value[index]) {
-      referenceVideos.value[index] = { ...referenceVideos.value[index], cover_url: cover, thumbnail_url: cover, loading: false }
+      referenceVideos.value[index] = {
+        ...referenceVideos.value[index],
+        thumbnail_url: frames.thumbnail_url || frames.first_frame_url,
+        first_frame_url: frames.first_frame_url,
+        last_frame_url: frames.last_frame_url,
+        cover_url: frames.thumbnail_url || frames.first_frame_url,
+        loading: false,
+      }
     }
   } catch {
     if (referenceVideos.value[index]) {
@@ -1651,59 +1865,6 @@ function addReferenceAudioFromURL() {
 
 function removeReferenceAudio(index: number) {
   referenceAudios.value.splice(index, 1)
-}
-
-function captureVideoCover(url: string) {
-  return new Promise<string>((resolve, reject) => {
-    const video = document.createElement('video')
-    const cleanup = () => {
-      video.pause()
-      video.removeAttribute('src')
-      video.load()
-    }
-    const fail = () => {
-      cleanup()
-      reject(new Error('无法读取视频封面'))
-    }
-    video.crossOrigin = 'anonymous'
-    video.muted = true
-    video.playsInline = true
-    video.preload = 'auto'
-    video.addEventListener('error', fail, { once: true })
-    video.addEventListener('loadeddata', () => {
-      try {
-        if (video.duration && Number.isFinite(video.duration)) video.currentTime = Math.min(0.1, Math.max(0, video.duration - 0.1))
-      } catch {
-        // Some streams cannot seek; draw the currently loaded frame instead.
-        drawVideoCover(video, cleanup, resolve, reject)
-      }
-    }, { once: true })
-    video.addEventListener('seeked', () => drawVideoCover(video, cleanup, resolve, reject), { once: true })
-    window.setTimeout(fail, 12000)
-    video.src = url
-  })
-}
-
-function drawVideoCover(video: HTMLVideoElement, cleanup: () => void, resolve: (value: string) => void, reject: (reason?: unknown) => void) {
-  try {
-    const sourceWidth = video.videoWidth || 320
-    const sourceHeight = video.videoHeight || 180
-    const scale = Math.min(1, 480 / Math.max(sourceWidth, sourceHeight))
-    const width = Math.max(1, Math.round(sourceWidth * scale))
-    const height = Math.max(1, Math.round(sourceHeight * scale))
-    const canvas = document.createElement('canvas')
-    canvas.width = width
-    canvas.height = height
-    const ctx = canvas.getContext('2d')
-    if (!ctx) throw new Error('无法创建封面')
-    ctx.drawImage(video, 0, 0, width, height)
-    const cover = canvas.toDataURL('image/jpeg', 0.82)
-    cleanup()
-    resolve(cover)
-  } catch (error) {
-    cleanup()
-    reject(error)
-  }
 }
 
 function clearFileInputs() {
@@ -2063,6 +2224,7 @@ function showMessage(text: string) {
         :models="models"
         :submitting="submitting"
         :shared-canvas-ids="sharedCanvasIds"
+        :canvas-task-snapshots="canvasTaskSnapshots"
         :canvas-import="pendingCanvasImport"
         :run-node-action="runCanvasNode"
         :run-llm-action="runCanvasLLM"
@@ -2071,6 +2233,7 @@ function showMessage(text: string) {
         @run-llm="runCanvasLLM"
         @share-canvas="shareCanvasToPlaza"
         @unshare-canvas="unshareCanvasFromPlaza"
+        @task-refs-change="syncCanvasTaskRefs"
         @zen-mode-change="canvasZenMode = $event"
         @close-context-menu="closeContextMenu"
         @ready="canvasFrameReady = true"
@@ -2281,7 +2444,7 @@ function showMessage(text: string) {
       <section class="reference-media-modal light-modal">
         <button class="modal-close" type="button" @click="previewMedia = null"><AppIcon name="close" /></button>
         <h2>{{ previewMedia.label }}</h2>
-        <video v-if="previewMedia.type === 'video'" :src="previewMedia.url" controls autoplay playsinline preload="auto" />
+        <video v-if="previewMedia.type === 'video'" :src="previewMedia.url" controls autoplay playsinline preload="auto" crossorigin="anonymous" />
         <audio v-else :src="previewMedia.url" controls autoplay />
       </section>
     </div>

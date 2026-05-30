@@ -8,6 +8,7 @@ services:
       - .env
     environment:
       PORT: ${PORT:-8080}
+      APP_CREDENTIAL_KEY: ${APP_CREDENTIAL_KEY:?APP_CREDENTIAL_KEY is required}
       IMAGE_HOST_PROVIDER: ${IMAGE_HOST_PROVIDER:-http-json}
       IMAGE_HOST_UPLOAD_URL: ${IMAGE_HOST_UPLOAD_URL:-https://2bad.lujilujilujilujiluji.com/}
       IMAGE_HOST_AUTH_HEADER: ${IMAGE_HOST_AUTH_HEADER:-Authorization}

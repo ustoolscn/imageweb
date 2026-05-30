@@ -1,9 +1,8 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { ref } from 'vue'
 import type { PlazaItem } from '../types'
 import { canvasPreviewAspectRatio, canvasPreviewMedia, canvasPreviewUrl } from '../lib/canvasPreview'
 import { isVideoTask } from '../lib/view'
-import { ensureVideoCover, videoCoverURL } from '../lib/videoCover'
 import AppIcon from './AppIcon.vue'
 
 const loadedImages = ref(new Set<string>())
@@ -34,7 +33,7 @@ function videoUrl(item: PlazaItem) {
 
 function videoCover(item: PlazaItem) {
   const video = item.result_videos?.[0]
-  return video?.thumbnail_url || videoCoverURL(video?.url)
+  return video?.thumbnail_url || video?.first_frame_url || ''
 }
 
 function previewImageUrl(item: PlazaItem) {
@@ -59,7 +58,7 @@ function isCardVideo(item: PlazaItem) {
 function cardVideoCover(item: PlazaItem) {
   if (item.item_type === 'canvas') {
     const media = canvasPreviewMedia(item)
-    return media?.thumbnail_url || videoCoverURL(media?.url)
+    return media?.thumbnail_url || ''
   }
   return videoCover(item)
 }
@@ -118,14 +117,6 @@ function canvasConnectionCount(item: PlazaItem) {
   return Array.isArray(canvas?.connections) ? canvas.connections.length : 0
 }
 
-watch(() => props.items, (items) => {
-  items.forEach((item) => {
-    const video = item.result_videos?.[0]
-    if (isVideoTask(item) && video?.url && !video.thumbnail_url) ensureVideoCover(video.url).catch(() => {})
-    const canvasMedia = canvasPreviewMedia(item)
-    if (canvasMedia?.type === 'video' && canvasMedia.url && !canvasMedia.thumbnail_url) ensureVideoCover(canvasMedia.url).catch(() => {})
-  })
-}, { immediate: true, deep: true })
 </script>
 
 <template>
@@ -144,7 +135,7 @@ watch(() => props.items, (items) => {
       >
         <div class="plaza-image-placeholder">加载中</div>
         <template v-if="isCardVideo(item)">
-          <img v-if="cardVideoCover(item)" class="preview-video" :src="cardVideoCover(item)" alt="视频封面" loading="lazy" decoding="async" />
+          <img v-if="cardVideoCover(item)" class="preview-video" :src="cardVideoCover(item)" alt="视频封面" loading="lazy" decoding="async" crossorigin="anonymous" />
           <span class="preview-play-indicator" aria-hidden="true">
             <span></span>
           </span>
@@ -155,12 +146,13 @@ watch(() => props.items, (items) => {
           alt="广场作品"
           loading="lazy"
           decoding="async"
+          crossorigin="anonymous"
           fetchpriority="low"
           @load="markImageLoaded(cardImageUrl(item)); markCanvasPreviewLoaded(item, $event)"
         />
         <div v-if="referenceImageUrl(item)" class="plaza-reference-overlay" title="参考图">
           <div class="plaza-reference-badge">参考图</div>
-          <img :src="referenceImageUrl(item)" alt="参考图" loading="lazy" decoding="async" />
+          <img :src="referenceImageUrl(item)" alt="参考图" loading="lazy" decoding="async" crossorigin="anonymous" />
           <span v-if="referenceMoreCount(item)">+{{ referenceMoreCount(item) }}</span>
         </div>
         <div v-if="item.prompt" class="plaza-prompt-hover">

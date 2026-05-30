@@ -88,10 +88,27 @@ export async function fetchCanvases(apikey: string, baseurl: string) {
 }
 
 export async function saveCanvasesCloud(apikey: string, baseurl: string, canvases: unknown) {
-  return request<{ canvases: unknown; updated_at: string }>('/api/canvases', {
+  return request<{ updated_at: string }>('/api/canvases', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ apikey, baseurl, canvases }),
+  })
+}
+
+export type CanvasPatchPayload = {
+  id: string
+  name?: string
+  elements?: unknown[]
+  deleted_element_ids?: string[]
+  connections?: unknown[]
+  deleted_connection_ids?: string[]
+}
+
+export async function patchCanvasesCloud(apikey: string, baseurl: string, canvases: unknown[], deletedCanvasIDs: string[] = [], canvasPatches: CanvasPatchPayload[] = []) {
+  return request<{ updated_at: string }>('/api/canvases', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apikey, baseurl, canvases, deleted_canvas_ids: deletedCanvasIDs, canvas_patches: canvasPatches }),
   })
 }
 
@@ -127,11 +144,21 @@ function toUploadedImage(data: unknown): UploadedImage {
   return {
     url,
     thumbnail_url: response.data?.thumbnail_url,
+    first_frame_url: response.data?.first_frame_url,
+    last_frame_url: response.data?.last_frame_url,
     filename: response.data?.filename,
     original_size: response.data?.original_size,
     compressed_size: response.data?.compressed_size,
     compression_ratio: response.data?.compression_ratio,
   }
+}
+
+export async function fetchVideoFrames(url: string, filename = ''): Promise<MediaAsset> {
+  return request<MediaAsset>('/api/video-frames', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, filename }),
+  })
 }
 
 export async function fetchModels(baseurl: string, apikey: string) {
