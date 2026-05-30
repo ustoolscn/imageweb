@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -14,11 +15,19 @@ import (
 )
 
 type Worker struct {
-	Store     *db.Store
-	Generator *generator.Client
-	ImageHost *imagehost.Client
-	running   int64
+	Store            *db.Store
+	Generator        *generator.Client
+	ImageHost        *imagehost.Client
+	running          int64
+	claiming         int64
+	lastNoPending    int64
+	lastStaleCleanup int64
 }
+
+const imageTaskTimeout = 10 * time.Minute
+const staleCleanupInterval = time.Minute
+const staleCleanupDBTimeout = 5 * time.Second
+const idleTaskPollInterval = 3 * time.Second
 
 func (w *Worker) Start(ctx context.Context) {
 	go func() {
@@ -37,10 +46,7 @@ func (w *Worker) Start(ctx context.Context) {
 }
 
 func (w *Worker) dispatch(ctx context.Context) {
-	if err := w.Store.ResetStaleRunningTasks(ctx, 30*time.Minute); err != nil {
-		fmt.Println("worker reset stale tasks:", err)
-		return
-	}
+	w.cleanupStaleImageTasks(ctx)
 	config, err := w.Store.SiteConfig(ctx)
 	if err != nil {
 		fmt.Println("worker get config:", err)
@@ -50,27 +56,58 @@ func (w *Worker) dispatch(ctx context.Context) {
 	if concurrency <= 0 {
 		concurrency = 1
 	}
-	fmt.Println("worker dispatch tick:", "running=", atomic.LoadInt64(&w.running), "concurrency=", concurrency)
-	for atomic.LoadInt64(&w.running) < int64(concurrency) {
-		atomic.AddInt64(&w.running, 1)
-		go func() {
-			defer atomic.AddInt64(&w.running, -1)
-			w.processNext(ctx)
-		}()
+	running := atomic.LoadInt64(&w.running)
+	if running > 0 {
+		fmt.Println("worker dispatch tick:", "running=", running, "concurrency=", concurrency)
+	}
+	if running >= int64(concurrency) {
+		return
+	}
+	if lastNoPending := atomic.LoadInt64(&w.lastNoPending); lastNoPending > 0 && time.Since(time.Unix(lastNoPending, 0)) < idleTaskPollInterval {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&w.claiming, 0, 1) {
+		return
+	}
+	go w.claimAndProcessNext(ctx)
+}
+
+func (w *Worker) cleanupStaleImageTasks(ctx context.Context) {
+	now := time.Now()
+	last := time.Unix(atomic.LoadInt64(&w.lastStaleCleanup), 0)
+	if !last.IsZero() && now.Sub(last) < staleCleanupInterval {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&w.lastStaleCleanup, last.Unix(), now.Unix()) {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(ctx, staleCleanupDBTimeout)
+	defer cancel()
+	if err := w.Store.FailStaleImageTasks(cleanupCtx, imageTaskTimeout); err != nil {
+		fmt.Println("worker fail stale image tasks skipped:", err)
 	}
 }
 
-func (w *Worker) processNext(ctx context.Context) {
-	fmt.Println("worker process_next begin")
+func (w *Worker) claimAndProcessNext(ctx context.Context) {
+	defer atomic.StoreInt64(&w.claiming, 0)
 	task, err := w.Store.NextPendingTask(ctx)
 	if err != nil {
 		if !db.IsNotFound(err) && err.Error() != "driver: bad connection" {
 			fmt.Println("worker get task:", err)
 		} else {
-			fmt.Println("worker process_next no_pending_task")
+			atomic.StoreInt64(&w.lastNoPending, time.Now().Unix())
 		}
 		return
 	}
+	atomic.StoreInt64(&w.lastNoPending, 0)
+	atomic.AddInt64(&w.running, 1)
+	go func() {
+		defer atomic.AddInt64(&w.running, -1)
+		w.processTask(ctx, task)
+	}()
+}
+
+func (w *Worker) processTask(ctx context.Context, task *model.Task) {
 	started := time.Now()
 	finalPrompt := task.Prompt
 	requestHeaders := ""
@@ -86,7 +123,9 @@ func (w *Worker) processNext(ctx context.Context) {
 	}
 
 	fmt.Println("worker route decision:", "id=", task.ID, "route=", "image", "reason_task_type=", task.TaskType)
-	result, err := w.Generator.Generate(ctx, task, finalPrompt)
+	imageCtx, cancel := context.WithTimeout(ctx, imageTaskTimeout)
+	defer cancel()
+	result, err := w.Generator.Generate(imageCtx, task, finalPrompt)
 	requestHeaders = result.RequestHeaders
 	requestJSON = result.RequestJSON
 	responseHeaders = result.ResponseHeaders
@@ -97,21 +136,25 @@ func (w *Worker) processNext(ctx context.Context) {
 	}
 	if err != nil {
 		fmt.Println("worker image generate failed:", "id=", task.ID, "task_type=", task.TaskType, "error=", err)
-		_ = w.Store.FailTask(ctx, task.ID, finalPrompt, requestHeaders, requestJSON, responseHeaders, responseJSON, err.Error(), time.Since(started).Milliseconds())
+		_ = w.Store.FailTask(ctx, task.ID, finalPrompt, requestHeaders, requestJSON, responseHeaders, responseJSON, imageTaskErrorMessage(err, imageCtx), time.Since(started).Milliseconds())
 		return
 	}
 
 	fmt.Println("worker generated files task:", task.ID, len(result.Files))
 	uploaded := []model.UploadedImage{}
 	for _, path := range result.Files {
-		image, err := w.ImageHost.UploadFile(ctx, path)
+		image, err := w.ImageHost.UploadFile(imageCtx, path)
 		if err != nil {
 			fmt.Println("worker upload result image:", task.ID, err)
-			_ = w.Store.FailTask(ctx, task.ID, finalPrompt, requestHeaders, requestJSON, responseHeaders, responseJSON, err.Error(), time.Since(started).Milliseconds())
+			_ = w.Store.FailTask(ctx, task.ID, finalPrompt, requestHeaders, requestJSON, responseHeaders, responseJSON, imageTaskErrorMessage(err, imageCtx), time.Since(started).Milliseconds())
 			return
 		}
 		fmt.Println("worker uploaded result image:", task.ID, image.URL)
 		uploaded = append(uploaded, image)
+	}
+	if err := imageCtx.Err(); err != nil {
+		_ = w.Store.FailTask(ctx, task.ID, finalPrompt, requestHeaders, requestJSON, responseHeaders, responseJSON, imageTaskErrorMessage(err, imageCtx), time.Since(started).Milliseconds())
+		return
 	}
 	if err := w.Store.CompleteTask(ctx, task.ID, finalPrompt, requestHeaders, requestJSON, responseHeaders, responseJSON, uploaded, time.Since(started).Milliseconds()); err != nil {
 		fmt.Println("worker complete task:", err)
@@ -119,6 +162,13 @@ func (w *Worker) processNext(ctx context.Context) {
 		return
 	}
 	fmt.Println("worker completed task:", task.ID, len(uploaded))
+}
+
+func imageTaskErrorMessage(err error, taskCtx context.Context) string {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(taskCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Sprintf("图片生成超过 %d 分钟，已自动断开并标记失败；上游可能仍在处理，请检查上游记录后手动重试", int(imageTaskTimeout.Minutes()))
+	}
+	return err.Error()
 }
 
 func (w *Worker) submitVideo(ctx context.Context, task *model.Task, started time.Time) {
@@ -140,10 +190,12 @@ func (w *Worker) submitVideo(ctx context.Context, task *model.Task, started time
 }
 
 func (w *Worker) pollVideos(ctx context.Context) {
-	fmt.Println("worker poll_videos begin")
 	tasks, err := w.Store.VideoTasksToPoll(ctx, 8)
 	if err != nil {
 		fmt.Println("worker list video polls:", err)
+		return
+	}
+	if len(tasks) == 0 {
 		return
 	}
 	fmt.Println("worker poll_videos tasks:", "count=", len(tasks))
