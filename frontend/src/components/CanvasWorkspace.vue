@@ -130,6 +130,7 @@ const ASSET_PAGE_SIZE = 30
 const MIN_ZOOM = 0.2
 const MAX_ZOOM = 3
 const CLOUD_SAVE_DEBOUNCE_MS = 5000
+const CANVAS_ROW_PATCH_MAX_BYTES = 256 * 1024
 const initialCanvasState = readLocalCanvasState()
 const canvases = ref<BoardCanvas[]>(initialCanvasState.canvases)
 const activeCanvasID = ref(validActiveCanvasID(initialCanvasState.canvases, initialCanvasState.meta.activeCanvasID))
@@ -895,7 +896,14 @@ function canvasCloudDelta(): CanvasCloudDelta {
       continue
     }
     const patch = canvasItemDelta(previousCanvas, canvas)
-    if (hasCanvasPatchChanges(patch)) patches.push(patch)
+    if (hasCanvasPatchChanges(patch)) {
+      const canvasSnapshot = serializeCanvasItem(canvas)
+      if (canvasSnapshot.length <= CANVAS_ROW_PATCH_MAX_BYTES) {
+        changedCanvases.push(canvas)
+      } else {
+        patches.push(patch)
+      }
+    }
   }
   const deleted = Array.from(previous.keys()).filter((id) => !current.has(id))
   return { full: false, canvases: changedCanvases, patches, deleted }

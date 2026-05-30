@@ -1,6 +1,8 @@
 package db
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -29,8 +31,15 @@ import (
 )
 
 type Store struct {
-	db            *sql.DB
-	credentialKey [32]byte
+	db                     *sql.DB
+	credentialKey          [32]byte
+	workspaceMu            sync.Mutex
+	workspaceCache         map[string]workspace
+	workspaceCacheExpires  map[string]time.Time
+	siteConfigMu           sync.Mutex
+	siteConfigCache        model.SiteConfig
+	siteConfigCacheExpires time.Time
+	siteConfigCacheOK      bool
 }
 
 type workspace struct {
@@ -45,6 +54,11 @@ type sqlExecer interface {
 
 type sqlQueryer interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+type sqlExecQueryer interface {
+	sqlExecer
+	sqlQueryer
 }
 
 type traceIDContextKey struct{}
@@ -62,6 +76,14 @@ const dbMigrationTimeout = 30 * time.Second
 const dbLockTimeout = 5 * time.Second
 const dbStatementTimeout = 60 * time.Second
 const dbIdleTransactionTimeout = 15 * time.Second
+const dbMaxOpenConns = 10
+const dbMaxIdleConns = 5
+const dbConnMaxIdleTime = 10 * time.Minute
+const dbConnMaxLifetime = 30 * time.Minute
+const workspaceCacheTTL = 10 * time.Minute
+const siteConfigCacheTTL = time.Minute
+const canvasCompressionMinBytes = 32 * 1024
+const canvasCompressionEncoding = "gzip+base64"
 
 var dbTxSeq uint64
 var dbLogOnce sync.Once
@@ -237,10 +259,11 @@ func Open(dsn, credentialSecret string) (*Store, error) {
 		return nil, err
 	}
 	fmt.Println("db init: ping")
-	database.SetConnMaxIdleTime(30 * time.Second)
-	database.SetConnMaxLifetime(5 * time.Minute)
-	database.SetMaxIdleConns(0)
-	database.SetMaxOpenConns(10)
+	database.SetConnMaxIdleTime(dbConnMaxIdleTime)
+	database.SetConnMaxLifetime(dbConnMaxLifetime)
+	database.SetMaxIdleConns(dbMaxIdleConns)
+	database.SetMaxOpenConns(dbMaxOpenConns)
+	log.Printf("[db] pool max_open=%d max_idle=%d max_idle_time=%s max_lifetime=%s", dbMaxOpenConns, dbMaxIdleConns, dbConnMaxIdleTime, dbConnMaxLifetime)
 	pingCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	if err := database.PingContext(pingCtx); err != nil {
 		cancel()
@@ -248,7 +271,12 @@ func Open(dsn, credentialSecret string) (*Store, error) {
 		return nil, err
 	}
 	cancel()
-	store := &Store{db: database, credentialKey: key}
+	store := &Store{
+		db:                    database,
+		credentialKey:         key,
+		workspaceCache:        map[string]workspace{},
+		workspaceCacheExpires: map[string]time.Time{},
+	}
 	fmt.Println("db init: migrate")
 	if err := store.migrate(context.Background()); err != nil {
 		database.Close()
@@ -634,10 +662,24 @@ ON CONFLICT (config_key) DO NOTHING`)
 }
 
 func (s *Store) SiteConfig(ctx context.Context) (model.SiteConfig, error) {
+	now := time.Now()
+	s.siteConfigMu.Lock()
+	if s.siteConfigCacheOK && now.Before(s.siteConfigCacheExpires) {
+		config := s.siteConfigCache
+		s.siteConfigMu.Unlock()
+		return config, nil
+	}
+	s.siteConfigMu.Unlock()
+
+	started := time.Now()
 	config := model.SiteConfig{}
 	rows, err := s.db.QueryContext(ctx, `SELECT config_key, value FROM site_config WHERE config_key IN ('baseurl_whitelist_enabled', 'baseurl_whitelist', 'admin_contact_image', 'site_title', 'site_icon', 'worker_concurrency')`)
 	if err != nil {
-		return config, err
+		logDB(ctx, "site_config query error elapsed=%s err=%v", time.Since(started), err)
+		if cached, ok := s.cachedSiteConfigFallback(); ok {
+			return cached, nil
+		}
+		return model.SiteConfig{}, err
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -661,7 +703,29 @@ func (s *Store) SiteConfig(ctx context.Context) (model.SiteConfig, error) {
 			config.WorkerConcurrency, _ = strconv.Atoi(value)
 		}
 	}
-	return config, rows.Err()
+	if err := rows.Err(); err != nil {
+		logDB(ctx, "site_config scan error elapsed=%s err=%v", time.Since(started), err)
+		if cached, ok := s.cachedSiteConfigFallback(); ok {
+			return cached, nil
+		}
+		return model.SiteConfig{}, err
+	}
+	s.siteConfigMu.Lock()
+	s.siteConfigCache = config
+	s.siteConfigCacheExpires = time.Now().Add(siteConfigCacheTTL)
+	s.siteConfigCacheOK = true
+	s.siteConfigMu.Unlock()
+	logDB(ctx, "site_config loaded elapsed=%s ttl=%s", time.Since(started), siteConfigCacheTTL)
+	return config, nil
+}
+
+func (s *Store) cachedSiteConfigFallback() (model.SiteConfig, bool) {
+	s.siteConfigMu.Lock()
+	defer s.siteConfigMu.Unlock()
+	if !s.siteConfigCacheOK {
+		return model.SiteConfig{}, false
+	}
+	return s.siteConfigCache, true
 }
 
 func (s *Store) resolveWorkspace(ctx context.Context, apiKey, baseURL string) (workspace, error) {
@@ -671,12 +735,19 @@ func (s *Store) resolveWorkspace(ctx context.Context, apiKey, baseURL string) (w
 		return workspace{}, fmt.Errorf("缺少 baseurl 或 apikey")
 	}
 	hash := apiKeyHash(apiKey)
+	cacheKey := workspaceCacheKey(baseURLKey, hash)
+	if ws, ok := s.cachedWorkspace(cacheKey); ok {
+		return ws, nil
+	}
 	var ws workspace
-	err := s.db.QueryRowContext(ctx, `SELECT id, base_url, api_key_encrypted FROM workspaces WHERE base_url = $1 AND api_key_hash = $2`, baseURLKey, hash).Scan(&ws.ID, &ws.BaseURL, &ws.EncryptedAPIKey)
+	err := scanLogged(ctx, "workspace.resolve", func() error {
+		return s.db.QueryRowContext(ctx, `SELECT id, base_url, api_key_encrypted FROM workspaces WHERE base_url = $1 AND api_key_hash = $2`, baseURLKey, hash).Scan(&ws.ID, &ws.BaseURL, &ws.EncryptedAPIKey)
+	})
 	if err == nil {
 		if _, err := s.decryptAPIKey(ws.EncryptedAPIKey); err != nil {
 			return workspace{}, fmt.Errorf("workspace api key 解密失败，请检查 APP_CREDENTIAL_KEY 是否与创建该 workspace 时一致")
 		}
+		s.cacheWorkspace(cacheKey, ws)
 		return ws, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -688,7 +759,7 @@ func (s *Store) resolveWorkspace(ctx context.Context, apiKey, baseURL string) (w
 	}
 	now := time.Now().UTC()
 	ws = workspace{ID: uuid.NewString(), BaseURL: baseURLKey, EncryptedAPIKey: encrypted}
-	result, err := s.db.ExecContext(ctx, `
+	result, err := execLogged(ctx, s.db, "workspace.insert", `
 INSERT INTO workspaces (id, base_url, api_key_hash, api_key_encrypted, created_at, updated_at)
 VALUES ($1, $2, $3, $4, $5, $5)
 ON CONFLICT (base_url, api_key_hash) DO NOTHING
@@ -697,16 +768,49 @@ ON CONFLICT (base_url, api_key_hash) DO NOTHING
 		return workspace{}, err
 	}
 	if count, _ := result.RowsAffected(); count > 0 {
+		s.cacheWorkspace(cacheKey, ws)
 		return ws, nil
 	}
-	err = s.db.QueryRowContext(ctx, `SELECT id, base_url, api_key_encrypted FROM workspaces WHERE base_url = $1 AND api_key_hash = $2`, baseURLKey, hash).Scan(&ws.ID, &ws.BaseURL, &ws.EncryptedAPIKey)
+	err = scanLogged(ctx, "workspace.resolve_after_conflict", func() error {
+		return s.db.QueryRowContext(ctx, `SELECT id, base_url, api_key_encrypted FROM workspaces WHERE base_url = $1 AND api_key_hash = $2`, baseURLKey, hash).Scan(&ws.ID, &ws.BaseURL, &ws.EncryptedAPIKey)
+	})
 	if err != nil {
 		return workspace{}, err
 	}
 	if _, err := s.decryptAPIKey(ws.EncryptedAPIKey); err != nil {
 		return workspace{}, fmt.Errorf("workspace api key 解密失败，请检查 APP_CREDENTIAL_KEY 是否与创建该 workspace 时一致")
 	}
+	s.cacheWorkspace(cacheKey, ws)
 	return ws, nil
+}
+
+func workspaceCacheKey(baseURLKey, apiKeyHash string) string {
+	return baseURLKey + "\x00" + apiKeyHash
+}
+
+func (s *Store) cachedWorkspace(cacheKey string) (workspace, bool) {
+	s.workspaceMu.Lock()
+	defer s.workspaceMu.Unlock()
+	expires, ok := s.workspaceCacheExpires[cacheKey]
+	if !ok || time.Now().After(expires) {
+		delete(s.workspaceCache, cacheKey)
+		delete(s.workspaceCacheExpires, cacheKey)
+		return workspace{}, false
+	}
+	return s.workspaceCache[cacheKey], true
+}
+
+func (s *Store) cacheWorkspace(cacheKey string, ws workspace) {
+	s.workspaceMu.Lock()
+	if s.workspaceCache == nil {
+		s.workspaceCache = map[string]workspace{}
+	}
+	if s.workspaceCacheExpires == nil {
+		s.workspaceCacheExpires = map[string]time.Time{}
+	}
+	s.workspaceCache[cacheKey] = ws
+	s.workspaceCacheExpires[cacheKey] = time.Now().Add(workspaceCacheTTL)
+	s.workspaceMu.Unlock()
 }
 
 func apiKeyHash(apiKey string) string {
@@ -774,8 +878,12 @@ func (s *Store) CanvasState(ctx context.Context, apiKey, baseURL string) (model.
 		if err := rows.Scan(&raw, &updatedAt); err != nil {
 			return model.CanvasState{}, err
 		}
-		if json.Valid([]byte(raw)) {
-			items = append(items, json.RawMessage(raw))
+		canvas, err := unpackCanvasFromStorage(json.RawMessage(raw))
+		if err != nil {
+			return model.CanvasState{}, err
+		}
+		if json.Valid(canvas) {
+			items = append(items, canvas)
 		}
 		if updatedAt.After(latest) {
 			latest = updatedAt
@@ -792,10 +900,12 @@ func (s *Store) CanvasState(ctx context.Context, apiKey, baseURL string) (model.
 }
 
 func (s *Store) SaveCanvasState(ctx context.Context, apiKey, baseURL string, canvases []byte) (model.CanvasState, error) {
+	started := time.Now()
 	items, err := decodeCanvasArray(canvases)
 	if err != nil {
 		return model.CanvasState{}, err
 	}
+	logDB(ctx, "canvas.save_full begin canvases=%d bytes=%d", len(items), len(canvases))
 	ws, err := s.resolveWorkspace(ctx, apiKey, baseURL)
 	if err != nil {
 		return model.CanvasState{}, err
@@ -819,10 +929,13 @@ func (s *Store) SaveCanvasState(ctx context.Context, apiKey, baseURL string, can
 	if err != nil {
 		return model.CanvasState{}, err
 	}
+	logDB(ctx, "canvas.save_full done canvases=%d elapsed=%s", len(items), time.Since(started))
 	return model.CanvasState{Canvases: payload, UpdatedAt: now}, nil
 }
 
 func (s *Store) PatchCanvasState(ctx context.Context, apiKey, baseURL string, changed []json.RawMessage, patches []model.CanvasItemPatch, deletedIDs []string) (model.CanvasState, error) {
+	started := time.Now()
+	logDB(ctx, "canvas.patch begin changed=%d patches=%d deleted=%d", len(changed), len(patches), len(deletedIDs))
 	ws, err := s.resolveWorkspace(ctx, apiKey, baseURL)
 	if err != nil {
 		return model.CanvasState{}, err
@@ -867,21 +980,24 @@ func (s *Store) PatchCanvasState(ctx context.Context, apiKey, baseURL string, ch
 		}
 	}
 	now := time.Now().UTC()
-	nextSort, err := nextCanvasSortOrder(ctx, s.db, ws.ID)
-	if err != nil {
-		return model.CanvasState{}, err
+	nextSort := 0
+	nextSortLoaded := false
+	consumeNextSort := func() (int, error) {
+		if !nextSortLoaded {
+			var err error
+			nextSort, err = nextCanvasSortOrder(ctx, s.db, ws.ID)
+			if err != nil {
+				return 0, err
+			}
+			nextSortLoaded = true
+		}
+		sortOrder := nextSort
+		nextSort++
+		return sortOrder, nil
 	}
 	for _, id := range changedOrder {
 		canvas := changedByID[id]
-		sortOrder, exists, err := currentCanvasSortOrder(ctx, s.db, ws.ID, id)
-		if err != nil {
-			return model.CanvasState{}, err
-		}
-		if !exists {
-			sortOrder = nextSort
-			nextSort++
-		}
-		if err := upsertCanvasRow(ctx, s.db, ws.ID, id, jsonObjectString(canvas, "name"), canvas, sortOrder, now); err != nil {
+		if err := upsertCanvasRowPreserveSort(ctx, s.db, ws.ID, id, jsonObjectString(canvas, "name"), canvas, now); err != nil {
 			return model.CanvasState{}, err
 		}
 	}
@@ -892,7 +1008,7 @@ func (s *Store) PatchCanvasState(ctx context.Context, apiKey, baseURL string, ch
 		patch := patchByID[id]
 		var currentRaw string
 		var sortOrder int
-		err := scanLogged(ctx, "canvas.select_for_update canvas_id="+compactID(id), func() error {
+		err := scanLogged(ctx, "canvas.current_snapshot canvas_id="+compactID(id), func() error {
 			return s.db.QueryRowContext(ctx, `SELECT canvas_json::text, sort_order FROM canvases WHERE workspace_id = $1 AND canvas_id = $2`, ws.ID, id).Scan(&currentRaw, &sortOrder)
 		})
 		var canvas json.RawMessage
@@ -901,12 +1017,18 @@ func (s *Store) PatchCanvasState(ctx context.Context, apiKey, baseURL string, ch
 			if err != nil {
 				return model.CanvasState{}, err
 			}
-			sortOrder = nextSort
-			nextSort++
+			sortOrder, err = consumeNextSort()
+			if err != nil {
+				return model.CanvasState{}, err
+			}
 		} else if err != nil {
 			return model.CanvasState{}, err
 		} else {
-			canvas, err = applyCanvasPatch(json.RawMessage(currentRaw), patch)
+			currentCanvas, err := unpackCanvasFromStorage(json.RawMessage(currentRaw))
+			if err != nil {
+				return model.CanvasState{}, err
+			}
+			canvas, err = applyCanvasPatch(currentCanvas, patch)
 			if err != nil {
 				return model.CanvasState{}, err
 			}
@@ -916,6 +1038,7 @@ func (s *Store) PatchCanvasState(ctx context.Context, apiKey, baseURL string, ch
 		}
 	}
 
+	logDB(ctx, "canvas.patch done changed=%d patches=%d deleted=%d sort_loaded=%t elapsed=%s", len(changed), len(patches), len(deletedIDs), nextSortLoaded, time.Since(started))
 	return model.CanvasState{UpdatedAt: now}, nil
 }
 
@@ -941,12 +1064,49 @@ func lockCanvasScope(ctx context.Context, tx *sql.Tx, workspaceID string) error 
 }
 
 func upsertCanvasRow(ctx context.Context, exec sqlExecer, workspaceID, canvasID, name string, canvas json.RawMessage, sortOrder int, now time.Time) error {
-	_, err := execLogged(ctx, exec, fmt.Sprintf("canvas.upsert_row canvas_id=%s bytes=%d", compactID(canvasID), len(canvas)), `
+	storedCanvas, err := packCanvasForStorage(canvas)
+	if err != nil {
+		return err
+	}
+	_, err = execLogged(ctx, exec, fmt.Sprintf("canvas.upsert_row canvas_id=%s bytes=%d stored_bytes=%d", compactID(canvasID), len(canvas), len(storedCanvas)), `
 INSERT INTO canvases (workspace_id, canvas_id, name, canvas_json, sort_order, created_at, updated_at)
 VALUES ($1, $2, $3, $4::jsonb, $5, $6, $6)
 ON CONFLICT (workspace_id, canvas_id)
 DO UPDATE SET name = EXCLUDED.name, canvas_json = EXCLUDED.canvas_json, sort_order = EXCLUDED.sort_order, updated_at = EXCLUDED.updated_at
-`, workspaceID, canvasID, name, string(canvas), sortOrder, now)
+`, workspaceID, canvasID, name, string(storedCanvas), sortOrder, now)
+	return err
+}
+
+func upsertCanvasRowPreserveSort(ctx context.Context, exec sqlExecQueryer, workspaceID, canvasID, name string, canvas json.RawMessage, now time.Time) error {
+	storedCanvas, err := packCanvasForStorage(canvas)
+	if err != nil {
+		return err
+	}
+	result, err := execLogged(ctx, exec, fmt.Sprintf("canvas.update_row canvas_id=%s bytes=%d stored_bytes=%d", compactID(canvasID), len(canvas), len(storedCanvas)), `
+UPDATE canvases
+SET name = $3, canvas_json = $4::jsonb, updated_at = $5
+WHERE workspace_id = $1 AND canvas_id = $2
+`, workspaceID, canvasID, name, string(storedCanvas), now)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count > 0 {
+		return nil
+	}
+	sortOrder, err := nextCanvasSortOrder(ctx, exec, workspaceID)
+	if err != nil {
+		return err
+	}
+	return upsertStoredCanvasRow(ctx, exec, workspaceID, canvasID, name, storedCanvas, sortOrder, now, len(canvas))
+}
+
+func upsertStoredCanvasRow(ctx context.Context, exec sqlExecer, workspaceID, canvasID, name string, storedCanvas json.RawMessage, sortOrder int, now time.Time, originalBytes int) error {
+	_, err := execLogged(ctx, exec, fmt.Sprintf("canvas.upsert_row canvas_id=%s bytes=%d stored_bytes=%d", compactID(canvasID), originalBytes, len(storedCanvas)), `
+INSERT INTO canvases (workspace_id, canvas_id, name, canvas_json, sort_order, created_at, updated_at)
+VALUES ($1, $2, $3, $4::jsonb, $5, $6, $6)
+ON CONFLICT (workspace_id, canvas_id)
+DO UPDATE SET name = EXCLUDED.name, canvas_json = EXCLUDED.canvas_json, sort_order = EXCLUDED.sort_order, updated_at = EXCLUDED.updated_at
+`, workspaceID, canvasID, name, string(storedCanvas), sortOrder, now)
 	return err
 }
 
@@ -987,6 +1147,60 @@ func currentCanvasSortOrder(ctx context.Context, query sqlQueryer, workspaceID, 
 		return 0, false, err
 	}
 	return sortOrder, true, nil
+}
+
+func packCanvasForStorage(canvas json.RawMessage) (json.RawMessage, error) {
+	if len(canvas) < canvasCompressionMinBytes {
+		return canvas, nil
+	}
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(canvas); err != nil {
+		_ = writer.Close()
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	wrapper, err := json.Marshal(map[string]any{
+		"__image_web_canvas_storage": canvasCompressionEncoding,
+		"size":                       len(canvas),
+		"data":                       base64.StdEncoding.EncodeToString(compressed.Bytes()),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(wrapper) >= len(canvas) {
+		return canvas, nil
+	}
+	return json.RawMessage(wrapper), nil
+}
+
+func unpackCanvasFromStorage(raw json.RawMessage) (json.RawMessage, error) {
+	var wrapper struct {
+		Storage string `json:"__image_web_canvas_storage"`
+		Data    string `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &wrapper); err != nil || wrapper.Storage != canvasCompressionEncoding {
+		return raw, nil
+	}
+	compressed, err := base64.StdEncoding.DecodeString(wrapper.Data)
+	if err != nil {
+		return nil, err
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	canvas, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	if !json.Valid(canvas) {
+		return nil, fmt.Errorf("compressed canvas payload is invalid JSON")
+	}
+	return json.RawMessage(canvas), nil
 }
 
 func applyCanvasPatch(canvas json.RawMessage, patch model.CanvasItemPatch) (json.RawMessage, error) {

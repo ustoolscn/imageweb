@@ -8,6 +8,7 @@ import (
 	_ "image/jpeg"
 	"image/png"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"slices"
@@ -48,6 +49,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 }
 
 func (h *Handler) canvases(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	log.Printf("[canvas-api] method=%s begin content_length=%d", r.Method, r.ContentLength)
 	switch r.Method {
 	case http.MethodGet:
 		apiKey := r.URL.Query().Get("apikey")
@@ -59,17 +62,20 @@ func (h *Handler) canvases(w http.ResponseWriter, r *http.Request) {
 		if !h.allowBaseURL(w, r, baseURL) {
 			return
 		}
+		log.Printf("[canvas-api] method=GET allow_done elapsed=%s", time.Since(started))
 		state, err := h.Store.CanvasState(r.Context(), apiKey, baseURL)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		log.Printf("[canvas-api] method=GET store_done elapsed=%s", time.Since(started))
 		writeJSON(w, http.StatusOK, state)
 	case http.MethodPatch:
 		var req model.CanvasPatchRequest
 		if !decodeJSONLimit(w, r, &req, 64<<20) {
 			return
 		}
+		log.Printf("[canvas-api] method=PATCH decode_done changed=%d patches=%d deleted=%d elapsed=%s", len(req.Canvases), len(req.CanvasPatches), len(req.DeletedCanvasIDs), time.Since(started))
 		if req.APIKey == "" || req.BaseURL == "" {
 			writeError(w, http.StatusBadRequest, "缺少 baseurl 或 apikey")
 			return
@@ -122,17 +128,20 @@ func (h *Handler) canvases(w http.ResponseWriter, r *http.Request) {
 		if !h.allowBaseURL(w, r, req.BaseURL) {
 			return
 		}
+		log.Printf("[canvas-api] method=PATCH allow_done elapsed=%s", time.Since(started))
 		state, err := h.Store.PatchCanvasState(r.Context(), req.APIKey, req.BaseURL, req.Canvases, req.CanvasPatches, req.DeletedCanvasIDs)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		log.Printf("[canvas-api] method=PATCH store_done elapsed=%s", time.Since(started))
 		writeJSON(w, http.StatusOK, model.CanvasSaveResponse{UpdatedAt: state.UpdatedAt})
 	case http.MethodPut:
 		var req model.CanvasStateRequest
 		if !decodeJSONLimit(w, r, &req, 64<<20) {
 			return
 		}
+		log.Printf("[canvas-api] method=PUT decode_done bytes=%d elapsed=%s", len(req.Canvases), time.Since(started))
 		if req.APIKey == "" || req.BaseURL == "" {
 			writeError(w, http.StatusBadRequest, "缺少 baseurl 或 apikey")
 			return
@@ -149,11 +158,13 @@ func (h *Handler) canvases(w http.ResponseWriter, r *http.Request) {
 		if !h.allowBaseURL(w, r, req.BaseURL) {
 			return
 		}
+		log.Printf("[canvas-api] method=PUT allow_done elapsed=%s", time.Since(started))
 		state, err := h.Store.SaveCanvasState(r.Context(), req.APIKey, req.BaseURL, req.Canvases)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		log.Printf("[canvas-api] method=PUT store_done elapsed=%s", time.Since(started))
 		writeJSON(w, http.StatusOK, model.CanvasSaveResponse{UpdatedAt: state.UpdatedAt})
 	default:
 		methodNotAllowed(w)

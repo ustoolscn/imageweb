@@ -2,6 +2,7 @@ package db
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"image-web/backend/internal/model"
@@ -69,5 +70,35 @@ func TestDecodeCanvasArrayRequiresCanvasIDs(t *testing.T) {
 
 	if _, err := decodeCanvasArray([]byte(`[{"name":"missing"}]`)); err == nil {
 		t.Fatal("expected missing canvas id to fail")
+	}
+}
+
+func TestPackCanvasForStorageRoundTripsLargeCanvas(t *testing.T) {
+	canvas := json.RawMessage(`{"id":"canvas-1","name":"A","elements":[{"id":"node-1","text":"` + strings.Repeat("hello ", 9000) + `"}],"connections":[]}`)
+
+	stored, err := packCanvasForStorage(canvas)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) >= len(canvas) {
+		t.Fatalf("stored canvas was not compressed: original=%d stored=%d", len(canvas), len(stored))
+	}
+	restored, err := unpackCanvasFromStorage(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != string(canvas) {
+		t.Fatal("restored canvas did not match original")
+	}
+}
+
+func TestUnpackCanvasFromStorageLeavesPlainCanvasUntouched(t *testing.T) {
+	canvas := json.RawMessage(`{"id":"canvas-1","name":"plain","elements":[],"connections":[]}`)
+	restored, err := unpackCanvasFromStorage(canvas)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != string(canvas) {
+		t.Fatal("plain canvas changed during unpack")
 	}
 }

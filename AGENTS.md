@@ -38,7 +38,7 @@ Image Web 是一个前后端同仓库项目：
 - `backend/cmd/server/main.go`：服务入口。加载配置、创建应用、启动 HTTP 服务，并处理 SIGINT/SIGTERM 优雅关闭。
 - `backend/internal/app/app.go`：应用装配层。连接数据库、重置过期运行任务、创建 generator/imagehost/handler/worker、注册 API 与静态文件服务、添加安全响应头，并为 HTTP 请求生成 trace 日志，便于和数据库事务日志对应。
 - `backend/internal/config/config.go`：配置加载。会尝试读取当前目录、上级目录和可执行文件附近的 `.env`。
-- `backend/internal/db/db.go`：PostgreSQL Store。包含最新建表 schema、workspace/API key 加密、任务 CRUD、任务源数据与媒体素材拆表读写、画布状态、广场分享/点赞、任务调度状态更新、视频轮询状态更新；关键事务、启动 migration、画布 advisory lock、`task_sources` 和 `task_media_assets` 写入都会输出带 trace/事务 id 的日志，用于排查数据库锁等待。DB 日志必须保持异步非阻塞，不能在事务提交前用同步日志阻塞 goroutine。
+- `backend/internal/db/db.go`：PostgreSQL Store。包含最新建表 schema、workspace/API key 加密、任务 CRUD、任务源数据与媒体素材拆表读写、画布状态、广场分享/点赞、任务调度状态更新、视频轮询状态更新；数据库连接池会保留少量空闲连接并延长空闲连接保留时间，避免远程 PostgreSQL 上每条小 SQL 都重新建连；`site_config` 和 workspace 解析使用短 TTL 缓存，减少保存路径上的固定查询；关键事务、启动 migration、workspace 解析、画布保存、`task_sources` 和 `task_media_assets` 写入都会输出带 trace/事务 id 的日志，用于排查数据库锁等待。DB 日志必须保持异步非阻塞，不能在事务提交前用同步日志阻塞 goroutine。
 - `backend/internal/handler/handlers.go`：HTTP API 层。注册 `/api/*` 路由，做参数校验、baseurl 白名单检查、任务创建、任务列表、上传、LLM、模型查询、画布和广场接口。
 - `backend/internal/model/types.go`：后端 API、任务、媒体素材、站点配置等共享类型。
 - `backend/internal/sourceclean/`：源数据入库前的压缩/脱敏工具。请求或响应源数据中不应保留原始 base64、data URL、`b64_json`、`inline_data.data`、`inlineData.data`、`thoughtSignature` 等大字段。
@@ -99,14 +99,14 @@ Image Web 是一个前后端同仓库项目：
 
 1. 用户通过 URL 参数或设置弹窗提供 `baseurl` 和 `apikey`，前端保存到 `localStorage` 并清理 URL 中的敏感参数。
 2. 前端通过 `/api/site-brand`、`/api/models` 等接口读取站点品牌、模型和能力配置。
-3. 后端收到带 `baseurl + apikey` 的请求后，会解析/创建 `workspaces` 行：业务表只保存 `workspace_id`，API key 以 hash 做查找、以 `APP_CREDENTIAL_KEY` 派生密钥加密保存，worker 调度时再解密回填到 `Task.APIKey`。数据库连接默认带 `lock_timeout`、`statement_timeout` 和 `idle_in_transaction_session_timeout`，事务内也会设置同样保护，避免单个异常任务写入把 PostgreSQL 长时间锁死。
+3. 后端收到带 `baseurl + apikey` 的请求后，会解析/创建 `workspaces` 行：业务表只保存 `workspace_id`，API key 以 hash 做查找、以 `APP_CREDENTIAL_KEY` 派生密钥加密保存，worker 调度时再解密回填到 `Task.APIKey`。数据库连接默认带 `lock_timeout`、`statement_timeout` 和 `idle_in_transaction_session_timeout`，事务内也会设置同样保护；连接池保留空闲连接并延长空闲保留时间以服务远程 PostgreSQL，避免画布保存这类多条小 SQL 反复建连。
 4. 创建任务时，前端调用 `/api/tasks`；后端写入 `tasks`，状态为 `pending`，参考图片/视频/音频写入 `task_media_assets`。任务页图片生成的“数量”是前端批量提交次数，范围 1-5，不作为上游大模型参数；每次提交仍固定传 `n: 1`，数量为 5 时会创建 5 个独立任务。
 5. Worker 周期性读取 pending 任务并置为 `running`；空队列时只允许单个取任务查询在途，并短暂退避，避免远程 PostgreSQL 上无任务时被并发空轮询压垮。
 6. 图片任务调用上游图片生成/编辑接口，下载结果，转存到图床，结果写入 `task_media_assets`；请求/响应源数据经 `sourceclean` 移除原始 base64 后写入 `task_sources`，但源数据只作为诊断信息在任务状态/素材事务提交后 best-effort 保存，不能因为源数据 upsert 卡住而阻塞任务完成或持有事务锁。图片任务总执行时间限制为 10 分钟：超过后自动取消当前上游请求并标记为 `failed`，启动或 Worker 调度时发现超过 10 分钟仍处于 `running` 的图片任务也会直接标记失败，不再重置回 `pending` 自动重跑，避免上游实际已生成但本地重复调用。前端不提供背景选择；后端不做透明背景/抠图后处理。`gpt-image-2` 的上游请求不发送 `background` 参数。
 7. 视频任务先提交上游任务，保存 upstream task id；后续轮询完成后下载视频、转存图床，并用 `ffmpeg` 以低占用参数抽取最长边约 480px 的首帧/尾帧图片，结果写入 `task_media_assets`，轮询响应源数据经 `sourceclean` 移除原始 base64 后更新到 `task_sources`。
 8. 前端通过共享的 `/api/tasks/updates` 以 10 秒间隔轮询更新运行中任务状态；画布会把节点引用的任务 id 和轻量任务快照同步给 App，刷新页面后即使节点只有 `task_id` 也会先补拉一次任务详情，再把画布中的 pending/running 任务纳入轮询，并在完成后回填节点结果。生成节点成功产出内容后会自动进入固化状态，后续流程会跳过该节点，用户可手动取消固化后重新运行。画布节点读取任务时要在节点本地 `task_snapshot`、父级画布任务缓存、任务列表和素材页缓存中选择结果最完整/状态最新的一份，避免刚完成的上游素材无法立刻传给下游节点。画布任务缓存与全局任务列表分离，不能为了追踪画布运行态把画布任务塞进任务列表，否则会污染任务页和素材列表顺序。视频素材封面和尾帧必须优先使用 `thumbnail_url`、`first_frame_url`、`last_frame_url` 这些已固化字段，不要再让浏览器临时读取远程视频抽帧。画布节点等待任务完成时也复用这条更新通道，避免同时高频请求单个 `/api/tasks/{id}` 详情。任务还可查看详情、收藏、重试、删除、分享到广场。
 9. 广场功能通过 `plaza_items` 和 `plaza_likes` 表实现公开展示、点赞、导入/复用；任务分享使用真实 nullable `task_id`，画布分享使用真实 `workspace_id + canvas_id`，不允许再伪造 `task_id = canvas:*`。前端进入广场时使用 60 秒内存缓存：列表为空、缓存过期或页面初始视图就是广场时会请求 `/api/plaza`，否则复用已有 `plazaItems`。
-10. 画布状态通过 `/api/canvases` 保存到 PostgreSQL，数据库层是一张画布一行，主键为 `workspace_id + canvas_id`。前端同时按当前 `baseurl + apikey` 分区保存本地副本和保存元数据，加载云端时需要比较本地/云端更新时间，避免旧云端内容静默覆盖较新的本地画布。实时同步使用 5 秒防抖，优先使用 `PATCH /api/canvases` 只上传新增画布、变更节点/连线、删除 id 和画布名变更；首次同步或无基线时才使用 `PUT /api/canvases` 全量保存。后端 `PUT/PATCH /api/canvases` 使用单语句 autocommit 写入，不要再包显式长事务或画布 advisory lock，避免远程 PostgreSQL 在日志/网络慢时留下 `idle in transaction`；PATCH 必须只更新受影响的画布行，不要恢复成把同一用户所有画布塞进单行 JSONB 的设计。节点拖拽或调整大小期间暂停深度保存、云端同步和历史快照，结束交互后只保存一次，避免连接线较多时卡顿。节点内的 `task_snapshot` 必须保持轻量，只保留展示、结果 URL、进度和继续轮询需要的字段，不要保存 `request_json`、`response_json` 等源数据大字段。`GET /api/canvases` 返回完整画布数组，`PUT/PATCH /api/canvases` 保存成功只返回 `updated_at`，避免保存响应体再次传回所有画布。
+10. 画布状态通过 `/api/canvases` 保存到 PostgreSQL，数据库层是一张画布一行，主键为 `workspace_id + canvas_id`。前端同时按当前 `baseurl + apikey` 分区保存本地副本和保存元数据，加载云端时需要比较本地/云端更新时间，避免旧云端内容静默覆盖较新的本地画布。实时同步使用 5 秒防抖，优先使用 `PATCH /api/canvases` 只上传新增画布、删除 id 和当前修改画布；普通画布行小于约 256KB 时前端发送当前修改的单张画布完整行，后端单条 update/upsert 并保留原有排序，超过阈值才回退到节点/连线级 patch；首次同步或无基线时才使用 `PUT /api/canvases` 全量保存。后端 `PUT/PATCH /api/canvases` 使用单语句 autocommit 写入，不要再包显式长事务或画布 advisory lock，避免远程 PostgreSQL 在日志/网络慢时留下 `idle in transaction`；PATCH 必须只更新受影响的画布行，且只有新增画布时才查询下一个 `sort_order`，不要恢复成把同一用户所有画布塞进单行 JSONB 的设计。超过约 32KB 的画布行写入 `canvases.canvas_json` 前会 gzip+base64 包装压缩，读取时后端自动解压，前端 API shape 不变；不要在前端依赖数据库内的压缩包装结构。节点拖拽或调整大小期间暂停深度保存、云端同步和历史快照，结束交互后只保存一次，避免连接线较多时卡顿。节点内的 `task_snapshot` 必须保持轻量，只保留展示、结果 URL、进度和继续轮询需要的字段，不要保存 `request_json`、`response_json` 等源数据大字段。`GET /api/canvases` 返回完整画布数组，`PUT/PATCH /api/canvases` 保存成功只返回 `updated_at`，避免保存响应体再次传回所有画布。
 
 ## 数据库与配置
 
@@ -119,7 +119,7 @@ Image Web 是一个前后端同仓库项目：
 - `task_sources` 保存任务 request/response headers/json；任务列表不加载源数据，任务详情才读取。写入前必须压缩/脱敏源数据，不保存原始 base64、data URL 或上游思考签名等大字段。
 - `task_media_assets` 保存参考素材和结果素材，按 `role + sort_order` 还原为前端现有数组字段；视频素材字段包括 `thumbnail_url`、`first_frame_url`、`last_frame_url`，展示封面和画布尾帧节点应优先使用这些字段。
 - `plaza_items` 保存公开广场条目，任务分享使用 nullable `task_id`，画布分享使用 `workspace_id + canvas_id` 和 `canvas_json` 快照；`plaza_likes` 通过外键级联删除。
-- `canvases` 保存用户画布状态，一张画布一行，字段包括 `workspace_id`、`canvas_id`、`name`、`canvas_json`、`sort_order`、`created_at`、`updated_at`。
+- `canvases` 保存用户画布状态，一张画布一行，字段包括 `workspace_id`、`canvas_id`、`name`、`canvas_json`、`sort_order`、`created_at`、`updated_at`；较大的 `canvas_json` 可能是后端内部 gzip+base64 包装对象，所有 API 读取必须经后端解压还原。
 
 常用环境变量见 `.env.example` 和 `README.md`。重要项包括：
 
