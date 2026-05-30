@@ -78,7 +78,8 @@ type CanvasElement = {
 
 type CanvasConnection = { id: string; from: string; to: string }
 type BoardCanvas = { id: string; name: string; elements: CanvasElement[]; connections: CanvasConnection[] }
-type CanvasLocalMeta = { updatedAt?: string; cloudUpdatedAt?: string; activeCanvasID?: string }
+type CanvasLocalMeta = { updatedAt?: string; cloudUpdatedAt?: string; activeCanvasID?: string; workspaceKey?: string }
+type CanvasStorageKeys = { canvas: string; meta: string; workspaceKey: string }
 type CanvasSaveState = 'loading' | 'local' | 'pending' | 'saving' | 'saved' | 'error'
 type CanvasDrawer = '' | 'board' | 'nodes' | 'view' | 'save'
 type CanvasCloudDelta = { full: boolean; canvases: BoardCanvas[]; patches: CanvasPatchPayload[]; deleted: string[] }
@@ -594,10 +595,12 @@ function drawerGroupClass(drawer: Exclude<CanvasDrawer, ''>) {
 
 function readLocalCanvasState(): { canvases: BoardCanvas[]; meta: CanvasLocalMeta } {
   const keys = currentCanvasStorageKeys()
-  // Once a workspace scope exists, never fall back to the legacy global key.
-  // Otherwise switching API keys can leak another workspace's local canvases.
-  const payload = localStorage.getItem(keys.canvas) || ''
   const meta = readCanvasMeta(keys.meta)
+  if (keys.workspaceKey && meta.workspaceKey !== keys.workspaceKey) {
+    discardUntrustedScopedCanvasState(keys)
+    return { canvases: [createBlankCanvas()], meta: {} }
+  }
+  const payload = localStorage.getItem(keys.canvas) || ''
   try {
     const parsed = JSON.parse(payload || '')
     if (Array.isArray(parsed) && parsed.length) {
@@ -609,11 +612,24 @@ function readLocalCanvasState(): { canvases: BoardCanvas[]; meta: CanvasLocalMet
   } catch {
     // Use the default below.
   }
-  return { canvases: [{ id: createID(), name: '画布 1', elements: [], connections: [] }], meta }
+  return { canvases: [createBlankCanvas()], meta }
+}
+
+function createBlankCanvas(): BoardCanvas {
+  return { id: createID(), name: '画布 1', elements: [], connections: [] }
+}
+
+function discardUntrustedScopedCanvasState(keys: CanvasStorageKeys) {
+  try {
+    localStorage.removeItem(keys.canvas)
+    localStorage.removeItem(keys.meta)
+  } catch {
+    // Keep rendering with an empty canvas even if localStorage cleanup fails.
+  }
 }
 
 function normalizeCanvases(raw: unknown): BoardCanvas[] {
-  if (!Array.isArray(raw) || !raw.length) return [{ id: createID(), name: '画布 1', elements: [], connections: [] }]
+  if (!Array.isArray(raw) || !raw.length) return [createBlankCanvas()]
   return raw.map((canvas: Partial<BoardCanvas>, index) => ({
     id: canvas.id || createID(),
     name: canvas.name || `画布 ${index + 1}`,
@@ -756,13 +772,15 @@ function saveCanvases(options: { updatedAt?: string; cloudUpdatedAt?: string; st
 }
 
 function saveCanvasMeta(overrides: Partial<CanvasLocalMeta> = {}) {
+  const keys = currentCanvasStorageKeys()
   const meta: CanvasLocalMeta = {
     updatedAt: overrides.updatedAt ?? canvasLastSavedAt.value,
     cloudUpdatedAt: overrides.cloudUpdatedAt ?? canvasLastCloudSavedAt.value,
     activeCanvasID: activeCanvasID.value,
   }
+  if (keys.workspaceKey) meta.workspaceKey = keys.workspaceKey
   try {
-    localStorage.setItem(currentCanvasStorageKeys().meta, JSON.stringify(meta))
+    localStorage.setItem(keys.meta, JSON.stringify(meta))
   } catch (error) {
     canvasSaveState.value = 'error'
     canvasSaveDetail.value = error instanceof Error ? `保存状态记录失败：${error.message}` : '保存状态记录失败'
@@ -973,11 +991,11 @@ function canvasDeltaChangeCount(delta: CanvasCloudDelta) {
       + (patch.deleted_connection_ids?.length || 0), 0)
 }
 
-function currentCanvasStorageKeys() {
+function currentCanvasStorageKeys(): CanvasStorageKeys {
   const suffix = workspaceStorageSuffix()
   return suffix
-    ? { canvas: `${STORAGE_SCOPED_PREFIX}${suffix}`, meta: `${STORAGE_META_SCOPED_PREFIX}${suffix}` }
-    : { canvas: STORAGE_KEY, meta: STORAGE_META_KEY }
+    ? { canvas: `${STORAGE_SCOPED_PREFIX}${suffix}`, meta: `${STORAGE_META_SCOPED_PREFIX}${suffix}`, workspaceKey: suffix }
+    : { canvas: STORAGE_KEY, meta: STORAGE_META_KEY, workspaceKey: '' }
 }
 
 function workspaceStorageSuffix() {
@@ -988,7 +1006,7 @@ function workspaceStorageSuffix() {
 }
 
 function normalizeStorageBaseURL(value: string) {
-  return value.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '')
+  return value.trim().replace(/\/+$/, '')
 }
 
 function hashStorageKey(value: string) {
@@ -1009,6 +1027,7 @@ function readCanvasMeta(key: string): CanvasLocalMeta {
       updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : '',
       cloudUpdatedAt: typeof value.cloudUpdatedAt === 'string' ? value.cloudUpdatedAt : '',
       activeCanvasID: typeof value.activeCanvasID === 'string' ? value.activeCanvasID : '',
+      workspaceKey: typeof value.workspaceKey === 'string' ? value.workspaceKey : '',
     }
   } catch {
     return {}
