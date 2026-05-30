@@ -7,6 +7,7 @@ import { fetchCanvases, fetchVideoFrames, listTasks, patchCanvasesCloud, saveCan
 import type { CanvasPatchPayload } from '../api'
 import type { MediaAsset, Task, UploadedImage } from '../types'
 import type { CanvasLLMPayload, CanvasRunPayload, ImageForm } from '../uiTypes'
+import { downloadFile } from '../lib/download'
 import { normalizeVideoSettings, supportsVideoDraft, videoModelCapability, videoRatioLabel, videoRatioOptions, videoResolutionOptions } from '../lib/videoModels'
 import { nanoBananaRatios, nanoBananaSizeBaseOptions, nanoBananaSizeValue, parseNanoBananaSize, parseSeedreamSize, ratioOptions, seedreamRatios, seedreamSizeBaseOptions, seedreamSizeValue, sizeBaseOptions, sizeFromRatio } from '../lib/sizes'
 import { displayImageURL, isVideoTask } from '../lib/view'
@@ -2211,13 +2212,7 @@ function downloadNodeMedia(element: CanvasElement) {
     showCanvasNotice('当前素材没有可下载地址')
     return
   }
-  const link = document.createElement('a')
-  link.href = media.url
-  link.download = media.filename || filenameFromURL(media.url) || `${nodeBadge(element) || 'media'}`
-  link.rel = 'noopener'
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
+  downloadFile(media.url, media.filename || filenameFromURL(media.url) || `${nodeBadge(element) || 'media'}`)
 }
 
 function openSelectionContextMenu(event: { event: MouseEvent; nodes: Array<{ id: string }> }) {

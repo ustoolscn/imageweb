@@ -9,8 +9,11 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"mime"
+	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -37,6 +40,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/models", h.models)
 	mux.HandleFunc("/api/llm", h.llm)
 	mux.HandleFunc("/api/upload", h.upload)
+	mux.HandleFunc("/api/download", h.download)
 	mux.HandleFunc("/api/video-frames", h.videoFrames)
 	mux.HandleFunc("/api/mask-preview", h.maskPreview)
 	mux.HandleFunc("/api/canvases", h.canvases)
@@ -46,6 +50,66 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/tasks", h.tasks)
 	mux.HandleFunc("/api/tasks/updates", h.taskUpdates)
 	mux.HandleFunc("/api/tasks/", h.taskByID)
+}
+
+func (h *Handler) download(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	rawURL := strings.TrimSpace(r.URL.Query().Get("url"))
+	if rawURL == "" {
+		writeError(w, http.StatusBadRequest, "缺少下载地址")
+		return
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" || !slices.Contains([]string{"http", "https"}, parsed.Scheme) {
+		writeError(w, http.StatusBadRequest, "下载地址无效")
+		return
+	}
+	if !downloadHostAllowed(parsed, r.Host) {
+		writeError(w, http.StatusBadRequest, "不允许下载该地址")
+		return
+	}
+
+	filename := safeDownloadFilename(r.URL.Query().Get("filename"))
+	if filename == "" {
+		filename = safeDownloadFilename(filenameFromURL(rawURL, "download"))
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "下载地址无效")
+		return
+	}
+	req.Header.Set("User-Agent", "image-web-downloader/1.0")
+	client := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "下载素材失败："+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("下载素材失败：HTTP %d", resp.StatusCode))
+		return
+	}
+
+	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if contentType == "" {
+		contentType = mime.TypeByExtension(filepath.Ext(filename))
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", downloadContentDisposition(filename))
+	w.Header().Set("Cache-Control", "no-store")
+	if length := strings.TrimSpace(resp.Header.Get("Content-Length")); length != "" {
+		w.Header().Set("Content-Length", length)
+	}
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("[download] copy failed url=%s err=%v", maskBaseURL(rawURL), err)
+	}
 }
 
 func (h *Handler) canvases(w http.ResponseWriter, r *http.Request) {
@@ -1016,6 +1080,70 @@ func filenameFromURL(value, fallback string) string {
 		return fallback
 	}
 	return path
+}
+
+func downloadHostAllowed(parsed *url.URL, requestHost string) bool {
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if host == "" {
+		return false
+	}
+	if sameHostname(host, requestHost) {
+		if strings.HasPrefix(parsed.EscapedPath(), "/api/download") {
+			return false
+		}
+	}
+	return true
+}
+
+func sameHostname(host, requestHost string) bool {
+	requestHost = strings.ToLower(strings.TrimSpace(requestHost))
+	if requestHost == "" {
+		return false
+	}
+	if parsedHost, _, err := net.SplitHostPort(requestHost); err == nil {
+		requestHost = parsedHost
+	}
+	return host == requestHost
+}
+
+func safeDownloadFilename(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	value = filepath.Base(value)
+	value = strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+			return '-'
+		default:
+			if r < 32 {
+				return -1
+			}
+			return r
+		}
+	}, value)
+	value = strings.Trim(value, ". ")
+	if value == "" {
+		return "download"
+	}
+	return value
+}
+
+func downloadContentDisposition(filename string) string {
+	ascii := strings.Map(func(r rune) rune {
+		if r < 32 {
+			return -1
+		}
+		if r > 126 || r == '"' || r == '\\' {
+			return '_'
+		}
+		return r
+	}, filename)
+	if ascii == "" {
+		ascii = "download"
+	}
+	return fmt.Sprintf("attachment; filename=%q; filename*=UTF-8''%s", ascii, url.PathEscape(filename))
 }
 
 func cleanMediaAssets(items []model.MediaAsset, assetType string) []model.MediaAsset {

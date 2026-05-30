@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { ComponentPublicInstance } from 'vue'
 import type { PreviewImage } from '../uiTypes'
+import { downloadFile } from '../lib/download'
 import AppIcon from './AppIcon.vue'
 
 type MaskTool = 'pan' | 'brush' | 'eraser'
@@ -224,13 +225,7 @@ function closePreviewContextMenu() {
 }
 
 function downloadPreviewImage() {
-  const link = document.createElement('a')
-  link.href = props.image.url
-  link.download = filenameFromURL(props.image.url, `${props.image.label || 'preview'}.png`)
-  link.rel = 'noopener noreferrer'
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
+  downloadFile(props.image.url, filenameFromURL(props.image.url, `${props.image.label || 'preview'}.png`))
   previewContextMenu.value = null
 }
 

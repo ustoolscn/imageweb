@@ -16,6 +16,7 @@ import SourceModal from './components/SourceModal.vue'
 import TaskDetailModal from './components/TaskDetailModal.vue'
 import TaskGrid from './components/TaskGrid.vue'
 import VideoSizeModal from './components/VideoSizeModal.vue'
+import { downloadFile } from './lib/download'
 import { nanoBananaRatios, nanoBananaSizeBaseOptions, nanoBananaSizeValue, parseNanoBananaSize, parseSeedreamSize, ratioOptions, seedreamRatios, seedreamSizeBaseOptions, seedreamSizeValue, sizeBaseOptions, sizeFromRatio, type SizeBase } from './lib/sizes'
 import { normalizeVideoSettings, supportsVideoDraft, videoRatioOptions, videoResolutionFromSize, videoResolutionOptions, videoSizeFor, videoSizeLabel, type VideoResolution } from './lib/videoModels'
 import { canOpenSource, canShareTask, isFavorite, maskBaseURL } from './lib/view'
@@ -1602,17 +1603,11 @@ function inferReferenceAssetType(url: string): 'image' | 'video' | 'audio' {
 }
 
 function openResultImage(task: Task | PlazaItem) {
-  const videoURL = task.result_videos?.[0]?.url
-  const imageURL = task.result_images?.[0]?.url
-  const url = videoURL || imageURL
+  const video = task.result_videos?.[0]
+  const image = task.result_images?.[0]
+  const url = video?.url || image?.url
   if (!url) return
-  const link = document.createElement('a')
-  link.href = url
-  link.download = filenameFromURL(url, videoURL ? 'result-video.mp4' : 'result-image.png')
-  link.rel = 'noopener noreferrer'
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
+  downloadFile(url, video?.filename || image?.filename || filenameFromURL(url, video ? 'result-video.mp4' : 'result-image.png'))
 }
 
 function syncVideoDimensions() {
