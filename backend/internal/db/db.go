@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"image-web/backend/internal/model"
+	"image-web/backend/internal/sourceclean"
 
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -1787,6 +1788,8 @@ func (s *Store) FailTask(ctx context.Context, id string, finalPrompt, requestHea
 }
 
 func replaceTaskSource(ctx context.Context, exec sqlExecer, taskID, requestHeaders, requestJSON, responseHeaders, responseJSON string, now time.Time) error {
+	requestJSON = sourceclean.CompactStringForStorage(requestJSON)
+	responseJSON = sourceclean.CompactStringForStorage(responseJSON)
 	_, err := execLogged(ctx, exec, fmt.Sprintf("task_source.replace task_id=%s request_bytes=%d response_bytes=%d", compactID(taskID), len(requestJSON), len(responseJSON)), `
 INSERT INTO task_sources (task_id, request_headers, request_json, response_headers, response_json, updated_at)
 VALUES ($1, $2, $3, $4, $5, $6)
@@ -1810,6 +1813,7 @@ func saveTaskSourceBestEffort(ctx context.Context, exec sqlExecer, taskID, reque
 }
 
 func updateTaskResponseSource(ctx context.Context, exec sqlExecer, taskID, responseHeaders, responseJSON string, now time.Time) error {
+	responseJSON = sourceclean.CompactStringForStorage(responseJSON)
 	_, err := execLogged(ctx, exec, fmt.Sprintf("task_source.update_response task_id=%s response_bytes=%d", compactID(taskID), len(responseJSON)), `
 INSERT INTO task_sources (task_id, response_headers, response_json, updated_at)
 VALUES ($1, $2, $3, $4)

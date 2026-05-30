@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"image-web/backend/internal/sourceclean"
 )
 
 func attachRequestTrace(req *http.Request, result *GenerateResult) *http.Request {
@@ -23,35 +25,7 @@ func attachRequestTrace(req *http.Request, result *GenerateResult) *http.Request
 }
 
 func compactImageResponseForStorage(data []byte) string {
-	var value any
-	if err := json.Unmarshal(data, &value); err != nil {
-		return string(data)
-	}
-	redactBase64Fields(value)
-	compact, err := json.Marshal(value)
-	if err != nil {
-		return string(data)
-	}
-	return string(compact)
-}
-
-func redactBase64Fields(value any) {
-	switch typed := value.(type) {
-	case map[string]any:
-		for key, child := range typed {
-			if key == "b64_json" || key == "data" || key == "thoughtSignature" {
-				if text, ok := child.(string); ok && text != "" {
-					typed[key] = fmt.Sprintf("[base64 image omitted, %d chars]", len(text))
-				}
-				continue
-			}
-			redactBase64Fields(child)
-		}
-	case []any:
-		for _, child := range typed {
-			redactBase64Fields(child)
-		}
-	}
+	return sourceclean.CompactBytesForStorage(data)
 }
 
 func requestInfoJSON(req *http.Request) string {

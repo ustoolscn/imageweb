@@ -97,7 +97,7 @@ func (c *Client) doGenerateJSON(ctx context.Context, task *model.Task, endpoint 
 	req.Header.Set("Authorization", "Bearer "+task.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 	requestHeaders := requestInfoJSON(req)
-	result := GenerateResult{RequestHeaders: requestHeaders, RequestJSON: string(requestData)}
+	result := GenerateResult{RequestHeaders: requestHeaders, RequestJSON: compactImageResponseForStorage(requestData)}
 	req = attachRequestTrace(req, &result)
 
 	result.RequestStartedAt = time.Now()
@@ -565,7 +565,7 @@ func (c *Client) generateWithReferences(ctx context.Context, task *model.Task, f
 	req.Header.Set("Authorization", "Bearer "+task.APIKey)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	requestHeaders := requestInfoJSON(req)
-	result := GenerateResult{RequestHeaders: requestHeaders, RequestJSON: string(requestData)}
+	result := GenerateResult{RequestHeaders: requestHeaders, RequestJSON: compactImageResponseForStorage([]byte(requestData))}
 	req = attachRequestTrace(req, &result)
 
 	result.RequestStartedAt = time.Now()

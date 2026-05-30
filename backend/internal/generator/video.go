@@ -168,7 +168,7 @@ func (c *Client) doJSONExchange(ctx context.Context, method, endpoint, apiKey st
 	if requestData != nil {
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	}
-	result := GenerateResult{RequestHeaders: requestInfoJSON(req), RequestJSON: string(requestData)}
+	result := GenerateResult{RequestHeaders: requestInfoJSON(req), RequestJSON: compactImageResponseForStorage(requestData)}
 	req = attachRequestTrace(req, &result)
 	result.RequestStartedAt = time.Now()
 	fmt.Println("generator json_exchange request_start:", "method=", method, "endpoint=", endpoint, "request_bytes=", len(requestData))

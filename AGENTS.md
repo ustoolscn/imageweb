@@ -41,6 +41,7 @@ Image Web 是一个前后端同仓库项目：
 - `backend/internal/db/db.go`：PostgreSQL Store。包含最新建表 schema、workspace/API key 加密、任务 CRUD、任务源数据与媒体素材拆表读写、画布状态、广场分享/点赞、任务调度状态更新、视频轮询状态更新；关键事务、启动 migration、画布 advisory lock、`task_sources` 和 `task_media_assets` 写入都会输出带 trace/事务 id 的日志，用于排查数据库锁等待。DB 日志必须保持异步非阻塞，不能在事务提交前用同步日志阻塞 goroutine。
 - `backend/internal/handler/handlers.go`：HTTP API 层。注册 `/api/*` 路由，做参数校验、baseurl 白名单检查、任务创建、任务列表、上传、LLM、模型查询、画布和广场接口。
 - `backend/internal/model/types.go`：后端 API、任务、媒体素材、站点配置等共享类型。
+- `backend/internal/sourceclean/`：源数据入库前的压缩/脱敏工具。请求或响应源数据中不应保留原始 base64、data URL、`b64_json`、`inline_data.data`、`inlineData.data`、`thoughtSignature` 等大字段。
 - `backend/internal/generator/`：上游生成客户端。负责图片生成、图片编辑、视频提交/轮询/下载、LLM 请求、请求/响应记录和传输层测试。
 - `backend/internal/imagehost/scdn.go`：图床适配器。支持 HTTP JSON 图床和 local provider，并负责上传原图/结果、图片缩略图、视频首帧/尾帧抽取上传；HTTP multipart 上传会显式传递文件 MIME 类型，避免图床对象落成 `application/octet-stream`。本地直接运行后端时也需要系统 PATH 中存在 `ffmpeg`，Docker 镜像已内置。
 - `backend/internal/worker/worker.go`：异步任务 Worker。周期性派发 pending 任务，按站点配置控制并发；图片任务直接生成并上传，视频任务先提交再轮询完成。
@@ -101,8 +102,8 @@ Image Web 是一个前后端同仓库项目：
 3. 后端收到带 `baseurl + apikey` 的请求后，会解析/创建 `workspaces` 行：业务表只保存 `workspace_id`，API key 以 hash 做查找、以 `APP_CREDENTIAL_KEY` 派生密钥加密保存，worker 调度时再解密回填到 `Task.APIKey`。数据库连接默认带 `lock_timeout`、`statement_timeout` 和 `idle_in_transaction_session_timeout`，事务内也会设置同样保护，避免单个异常任务写入把 PostgreSQL 长时间锁死。
 4. 创建任务时，前端调用 `/api/tasks`；后端写入 `tasks`，状态为 `pending`，参考图片/视频/音频写入 `task_media_assets`。任务页图片生成的“数量”是前端批量提交次数，范围 1-5，不作为上游大模型参数；每次提交仍固定传 `n: 1`，数量为 5 时会创建 5 个独立任务。
 5. Worker 周期性读取 pending 任务并置为 `running`；空队列时只允许单个取任务查询在途，并短暂退避，避免远程 PostgreSQL 上无任务时被并发空轮询压垮。
-6. 图片任务调用上游图片生成/编辑接口，下载结果，转存到图床，结果写入 `task_media_assets`；请求/响应源数据写入 `task_sources`，但源数据只作为诊断信息在任务状态/素材事务提交后 best-effort 保存，不能因为源数据 upsert 卡住而阻塞任务完成或持有事务锁。图片任务总执行时间限制为 10 分钟：超过后自动取消当前上游请求并标记为 `failed`，启动或 Worker 调度时发现超过 10 分钟仍处于 `running` 的图片任务也会直接标记失败，不再重置回 `pending` 自动重跑，避免上游实际已生成但本地重复调用。前端不提供背景选择；后端不做透明背景/抠图后处理。`gpt-image-2` 的上游请求不发送 `background` 参数。
-7. 视频任务先提交上游任务，保存 upstream task id；后续轮询完成后下载视频、转存图床，并用 `ffmpeg` 以低占用参数抽取最长边约 480px 的首帧/尾帧图片，结果写入 `task_media_assets`，轮询响应源数据更新到 `task_sources`。
+6. 图片任务调用上游图片生成/编辑接口，下载结果，转存到图床，结果写入 `task_media_assets`；请求/响应源数据经 `sourceclean` 移除原始 base64 后写入 `task_sources`，但源数据只作为诊断信息在任务状态/素材事务提交后 best-effort 保存，不能因为源数据 upsert 卡住而阻塞任务完成或持有事务锁。图片任务总执行时间限制为 10 分钟：超过后自动取消当前上游请求并标记为 `failed`，启动或 Worker 调度时发现超过 10 分钟仍处于 `running` 的图片任务也会直接标记失败，不再重置回 `pending` 自动重跑，避免上游实际已生成但本地重复调用。前端不提供背景选择；后端不做透明背景/抠图后处理。`gpt-image-2` 的上游请求不发送 `background` 参数。
+7. 视频任务先提交上游任务，保存 upstream task id；后续轮询完成后下载视频、转存图床，并用 `ffmpeg` 以低占用参数抽取最长边约 480px 的首帧/尾帧图片，结果写入 `task_media_assets`，轮询响应源数据经 `sourceclean` 移除原始 base64 后更新到 `task_sources`。
 8. 前端通过共享的 `/api/tasks/updates` 以 10 秒间隔轮询更新运行中任务状态；画布会把节点引用的任务 id 和轻量任务快照同步给 App，刷新页面后即使节点只有 `task_id` 也会先补拉一次任务详情，再把画布中的 pending/running 任务纳入轮询，并在完成后回填节点结果。生成节点成功产出内容后会自动进入固化状态，后续流程会跳过该节点，用户可手动取消固化后重新运行。画布节点读取任务时要在节点本地 `task_snapshot`、父级画布任务缓存、任务列表和素材页缓存中选择结果最完整/状态最新的一份，避免刚完成的上游素材无法立刻传给下游节点。画布任务缓存与全局任务列表分离，不能为了追踪画布运行态把画布任务塞进任务列表，否则会污染任务页和素材列表顺序。视频素材封面和尾帧必须优先使用 `thumbnail_url`、`first_frame_url`、`last_frame_url` 这些已固化字段，不要再让浏览器临时读取远程视频抽帧。画布节点等待任务完成时也复用这条更新通道，避免同时高频请求单个 `/api/tasks/{id}` 详情。任务还可查看详情、收藏、重试、删除、分享到广场。
 9. 广场功能通过 `plaza_items` 和 `plaza_likes` 表实现公开展示、点赞、导入/复用；任务分享使用真实 nullable `task_id`，画布分享使用真实 `workspace_id + canvas_id`，不允许再伪造 `task_id = canvas:*`。前端进入广场时使用 60 秒内存缓存：列表为空、缓存过期或页面初始视图就是广场时会请求 `/api/plaza`，否则复用已有 `plazaItems`。
 10. 画布状态通过 `/api/canvases` 保存到 PostgreSQL，数据库层是一张画布一行，主键为 `workspace_id + canvas_id`。前端同时按当前 `baseurl + apikey` 分区保存本地副本和保存元数据，加载云端时需要比较本地/云端更新时间，避免旧云端内容静默覆盖较新的本地画布。实时同步使用 5 秒防抖，优先使用 `PATCH /api/canvases` 只上传新增画布、变更节点/连线、删除 id 和画布名变更；首次同步或无基线时才使用 `PUT /api/canvases` 全量保存。后端 `PUT/PATCH /api/canvases` 使用单语句 autocommit 写入，不要再包显式长事务或画布 advisory lock，避免远程 PostgreSQL 在日志/网络慢时留下 `idle in transaction`；PATCH 必须只更新受影响的画布行，不要恢复成把同一用户所有画布塞进单行 JSONB 的设计。节点拖拽或调整大小期间暂停深度保存、云端同步和历史快照，结束交互后只保存一次，避免连接线较多时卡顿。节点内的 `task_snapshot` 必须保持轻量，只保留展示、结果 URL、进度和继续轮询需要的字段，不要保存 `request_json`、`response_json` 等源数据大字段。`GET /api/canvases` 返回完整画布数组，`PUT/PATCH /api/canvases` 保存成功只返回 `updated_at`，避免保存响应体再次传回所有画布。
@@ -115,7 +116,7 @@ Image Web 是一个前后端同仓库项目：
 - `workspaces` 保存 `base_url`、`api_key_hash` 和加密后的 API key，业务表通过 `workspace_id` 关联，不再在 `tasks`、`canvases` 中明文保存 `api_key`。
 - `site_config` 保存 baseurl 白名单、管理员联系图、站点标题/图标、worker 并发数等配置。
 - `tasks` 保存轻量任务输入、状态、视频 upstream 状态和时间字段；不要再把参考素材、结果素材或源数据塞回任务宽表。
-- `task_sources` 保存任务 request/response headers/json；任务列表不加载源数据，任务详情才读取。
+- `task_sources` 保存任务 request/response headers/json；任务列表不加载源数据，任务详情才读取。写入前必须压缩/脱敏源数据，不保存原始 base64、data URL 或上游思考签名等大字段。
 - `task_media_assets` 保存参考素材和结果素材，按 `role + sort_order` 还原为前端现有数组字段；视频素材字段包括 `thumbnail_url`、`first_frame_url`、`last_frame_url`，展示封面和画布尾帧节点应优先使用这些字段。
 - `plaza_items` 保存公开广场条目，任务分享使用 nullable `task_id`，画布分享使用 `workspace_id + canvas_id` 和 `canvas_json` 快照；`plaza_likes` 通过外键级联删除。
 - `canvases` 保存用户画布状态，一张画布一行，字段包括 `workspace_id`、`canvas_id`、`name`、`canvas_json`、`sort_order`、`created_at`、`updated_at`。
@@ -180,6 +181,7 @@ docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --buil
 
 - 改 API 时，需要同时检查 `backend/internal/handler/handlers.go`、`backend/internal/model/types.go`、`frontend/src/api.ts`、`frontend/src/types.ts` 和相关组件。
 - 改任务字段或数据库字段时，需要同步检查 `backend/internal/db/db.go` 的最新 `CREATE TABLE` schema、workspace 解析、任务媒体/源数据拆表读写、插入、查询列、扫描函数和前端类型；当前不维护旧 schema 的 `ALTER TABLE` 兼容迁移。
+- 改源数据保存或生成器请求/响应记录时，需要确保 `sourceclean` 仍在生成器记录和数据库落库前生效，不能把原始 base64、data URL、`b64_json`、`inline_data.data`、`inlineData.data` 或 `thoughtSignature` 写入 `task_sources`。
 - 改图片/视频生成参数时，需要同时检查前端 `Composer.vue`、尺寸工具库、后端 `createTask` 归一化逻辑、`generator` 请求构造和 worker 执行路径。
 - 改图床或上传逻辑时，需要检查参考图上传、结果上传、缩略图、multipart 文件 MIME 类型、前端预览和下载/复用流程。
 - 改视频素材逻辑时，需要同时检查 `/api/upload`、`/api/video-frames`、worker 视频完成路径、`task_media_assets` 首尾帧字段、画布 URL 导入和尾帧节点；后端抽帧应保持低占用，失败不应阻断原视频保存。
