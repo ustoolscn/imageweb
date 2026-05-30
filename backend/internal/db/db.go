@@ -42,6 +42,10 @@ type sqlExecer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
+type sqlQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 type traceIDContextKey struct{}
 
 type dbTxLog struct {
@@ -795,14 +799,6 @@ func (s *Store) SaveCanvasState(ctx context.Context, apiKey, baseURL string, can
 	if err != nil {
 		return model.CanvasState{}, err
 	}
-	tx, txLog, err := s.beginTx(ctx, "canvas.save_full")
-	if err != nil {
-		return model.CanvasState{}, err
-	}
-	defer txLog.Rollback(tx)
-	if err := lockCanvasScope(ctx, tx, ws.ID); err != nil {
-		return model.CanvasState{}, err
-	}
 	ids := make([]string, 0, len(items))
 	now := time.Now().UTC()
 	for index, canvas := range items {
@@ -811,14 +807,11 @@ func (s *Store) SaveCanvasState(ctx context.Context, apiKey, baseURL string, can
 			return model.CanvasState{}, fmt.Errorf("画布数据必须包含 id")
 		}
 		ids = append(ids, id)
-		if err := upsertCanvasRow(ctx, tx, ws.ID, id, jsonObjectString(canvas, "name"), canvas, index, now); err != nil {
+		if err := upsertCanvasRow(ctx, s.db, ws.ID, id, jsonObjectString(canvas, "name"), canvas, index, now); err != nil {
 			return model.CanvasState{}, err
 		}
 	}
-	if err := deleteMissingCanvases(ctx, tx, ws.ID, ids); err != nil {
-		return model.CanvasState{}, err
-	}
-	if err := txLog.Commit(tx); err != nil {
+	if err := deleteMissingCanvases(ctx, s.db, ws.ID, ids); err != nil {
 		return model.CanvasState{}, err
 	}
 	payload, err := json.Marshal(items)
@@ -833,15 +826,6 @@ func (s *Store) PatchCanvasState(ctx context.Context, apiKey, baseURL string, ch
 	if err != nil {
 		return model.CanvasState{}, err
 	}
-	tx, txLog, err := s.beginTx(ctx, "canvas.patch")
-	if err != nil {
-		return model.CanvasState{}, err
-	}
-	defer txLog.Rollback(tx)
-	if err := lockCanvasScope(ctx, tx, ws.ID); err != nil {
-		return model.CanvasState{}, err
-	}
-
 	deleted := map[string]bool{}
 	for _, id := range deletedIDs {
 		id = strings.TrimSpace(id)
@@ -877,18 +861,18 @@ func (s *Store) PatchCanvasState(ctx context.Context, apiKey, baseURL string, ch
 	}
 
 	for id := range deleted {
-		if _, err := execLogged(ctx, tx, "canvas.delete_row canvas_id="+compactID(id), `DELETE FROM canvases WHERE workspace_id = $1 AND canvas_id = $2`, ws.ID, id); err != nil {
+		if _, err := execLogged(ctx, s.db, "canvas.delete_row canvas_id="+compactID(id), `DELETE FROM canvases WHERE workspace_id = $1 AND canvas_id = $2`, ws.ID, id); err != nil {
 			return model.CanvasState{}, err
 		}
 	}
 	now := time.Now().UTC()
-	nextSort, err := nextCanvasSortOrder(ctx, tx, ws.ID)
+	nextSort, err := nextCanvasSortOrder(ctx, s.db, ws.ID)
 	if err != nil {
 		return model.CanvasState{}, err
 	}
 	for _, id := range changedOrder {
 		canvas := changedByID[id]
-		sortOrder, exists, err := currentCanvasSortOrder(ctx, tx, ws.ID, id)
+		sortOrder, exists, err := currentCanvasSortOrder(ctx, s.db, ws.ID, id)
 		if err != nil {
 			return model.CanvasState{}, err
 		}
@@ -896,7 +880,7 @@ func (s *Store) PatchCanvasState(ctx context.Context, apiKey, baseURL string, ch
 			sortOrder = nextSort
 			nextSort++
 		}
-		if err := upsertCanvasRow(ctx, tx, ws.ID, id, jsonObjectString(canvas, "name"), canvas, sortOrder, now); err != nil {
+		if err := upsertCanvasRow(ctx, s.db, ws.ID, id, jsonObjectString(canvas, "name"), canvas, sortOrder, now); err != nil {
 			return model.CanvasState{}, err
 		}
 	}
@@ -908,7 +892,7 @@ func (s *Store) PatchCanvasState(ctx context.Context, apiKey, baseURL string, ch
 		var currentRaw string
 		var sortOrder int
 		err := scanLogged(ctx, "canvas.select_for_update canvas_id="+compactID(id), func() error {
-			return tx.QueryRowContext(ctx, `SELECT canvas_json::text, sort_order FROM canvases WHERE workspace_id = $1 AND canvas_id = $2 FOR UPDATE`, ws.ID, id).Scan(&currentRaw, &sortOrder)
+			return s.db.QueryRowContext(ctx, `SELECT canvas_json::text, sort_order FROM canvases WHERE workspace_id = $1 AND canvas_id = $2`, ws.ID, id).Scan(&currentRaw, &sortOrder)
 		})
 		var canvas json.RawMessage
 		if errors.Is(err, sql.ErrNoRows) {
@@ -926,14 +910,11 @@ func (s *Store) PatchCanvasState(ctx context.Context, apiKey, baseURL string, ch
 				return model.CanvasState{}, err
 			}
 		}
-		if err := upsertCanvasRow(ctx, tx, ws.ID, id, jsonObjectString(canvas, "name"), canvas, sortOrder, now); err != nil {
+		if err := upsertCanvasRow(ctx, s.db, ws.ID, id, jsonObjectString(canvas, "name"), canvas, sortOrder, now); err != nil {
 			return model.CanvasState{}, err
 		}
 	}
 
-	if err := txLog.Commit(tx); err != nil {
-		return model.CanvasState{}, err
-	}
 	return model.CanvasState{UpdatedAt: now}, nil
 }
 
@@ -958,8 +939,8 @@ func lockCanvasScope(ctx context.Context, tx *sql.Tx, workspaceID string) error 
 	return err
 }
 
-func upsertCanvasRow(ctx context.Context, tx *sql.Tx, workspaceID, canvasID, name string, canvas json.RawMessage, sortOrder int, now time.Time) error {
-	_, err := execLogged(ctx, tx, fmt.Sprintf("canvas.upsert_row canvas_id=%s bytes=%d", compactID(canvasID), len(canvas)), `
+func upsertCanvasRow(ctx context.Context, exec sqlExecer, workspaceID, canvasID, name string, canvas json.RawMessage, sortOrder int, now time.Time) error {
+	_, err := execLogged(ctx, exec, fmt.Sprintf("canvas.upsert_row canvas_id=%s bytes=%d", compactID(canvasID), len(canvas)), `
 INSERT INTO canvases (workspace_id, canvas_id, name, canvas_json, sort_order, created_at, updated_at)
 VALUES ($1, $2, $3, $4::jsonb, $5, $6, $6)
 ON CONFLICT (workspace_id, canvas_id)
@@ -968,9 +949,9 @@ DO UPDATE SET name = EXCLUDED.name, canvas_json = EXCLUDED.canvas_json, sort_ord
 	return err
 }
 
-func deleteMissingCanvases(ctx context.Context, tx *sql.Tx, workspaceID string, keepIDs []string) error {
+func deleteMissingCanvases(ctx context.Context, exec sqlExecer, workspaceID string, keepIDs []string) error {
 	if len(keepIDs) == 0 {
-		_, err := execLogged(ctx, tx, "canvas.delete_missing all", `DELETE FROM canvases WHERE workspace_id = $1`, workspaceID)
+		_, err := execLogged(ctx, exec, "canvas.delete_missing all", `DELETE FROM canvases WHERE workspace_id = $1`, workspaceID)
 		return err
 	}
 	args := []any{workspaceID}
@@ -979,24 +960,24 @@ func deleteMissingCanvases(ctx context.Context, tx *sql.Tx, workspaceID string, 
 		args = append(args, id)
 		placeholders = append(placeholders, placeholder(len(args)))
 	}
-	_, err := execLogged(ctx, tx, fmt.Sprintf("canvas.delete_missing keep=%d", len(keepIDs)), `DELETE FROM canvases WHERE workspace_id = $1 AND canvas_id NOT IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	_, err := execLogged(ctx, exec, fmt.Sprintf("canvas.delete_missing keep=%d", len(keepIDs)), `DELETE FROM canvases WHERE workspace_id = $1 AND canvas_id NOT IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	return err
 }
 
-func nextCanvasSortOrder(ctx context.Context, tx *sql.Tx, workspaceID string) (int, error) {
+func nextCanvasSortOrder(ctx context.Context, query sqlQueryer, workspaceID string) (int, error) {
 	var next int
 	if err := scanLogged(ctx, "canvas.next_sort_order", func() error {
-		return tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sort_order) + 1, 0) FROM canvases WHERE workspace_id = $1`, workspaceID).Scan(&next)
+		return query.QueryRowContext(ctx, `SELECT COALESCE(MAX(sort_order) + 1, 0) FROM canvases WHERE workspace_id = $1`, workspaceID).Scan(&next)
 	}); err != nil {
 		return 0, err
 	}
 	return next, nil
 }
 
-func currentCanvasSortOrder(ctx context.Context, tx *sql.Tx, workspaceID, canvasID string) (int, bool, error) {
+func currentCanvasSortOrder(ctx context.Context, query sqlQueryer, workspaceID, canvasID string) (int, bool, error) {
 	var sortOrder int
 	err := scanLogged(ctx, "canvas.current_sort_order canvas_id="+compactID(canvasID), func() error {
-		return tx.QueryRowContext(ctx, `SELECT sort_order FROM canvases WHERE workspace_id = $1 AND canvas_id = $2`, workspaceID, canvasID).Scan(&sortOrder)
+		return query.QueryRowContext(ctx, `SELECT sort_order FROM canvases WHERE workspace_id = $1 AND canvas_id = $2`, workspaceID, canvasID).Scan(&sortOrder)
 	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
