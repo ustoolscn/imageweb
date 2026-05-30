@@ -594,10 +594,10 @@ function drawerGroupClass(drawer: Exclude<CanvasDrawer, ''>) {
 
 function readLocalCanvasState(): { canvases: BoardCanvas[]; meta: CanvasLocalMeta } {
   const keys = currentCanvasStorageKeys()
-  const scopedPayload = localStorage.getItem(keys.canvas)
-  const useLegacy = !scopedPayload && keys.canvas !== STORAGE_KEY
-  const payload = scopedPayload || (useLegacy ? localStorage.getItem(STORAGE_KEY) : '')
-  const meta = readCanvasMeta(useLegacy ? STORAGE_META_KEY : keys.meta)
+  // Once a workspace scope exists, never fall back to the legacy global key.
+  // Otherwise switching API keys can leak another workspace's local canvases.
+  const payload = localStorage.getItem(keys.canvas) || ''
+  const meta = readCanvasMeta(keys.meta)
   try {
     const parsed = JSON.parse(payload || '')
     if (Array.isArray(parsed) && parsed.length) {
