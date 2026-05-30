@@ -3412,9 +3412,9 @@ function setEditorCaret(target: HTMLElement, offset: number) {
   const walk = (node: globalThis.Node): boolean => {
     for (const child of Array.from(node.childNodes)) {
       if (child.nodeType === globalThis.Node.TEXT_NODE) {
-        const length = child.textContent?.length || 0
+        const length = editorNodeTextLength(child)
         if (remaining <= length) {
-          placeCaret(child, remaining)
+          placeCaret(child, rawOffsetForEditorText(child.textContent || '', remaining))
           return true
         }
         remaining -= length
@@ -3562,6 +3562,16 @@ function normalizeEditorText(text: string) {
 
 function editorTextPrefixLength(text: string, offset: number) {
   return normalizeEditorText(text.slice(0, Math.max(0, offset))).length
+}
+
+function rawOffsetForEditorText(text: string, normalizedOffset: number) {
+  if (normalizedOffset <= 0) return text.startsWith('\u200b') ? 1 : 0
+  let visible = 0
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] !== '\u200b') visible += 1
+    if (visible >= normalizedOffset) return index + 1
+  }
+  return text.length
 }
 
 function mentionBadgeFromLabel(label: string) {
