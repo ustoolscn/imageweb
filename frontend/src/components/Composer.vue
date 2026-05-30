@@ -163,18 +163,30 @@ function onPromptKeydown(event: KeyboardEvent) {
     handlePromptDelete(event)
     return
   }
-  if (!mentionMenu.value || !mentionCandidates.value.length) return
-  if (event.key === 'ArrowDown') {
-    event.preventDefault()
-    mentionMenu.value.activeIndex = (mentionMenu.value.activeIndex + 1) % mentionCandidates.value.length
-  } else if (event.key === 'ArrowUp') {
-    event.preventDefault()
-    mentionMenu.value.activeIndex = (mentionMenu.value.activeIndex - 1 + mentionCandidates.value.length) % mentionCandidates.value.length
-  } else if (event.key === 'Enter' || event.key === 'Tab') {
-    event.preventDefault()
-    insertMention(mentionCandidates.value[mentionMenu.value.activeIndex]?.label)
-  } else if (event.key === 'Escape') {
+  if (mentionMenu.value && mentionCandidates.value.length) {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      mentionMenu.value.activeIndex = (mentionMenu.value.activeIndex + 1) % mentionCandidates.value.length
+      return
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      mentionMenu.value.activeIndex = (mentionMenu.value.activeIndex - 1 + mentionCandidates.value.length) % mentionCandidates.value.length
+      return
+    }
+    if (event.key === 'Enter' || event.key === 'Tab') {
+      event.preventDefault()
+      insertMention(mentionCandidates.value[mentionMenu.value.activeIndex]?.label)
+      return
+    }
+  }
+  if (event.key === 'Escape') {
     mentionMenu.value = null
+    return
+  }
+  if (event.key === 'Enter') {
+    event.preventDefault()
+    insertPromptTextAtSelection('\n')
   }
 }
 
@@ -298,8 +310,21 @@ function insertPlainTextAtCaret(text: string) {
   })
 }
 
+function insertPromptTextAtSelection(text: string) {
+  const target = promptEditor.value
+  const selection = target ? editorSelectionOffsets(target) : { start: props.form.prompt.length, end: props.form.prompt.length }
+  const value = props.form.prompt
+  const nextValue = `${value.slice(0, selection.start)}${text}${value.slice(selection.end)}`
+  emit('updateField', 'prompt', nextValue)
+  mentionMenu.value = null
+  nextTick(() => {
+    target?.focus({ preventScroll: true })
+    setEditorCaret(selection.start + text.length)
+  })
+}
+
 function editorPlainText(target: HTMLElement) {
-  return target.innerText.replace(/\u00a0/g, ' ').replace(/\n$/, '')
+  return editorNodeText(target)
 }
 
 function editorCaretOffset(target: HTMLElement) {
@@ -307,10 +332,7 @@ function editorCaretOffset(target: HTMLElement) {
   if (!selection?.rangeCount) return editorPlainText(target).length
   const range = selection.getRangeAt(0)
   if (!target.contains(range.endContainer)) return editorPlainText(target).length
-  const preRange = document.createRange()
-  preRange.selectNodeContents(target)
-  preRange.setEnd(range.endContainer, range.endOffset)
-  return preRange.toString().replace(/\u00a0/g, ' ').length
+  return editorOffsetForBoundary(target, range.endContainer, range.endOffset)
 }
 
 function editorSelectionOffsets(target: HTMLElement) {
@@ -324,15 +346,46 @@ function editorSelectionOffsets(target: HTMLElement) {
     const end = editorPlainText(target).length
     return { start: end, end }
   }
-  const startRange = document.createRange()
-  startRange.selectNodeContents(target)
-  startRange.setEnd(range.startContainer, range.startOffset)
-  const endRange = document.createRange()
-  endRange.selectNodeContents(target)
-  endRange.setEnd(range.endContainer, range.endOffset)
-  const start = startRange.toString().replace(/\u00a0/g, ' ').length
-  const end = endRange.toString().replace(/\u00a0/g, ' ').length
+  const start = editorOffsetForBoundary(target, range.startContainer, range.startOffset)
+  const end = editorOffsetForBoundary(target, range.endContainer, range.endOffset)
   return { start: Math.min(start, end), end: Math.max(start, end) }
+}
+
+function editorNodeText(node: Node): string {
+  if (node.nodeType === Node.TEXT_NODE) return normalizeEditorText(node.textContent || '')
+  if (node instanceof HTMLBRElement) return '\n'
+  return Array.from(node.childNodes).map(editorNodeText).join('')
+}
+
+function editorNodeTextLength(node: Node): number {
+  return editorNodeText(node).length
+}
+
+function editorOffsetForBoundary(root: HTMLElement, boundaryNode: Node, boundaryOffset: number) {
+  let offset = 0
+  let found = false
+  const walk = (node: Node) => {
+    if (found) return
+    if (node === boundaryNode) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        offset += editorTextPrefixLength(node.textContent || '', boundaryOffset)
+      } else {
+        const children = Array.from(node.childNodes)
+        for (let index = 0; index < Math.min(boundaryOffset, children.length); index += 1) {
+          offset += editorNodeTextLength(children[index])
+        }
+      }
+      found = true
+      return
+    }
+    if (node.nodeType === Node.TEXT_NODE || node instanceof HTMLBRElement) {
+      offset += editorNodeTextLength(node)
+      return
+    }
+    for (const child of Array.from(node.childNodes)) walk(child)
+  }
+  walk(root)
+  return found ? offset : editorPlainText(root).length
 }
 
 function setEditorCaret(offset: number) {
@@ -357,6 +410,24 @@ function setEditorCaret(offset: number) {
           return true
         }
         remaining -= length
+        continue
+      }
+      if (child instanceof HTMLBRElement) {
+        const index = Array.prototype.indexOf.call(node.childNodes, child)
+        if (remaining <= 0) {
+          placeCaret(node, index)
+          return true
+        }
+        if (remaining <= 1) {
+          const next = child.nextSibling
+          if (next?.nodeType === Node.TEXT_NODE && (next.textContent || '').startsWith('\u200b')) {
+            placeCaret(next, 1)
+            return true
+          }
+          placeCaret(node, index + 1)
+          return true
+        }
+        remaining -= 1
         continue
       }
       if (child instanceof HTMLElement && child.classList.contains('composer-mention-token')) {
@@ -395,16 +466,28 @@ function renderPromptMentions(text: string) {
     const index = match.index ?? 0
     const token = match[1] || ''
     if (!labels.has(token)) continue
-    html += escapeHTML(text.slice(lastIndex, index))
+    html += escapeEditorText(text.slice(lastIndex, index))
     html += `<span class="composer-mention-token" contenteditable="false">@${escapeHTML(token)}</span>`
     lastIndex = index + match[0].length
   }
-  html += escapeHTML(text.slice(lastIndex))
+  html += escapeEditorText(text.slice(lastIndex))
   return html
+}
+
+function escapeEditorText(text: string) {
+  return escapeHTML(text).replace(/\n/g, '<br data-editor-newline="true">&#8203;')
 }
 
 function escapeHTML(text: string) {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+function normalizeEditorText(text: string) {
+  return text.replace(/\u00a0/g, ' ').replace(/\u200b/g, '')
+}
+
+function editorTextPrefixLength(text: string, offset: number) {
+  return normalizeEditorText(text.slice(0, Math.max(0, offset))).length
 }
 
 function numberValue(event: Event) {

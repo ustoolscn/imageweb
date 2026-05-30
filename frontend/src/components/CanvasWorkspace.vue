@@ -3134,6 +3134,7 @@ function onEditorCompositionEnd(event: CompositionEvent, element: CanvasElement)
 
 function onPromptTextInput(event: Event, element: CanvasElement, force = false) {
   if (!force && isEditorComposing(event, element)) return
+  if (!force && event instanceof KeyboardEvent && event.key === 'Enter') return
   const target = event.currentTarget as HTMLElement
   const selection = editorSelectionOffsets(target)
   if (!force && event instanceof KeyboardEvent && selection.start !== selection.end) {
@@ -3204,6 +3205,11 @@ function onRichEditorKeydown(event: KeyboardEvent, element: CanvasElement) {
   if (event.key === 'Escape' && element.kind === 'llm') {
     event.preventDefault()
     blurEditable(event, element)
+    return
+  }
+  if (event.key === 'Enter') {
+    event.preventDefault()
+    insertEditableTextAtSelection(element, '\n', event.currentTarget as HTMLElement)
   }
 }
 
@@ -3311,13 +3317,24 @@ function insertMention(element: CanvasElement, label: string) {
   })
 }
 
+function insertEditableTextAtSelection(element: CanvasElement, text: string, target: HTMLElement) {
+  const selection = editorSelectionOffsets(target)
+  const value = editorPlainText(target)
+  element.text = `${value.slice(0, selection.start)}${text}${value.slice(selection.end)}`
+  mentionMenu.value = null
+  nextTick(() => {
+    target.focus({ preventScroll: true })
+    setEditorCaret(target, selection.start + text.length)
+  })
+}
+
 function editableText(target: HTMLElement) {
-  if (target instanceof HTMLTextAreaElement) return target.value.trimEnd()
-  return target.innerText.replace(/\u00a0/g, ' ').trimEnd()
+  if (target instanceof HTMLTextAreaElement) return target.value
+  return editorPlainText(target)
 }
 
 function editorPlainText(target: HTMLElement) {
-  return target.innerText.replace(/\u00a0/g, ' ').replace(/\n$/, '')
+  return editorNodeText(target)
 }
 
 function editorCaretOffset(target: HTMLElement) {
@@ -3325,10 +3342,7 @@ function editorCaretOffset(target: HTMLElement) {
   if (!selection?.rangeCount) return editorPlainText(target).length
   const range = selection.getRangeAt(0)
   if (!target.contains(range.endContainer)) return editorPlainText(target).length
-  const preRange = document.createRange()
-  preRange.selectNodeContents(target)
-  preRange.setEnd(range.endContainer, range.endOffset)
-  return preRange.toString().replace(/\u00a0/g, ' ').length
+  return editorOffsetForBoundary(target, range.endContainer, range.endOffset)
 }
 
 function editorSelectionOffsets(target: HTMLElement) {
@@ -3342,15 +3356,46 @@ function editorSelectionOffsets(target: HTMLElement) {
     const end = editorPlainText(target).length
     return { start: end, end }
   }
-  const startRange = document.createRange()
-  startRange.selectNodeContents(target)
-  startRange.setEnd(range.startContainer, range.startOffset)
-  const endRange = document.createRange()
-  endRange.selectNodeContents(target)
-  endRange.setEnd(range.endContainer, range.endOffset)
-  const start = startRange.toString().replace(/\u00a0/g, ' ').length
-  const end = endRange.toString().replace(/\u00a0/g, ' ').length
+  const start = editorOffsetForBoundary(target, range.startContainer, range.startOffset)
+  const end = editorOffsetForBoundary(target, range.endContainer, range.endOffset)
   return { start: Math.min(start, end), end: Math.max(start, end) }
+}
+
+function editorNodeText(node: globalThis.Node): string {
+  if (node.nodeType === globalThis.Node.TEXT_NODE) return normalizeEditorText(node.textContent || '')
+  if (node instanceof HTMLBRElement) return '\n'
+  return Array.from(node.childNodes).map(editorNodeText).join('')
+}
+
+function editorNodeTextLength(node: globalThis.Node): number {
+  return editorNodeText(node).length
+}
+
+function editorOffsetForBoundary(root: HTMLElement, boundaryNode: globalThis.Node, boundaryOffset: number) {
+  let offset = 0
+  let found = false
+  const walk = (node: globalThis.Node) => {
+    if (found) return
+    if (node === boundaryNode) {
+      if (node.nodeType === globalThis.Node.TEXT_NODE) {
+        offset += editorTextPrefixLength(node.textContent || '', boundaryOffset)
+      } else {
+        const children = Array.from(node.childNodes)
+        for (let index = 0; index < Math.min(boundaryOffset, children.length); index += 1) {
+          offset += editorNodeTextLength(children[index])
+        }
+      }
+      found = true
+      return
+    }
+    if (node.nodeType === globalThis.Node.TEXT_NODE || node instanceof HTMLBRElement) {
+      offset += editorNodeTextLength(node)
+      return
+    }
+    for (const child of Array.from(node.childNodes)) walk(child)
+  }
+  walk(root)
+  return found ? offset : editorPlainText(root).length
 }
 
 function setEditorCaret(target: HTMLElement, offset: number) {
@@ -3373,6 +3418,24 @@ function setEditorCaret(target: HTMLElement, offset: number) {
           return true
         }
         remaining -= length
+        continue
+      }
+      if (child instanceof HTMLBRElement) {
+        const index = Array.prototype.indexOf.call(node.childNodes, child)
+        if (remaining <= 0) {
+          placeCaret(node, index)
+          return true
+        }
+        if (remaining <= 1) {
+          const next = child.nextSibling
+          if (next?.nodeType === globalThis.Node.TEXT_NODE && (next.textContent || '').startsWith('\u200b')) {
+            placeCaret(next, 1)
+            return true
+          }
+          placeCaret(node, index + 1)
+          return true
+        }
+        remaining -= 1
         continue
       }
       if (child instanceof HTMLElement && child.classList.contains('canvas-mention-token')) {
@@ -3472,8 +3535,33 @@ function syncActiveEditable() {
 }
 
 function renderEditableText(text?: string) {
-  const source = escapeHTML(text || '')
-  return source.replace(/(^|\s)@([A-Z]+\d{2})\b/g, '$1<span class="canvas-mention-token" contenteditable="false">@$2</span>')
+  const source = text || ''
+  let html = ''
+  let lastIndex = 0
+  const pattern = /(^|\s)@([A-Z]+\d{2})\b/g
+  for (const match of source.matchAll(pattern)) {
+    const index = match.index ?? 0
+    const prefix = match[1] || ''
+    const token = match[2] || ''
+    const mentionStart = index + prefix.length
+    html += escapeEditorText(source.slice(lastIndex, mentionStart))
+    html += `<span class="canvas-mention-token" contenteditable="false">@${escapeHTML(token)}</span>`
+    lastIndex = mentionStart + token.length + 1
+  }
+  html += escapeEditorText(source.slice(lastIndex))
+  return html
+}
+
+function escapeEditorText(text: string) {
+  return escapeHTML(text).replace(/\n/g, '<br data-editor-newline="true">&#8203;')
+}
+
+function normalizeEditorText(text: string) {
+  return text.replace(/\u00a0/g, ' ').replace(/\u200b/g, '')
+}
+
+function editorTextPrefixLength(text: string, offset: number) {
+  return normalizeEditorText(text.slice(0, Math.max(0, offset))).length
 }
 
 function mentionBadgeFromLabel(label: string) {
