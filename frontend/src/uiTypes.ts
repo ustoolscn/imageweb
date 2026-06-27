@@ -1,6 +1,6 @@
 import type { MediaAsset, UploadedImage } from './types'
 
-export type ViewMode = 'tasks' | 'canvas' | 'plaza'
+export type ViewMode = 'tasks' | 'canvas' | 'plaza' | 'gallery'
 export type ThemeMode = 'system' | 'dark' | 'light'
 export type AppliedThemeMode = 'dark' | 'light'
 export type PlazaSort = 'time' | 'likes'

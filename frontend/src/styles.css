@@ -244,6 +244,10 @@ button {
   background: rgba(255, 255, 255, .10);
 }
 
+.admin-user-mini {
+  color: #b9c6db;
+}
+
 .brand p {
   margin: 3px 0 0;
   overflow: hidden;
@@ -275,6 +279,22 @@ button {
 
 .toolbar-controls.canvas .theme-toggle {
   grid-column: 4;
+}
+
+.toolbar-controls.admin {
+  grid-template-columns: 158px 124px minmax(220px, 1fr) max-content max-content max-content 48px 48px;
+}
+
+.toolbar-controls.admin.canvas {
+  grid-template-columns: 158px minmax(0, 1fr) max-content 48px 48px;
+}
+
+.toolbar-controls.admin.canvas .toolbar-help {
+  grid-column: 4;
+}
+
+.toolbar-controls.admin.canvas .theme-toggle {
+  grid-column: 5;
 }
 
 .view-tabs,
@@ -6730,6 +6750,294 @@ body:has(.modal-backdrop) {
   inset: 0;
   opacity: 0;
   cursor: pointer;
+}
+
+.gallery-manager {
+  width: min(1180px, calc(100vw - 32px));
+  margin: 0 auto 120px;
+  padding: 18px;
+}
+
+.gallery-login,
+.gallery-manager-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.gallery-login {
+  max-width: 520px;
+  margin: 42px auto;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.gallery-user-switcher {
+  width: min(680px, calc(100vw - 28px));
+  padding: 26px;
+}
+
+.gallery-user-switcher-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0 0 16px;
+}
+
+.gallery-user-switcher-head h2 {
+  margin: 0;
+}
+
+.gallery-user-switcher-head p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.gallery-user-switcher-head button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 38px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0 14px;
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.gallery-user-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 12px;
+  background: var(--panel);
+  color: var(--muted);
+}
+
+.gallery-user-search input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+}
+
+.gallery-login input,
+.gallery-manager-toolbar input {
+  min-height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 12px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.gallery-manager-toolbar input {
+  flex: 1;
+}
+
+.gallery-admin-grid {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.gallery-user-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.gallery-user-list button {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) 72px 150px;
+  gap: 12px;
+  align-items: center;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color .16s ease, background .16s ease, transform .16s ease;
+}
+
+.gallery-user-list button:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+}
+
+.gallery-user-list button.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+}
+
+.gallery-user-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 14px;
+}
+
+.gallery-user-pagination button {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  min-width: 36px;
+  min-height: 36px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 10px;
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.gallery-user-pagination button.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, var(--panel));
+}
+
+.gallery-user-pagination button:disabled {
+  cursor: not-allowed;
+  opacity: .65;
+}
+
+.gallery-user-avatar {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 900;
+}
+
+.gallery-user-main {
+  min-width: 0;
+}
+
+.gallery-user-main strong {
+  display: block;
+  overflow: hidden;
+  font-size: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gallery-user-meta {
+  display: grid;
+  justify-items: end;
+  gap: 2px;
+}
+
+.gallery-user-meta strong {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.gallery-user-date {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gallery-user-list .gallery-user-main,
+.gallery-table-wrap span {
+  display: block;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gallery-user-main small,
+.gallery-user-meta small,
+.gallery-table-wrap small {
+  display: block;
+  max-width: 420px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gallery-table-wrap {
+  margin-top: 14px;
+  overflow: auto;
+}
+
+.gallery-table-wrap table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.gallery-table-wrap th,
+.gallery-table-wrap td {
+  border-bottom: 1px solid var(--border);
+  padding: 10px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.gallery-link-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.gallery-error {
+  color: var(--danger);
+}
+
+@media (max-width: 860px) {
+  .gallery-admin-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 680px) {
+  .gallery-user-switcher {
+    padding: 22px;
+  }
+
+  .gallery-user-switcher-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .gallery-user-list button {
+    grid-template-columns: 42px minmax(0, 1fr) 58px;
+  }
+
+  .gallery-user-date {
+    grid-column: 2 / -1;
+    text-align: left;
+  }
 }
 
 .current-size {

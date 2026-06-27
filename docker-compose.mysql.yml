@@ -1,0 +1,30 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: image-web-mysql
+    environment:
+      MYSQL_DATABASE: image_web
+      MYSQL_USER: image_web
+      MYSQL_PASSWORD: image_web
+      MYSQL_ROOT_PASSWORD: image_web_root
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u image_web -pimage_web --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  image-web:
+    environment:
+      DATABASE_DSN: image_web:image_web@tcp(mysql:3306)/image_web?parseTime=true&charset=utf8mb4&loc=UTC
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql-data:

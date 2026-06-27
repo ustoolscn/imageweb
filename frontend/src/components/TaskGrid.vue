@@ -16,6 +16,7 @@ const props = defineProps<{
   loadingMore: boolean
   hasMoreTasks: boolean
   clock: number
+  adminMode?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -98,7 +99,7 @@ function taskVideoCover(task: Task) {
           <p class="prompt">{{ task.prompt }}</p>
           <div v-if="taskReferenceImages(task).length" class="card-references">
             <span class="ref-label">参考</span>
-            <button v-for="(image, index) in taskReferenceImages(task).slice(0, 2)" :key="`${image.url}-${index}`" type="button" class="ref-thumb" @click="emit('openPreview', image.url, image.filename || `参考图 ${index + 1}`, $event, image.mask_url)">
+            <button v-for="(image, index) in taskReferenceImages(task).slice(0, 2)" :key="`${image.url}-${index}`" type="button" class="ref-thumb" @click="emit('openPreview', adminMode ? displayImageURL(image) : image.url, image.filename || `参考图 ${index + 1}`, $event, image.mask_url)">
               <img :src="displayImageURL(image)" :alt="image.filename || '参考图'" loading="lazy" decoding="async" crossorigin="anonymous" />
             </button>
             <span v-if="taskReferenceImages(task).length > 2" class="ref-more">+{{ taskReferenceImages(task).length - 2 }}</span>
@@ -115,7 +116,7 @@ function taskVideoCover(task: Task) {
               <span>{{ task.output_format }}</span>
             </template>
           </div>
-          <div class="actions" @click.stop>
+          <div v-if="!adminMode" class="actions" @click.stop>
             <button title="查看源数据" aria-label="查看源数据" :disabled="!canOpenSource(task)" @click="emit('openSource', task, $event)">
               <AppIcon name="file" />
             </button>
@@ -130,6 +131,11 @@ function taskVideoCover(task: Task) {
             </button>
             <button :title="task.shared_to_plaza ? '取消广场分享' : '分享到广场'" :aria-label="task.shared_to_plaza ? '取消广场分享' : '分享到广场'" :class="{ favorite: task.shared_to_plaza }" :disabled="!canShareTask(task)" @click="emit('toggleShare', task, $event)">
               <AppIcon name="share" />
+            </button>
+          </div>
+          <div v-else class="actions" @click.stop>
+            <button title="查看源数据" aria-label="查看源数据" :disabled="!canOpenSource(task)" @click="emit('openSource', task, $event)">
+              <AppIcon name="file" />
             </button>
           </div>
         </div>

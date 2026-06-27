@@ -8,38 +8,42 @@ import (
 )
 
 type Config struct {
-	Port                     string
-	DataDir                  string
-	DatabaseDSN              string
-	AppCredentialKey         string
-	ImageHostProvider        string
-	ImageHostUploadURL       string
-	ImageHostAuthHeader      string
-	ImageHostAuthValue       string
-	ImageHostFieldName       string
-	ImageHostResponseURLPath string
-	ImageHostLocalDir        string
-	ImageHostPublicBaseURL   string
-	StaticDir                string
+	Port                 string
+	DataDir              string
+	DatabaseDSN          string
+	AppCredentialKey     string
+	OSSRegion            string
+	OSSBucket            string
+	OSSEndpoint          string
+	OSSPublicBaseURL     string
+	OSSPrefix            string
+	OSSAccessKeyID       string
+	OSSAccessKeySecret   string
+	GalleryAdminUsername string
+	GalleryAdminPassword string
+	GallerySessionSecret string
+	StaticDir            string
 }
 
 func Load() Config {
 	loadDotEnv()
 	dataDir := filepath.Join(os.TempDir(), "image-web")
 	return Config{
-		Port:                     getEnv("PORT", "8080"),
-		DataDir:                  dataDir,
-		DatabaseDSN:              getEnv("DATABASE_DSN", "postgres://image_web:image_web@localhost:5432/image_web?sslmode=disable"),
-		AppCredentialKey:         getEnv("APP_CREDENTIAL_KEY", ""),
-		ImageHostProvider:        getEnv("IMAGE_HOST_PROVIDER", "http-json"),
-		ImageHostUploadURL:       getEnv("IMAGE_HOST_UPLOAD_URL", "https://2bad.lujilujilujilujiluji.com/"),
-		ImageHostAuthHeader:      getEnv("IMAGE_HOST_AUTH_HEADER", "Authorization"),
-		ImageHostAuthValue:       getEnv("IMAGE_HOST_AUTH_VALUE", "Bearer cooper"),
-		ImageHostFieldName:       getEnv("IMAGE_HOST_FIELD_NAME", "file"),
-		ImageHostResponseURLPath: getEnv("IMAGE_HOST_RESPONSE_URL_PATH", "url"),
-		ImageHostLocalDir:        getEnv("IMAGE_HOST_LOCAL_DIR", filepath.Join(dataDir, "uploads")),
-		ImageHostPublicBaseURL:   getEnv("IMAGE_HOST_PUBLIC_BASE_URL", ""),
-		StaticDir:                "./static",
+		Port:                 getEnv("PORT", "8080"),
+		DataDir:              dataDir,
+		DatabaseDSN:          getEnv("DATABASE_DSN", "image_web:image_web@tcp(localhost:3306)/image_web?parseTime=true&charset=utf8mb4&loc=UTC"),
+		AppCredentialKey:     getEnv("APP_CREDENTIAL_KEY", ""),
+		OSSRegion:            normalizeOSSRegion(getEnv("OSS_REGION", "")),
+		OSSBucket:            getEnv("OSS_BUCKET", ""),
+		OSSEndpoint:          getEnv("OSS_ENDPOINT", ""),
+		OSSPublicBaseURL:     strings.TrimRight(getEnv("OSS_PUBLIC_BASE_URL", ""), "/"),
+		OSSPrefix:            strings.Trim(getEnv("OSS_PREFIX", "imageweb"), "/"),
+		OSSAccessKeyID:       getEnv("OSS_ACCESS_KEY_ID", ""),
+		OSSAccessKeySecret:   getEnv("OSS_ACCESS_KEY_SECRET", ""),
+		GalleryAdminUsername: getEnv("GALLERY_ADMIN_USERNAME", "admin"),
+		GalleryAdminPassword: getEnv("GALLERY_ADMIN_PASSWORD", ""),
+		GallerySessionSecret: getEnv("GALLERY_SESSION_SECRET", getEnv("APP_CREDENTIAL_KEY", "")),
+		StaticDir:            "./static",
 	}
 }
 
@@ -48,6 +52,11 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func normalizeOSSRegion(value string) string {
+	value = strings.TrimSpace(value)
+	return strings.TrimPrefix(value, "oss-")
 }
 
 func loadDotEnv() {

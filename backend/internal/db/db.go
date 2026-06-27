@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -26,8 +27,8 @@ import (
 	"image-web/backend/internal/model"
 	"image-web/backend/internal/sourceclean"
 
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
-	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 type Store struct {
@@ -40,6 +41,13 @@ type Store struct {
 	siteConfigCache        model.SiteConfig
 	siteConfigCacheExpires time.Time
 	siteConfigCacheOK      bool
+}
+
+type GalleryUserListOptions struct {
+	Query  string
+	Limit  int
+	Offset int
+	Page   int
 }
 
 type workspace struct {
@@ -75,7 +83,6 @@ const dbSlowOperationThreshold = 750 * time.Millisecond
 const dbMigrationTimeout = 30 * time.Second
 const dbLockTimeout = 5 * time.Second
 const dbStatementTimeout = 60 * time.Second
-const dbIdleTransactionTimeout = 15 * time.Second
 const dbMaxOpenConns = 10
 const dbMaxIdleConns = 5
 const dbConnMaxIdleTime = 10 * time.Minute
@@ -139,12 +146,7 @@ func quietDBOp(op string) bool {
 }
 
 func applyTransactionTimeouts(ctx context.Context, tx *sql.Tx) error {
-	_, err := tx.ExecContext(ctx, fmt.Sprintf(
-		`SET LOCAL lock_timeout = %s; SET LOCAL statement_timeout = %s; SET LOCAL idle_in_transaction_session_timeout = %s`,
-		sqlTimeoutLiteral(dbLockTimeout),
-		sqlTimeoutLiteral(dbStatementTimeout),
-		sqlTimeoutLiteral(dbIdleTransactionTimeout),
-	))
+	_, err := tx.ExecContext(ctx, `SET innodb_lock_wait_timeout = ?`, int(dbLockTimeout.Seconds()))
 	return err
 }
 
@@ -249,12 +251,12 @@ func Open(dsn, credentialSecret string) (*Store, error) {
 	if strings.TrimSpace(dsn) == "" {
 		return nil, fmt.Errorf("database dsn is required")
 	}
-	dsn = withRuntimeTimeoutParams(dsn)
+	dsn = withMySQLDSNParams(dsn)
 	key, err := deriveCredentialKey(credentialSecret)
 	if err != nil {
 		return nil, err
 	}
-	database, err := sql.Open("pgx", dsn)
+	database, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -286,52 +288,33 @@ func Open(dsn, credentialSecret string) (*Store, error) {
 	return store, nil
 }
 
-func withRuntimeTimeoutParams(dsn string) string {
+func withMySQLDSNParams(dsn string) string {
 	trimmed := strings.TrimSpace(dsn)
 	if trimmed == "" {
 		return dsn
 	}
-	parsed, err := url.Parse(trimmed)
-	if err == nil && (parsed.Scheme == "postgres" || parsed.Scheme == "postgresql") {
-		values := parsed.Query()
-		setDefaultRuntimeParam(values, "lock_timeout", dbLockTimeout)
-		setDefaultRuntimeParam(values, "statement_timeout", dbStatementTimeout)
-		setDefaultRuntimeParam(values, "idle_in_transaction_session_timeout", dbIdleTransactionTimeout)
-		parsed.RawQuery = values.Encode()
-		return parsed.String()
+	before, query, hasQuery := strings.Cut(trimmed, "?")
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		return trimmed
 	}
-	if strings.Contains(trimmed, "=") && !strings.ContainsAny(trimmed, "\r\n") {
-		params := []struct {
-			key     string
-			timeout time.Duration
-		}{
-			{"lock_timeout", dbLockTimeout},
-			{"statement_timeout", dbStatementTimeout},
-			{"idle_in_transaction_session_timeout", dbIdleTransactionTimeout},
-		}
-		for _, param := range params {
-			if !keywordDSNHasKey(trimmed, param.key) {
-				trimmed += fmt.Sprintf(" %s=%d", param.key, param.timeout.Milliseconds())
-			}
-		}
+	if values.Get("parseTime") == "" {
+		values.Set("parseTime", "true")
 	}
-	return trimmed
-}
-
-func setDefaultRuntimeParam(values url.Values, key string, timeout time.Duration) {
-	if values.Get(key) == "" {
-		values.Set(key, strconv.FormatInt(timeout.Milliseconds(), 10))
+	if values.Get("charset") == "" {
+		values.Set("charset", "utf8mb4")
 	}
-}
-
-func keywordDSNHasKey(dsn, key string) bool {
-	for _, field := range strings.Fields(dsn) {
-		name, _, ok := strings.Cut(field, "=")
-		if ok && name == key {
-			return true
-		}
+	if values.Get("loc") == "" {
+		values.Set("loc", "UTC")
 	}
-	return false
+	if values.Get("multiStatements") == "" {
+		values.Set("multiStatements", "true")
+	}
+	encoded := values.Encode()
+	if encoded == "" && !hasQuery {
+		return before
+	}
+	return before + "?" + encoded
 }
 
 func deriveCredentialKey(secret string) ([32]byte, error) {
@@ -354,76 +337,82 @@ func (s *Store) migrate(parent context.Context) error {
 	}
 	_, err := execLogged(ctx, s.db, "migration base schema", `
 CREATE TABLE IF NOT EXISTS workspaces (
-  id TEXT PRIMARY KEY,
-  base_url TEXT NOT NULL,
-  api_key_hash TEXT NOT NULL,
+  id VARCHAR(64) PRIMARY KEY,
+  base_url VARCHAR(512) NOT NULL,
+  api_key_hash VARCHAR(128) NOT NULL,
   api_key_encrypted TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL,
-  updated_at TIMESTAMPTZ NOT NULL,
-  UNIQUE (base_url, api_key_hash)
-);
+  created_at DATETIME(3) NOT NULL,
+  updated_at DATETIME(3) NOT NULL,
+  UNIQUE KEY idx_workspaces_base_key (base_url, api_key_hash)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE TABLE IF NOT EXISTS tasks (
-  id TEXT PRIMARY KEY,
-  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-  task_type TEXT NOT NULL DEFAULT 'image_generation' CHECK (task_type IN ('image_generation', 'video_generation')),
-  status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
-  prompt TEXT NOT NULL,
-  final_prompt TEXT NOT NULL DEFAULT '',
-  model TEXT NOT NULL,
-  size TEXT NOT NULL,
-  quality TEXT NOT NULL,
-  output_format TEXT NOT NULL,
+  id VARCHAR(64) PRIMARY KEY,
+  workspace_id VARCHAR(64) NOT NULL,
+  task_type VARCHAR(32) NOT NULL DEFAULT 'image_generation' CHECK (task_type IN ('image_generation', 'video_generation')),
+  status VARCHAR(32) NOT NULL CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
+  prompt MEDIUMTEXT NOT NULL,
+  final_prompt MEDIUMTEXT NOT NULL,
+  model VARCHAR(128) NOT NULL,
+  size VARCHAR(64) NOT NULL,
+  quality VARCHAR(32) NOT NULL,
+  output_format VARCHAR(32) NOT NULL,
   output_compression INT NOT NULL,
-  background TEXT NOT NULL,
-  moderation TEXT NOT NULL,
-  input_fidelity TEXT NOT NULL DEFAULT 'high',
+  background VARCHAR(32) NOT NULL,
+  moderation VARCHAR(32) NOT NULL,
+  input_fidelity VARCHAR(32) NOT NULL DEFAULT 'high',
   n INT NOT NULL,
   stream BOOLEAN NOT NULL DEFAULT FALSE,
-  style TEXT NOT NULL DEFAULT '',
-  response_format TEXT NOT NULL DEFAULT '',
+  style VARCHAR(128) NOT NULL DEFAULT '',
+  response_format VARCHAR(128) NOT NULL DEFAULT '',
   favorite BOOLEAN NOT NULL DEFAULT FALSE,
-  upstream_task_id TEXT NOT NULL DEFAULT '',
-  upstream_status TEXT NOT NULL DEFAULT '',
+  upstream_task_id VARCHAR(255) NOT NULL DEFAULT '',
+  upstream_status VARCHAR(64) NOT NULL DEFAULT '',
   upstream_progress INT NOT NULL DEFAULT 0,
-  next_poll_at TIMESTAMPTZ,
+  next_poll_at DATETIME(3),
   poll_count INT NOT NULL DEFAULT 0,
-  video_ratio TEXT NOT NULL DEFAULT '',
+  video_ratio VARCHAR(32) NOT NULL DEFAULT '',
   video_width INT NOT NULL DEFAULT 0,
   video_height INT NOT NULL DEFAULT 0,
   video_duration INT NOT NULL DEFAULT 0,
   generate_audio BOOLEAN NOT NULL DEFAULT FALSE,
   video_draft BOOLEAN NOT NULL DEFAULT FALSE,
   watermark BOOLEAN NOT NULL DEFAULT FALSE,
-  error_message TEXT NOT NULL DEFAULT '',
+  error_message MEDIUMTEXT NOT NULL,
   elapsed_ms BIGINT NOT NULL DEFAULT 0,
-  created_at TIMESTAMPTZ NOT NULL,
-  updated_at TIMESTAMPTZ NOT NULL,
-  started_at TIMESTAMPTZ,
-  completed_at TIMESTAMPTZ
-);
+  created_at DATETIME(3) NOT NULL,
+  updated_at DATETIME(3) NOT NULL,
+  started_at DATETIME(3),
+  completed_at DATETIME(3),
+  INDEX idx_tasks_workspace_created (workspace_id, created_at DESC, id DESC),
+  INDEX idx_tasks_workspace_status_created (workspace_id, status, created_at DESC, id DESC),
+  INDEX idx_tasks_pending_queue (status, created_at ASC, id ASC),
+  INDEX idx_tasks_video_poll (task_type, status, upstream_task_id, next_poll_at, updated_at, id),
+  CONSTRAINT fk_tasks_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE TABLE IF NOT EXISTS task_sources (
-  task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
-  request_headers TEXT NOT NULL DEFAULT '',
-  request_json TEXT NOT NULL DEFAULT '',
-  response_headers TEXT NOT NULL DEFAULT '',
-  response_json TEXT NOT NULL DEFAULT '',
-  updated_at TIMESTAMPTZ NOT NULL
-);
+  task_id VARCHAR(64) PRIMARY KEY,
+  request_headers MEDIUMTEXT NOT NULL,
+  request_json MEDIUMTEXT NOT NULL,
+  response_headers MEDIUMTEXT NOT NULL,
+  response_json MEDIUMTEXT NOT NULL,
+  updated_at DATETIME(3) NOT NULL,
+  CONSTRAINT fk_task_sources_task FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE TABLE IF NOT EXISTS task_media_assets (
-  id TEXT PRIMARY KEY,
-  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  role TEXT NOT NULL CHECK (role IN ('reference_image', 'reference_video', 'reference_audio', 'result_image', 'result_video', 'result_audio')),
-  asset_type TEXT NOT NULL DEFAULT '',
-  url TEXT NOT NULL,
-  thumbnail_url TEXT NOT NULL DEFAULT '',
-  first_frame_url TEXT NOT NULL DEFAULT '',
-  last_frame_url TEXT NOT NULL DEFAULT '',
-  filename TEXT NOT NULL DEFAULT '',
-  node_id TEXT NOT NULL DEFAULT '',
-  reference_label TEXT NOT NULL DEFAULT '',
-  video_frame_role TEXT NOT NULL DEFAULT '',
-  mask_reference_label TEXT NOT NULL DEFAULT '',
-  mask_url TEXT NOT NULL DEFAULT '',
+  id VARCHAR(64) PRIMARY KEY,
+  task_id VARCHAR(64) NOT NULL,
+  role VARCHAR(32) NOT NULL CHECK (role IN ('reference_image', 'reference_video', 'reference_audio', 'result_image', 'result_video', 'result_audio')),
+  asset_type VARCHAR(32) NOT NULL DEFAULT '',
+  url VARCHAR(2048) NOT NULL,
+  thumbnail_url VARCHAR(2048) NOT NULL DEFAULT '',
+  first_frame_url VARCHAR(2048) NOT NULL DEFAULT '',
+  last_frame_url VARCHAR(2048) NOT NULL DEFAULT '',
+  filename VARCHAR(512) NOT NULL DEFAULT '',
+  node_id VARCHAR(128) NOT NULL DEFAULT '',
+  reference_label VARCHAR(128) NOT NULL DEFAULT '',
+  video_frame_role VARCHAR(64) NOT NULL DEFAULT '',
+  mask_reference_label VARCHAR(128) NOT NULL DEFAULT '',
+  mask_url VARCHAR(2048) NOT NULL DEFAULT '',
   duration INT NOT NULL DEFAULT 0,
   clip_start INT NOT NULL DEFAULT 0,
   clip_end INT NOT NULL DEFAULT 0,
@@ -431,48 +420,52 @@ CREATE TABLE IF NOT EXISTS task_media_assets (
   height INT NOT NULL DEFAULT 0,
   original_size BIGINT NOT NULL DEFAULT 0,
   compressed_size BIGINT NOT NULL DEFAULT 0,
-  compression_ratio DOUBLE PRECISION NOT NULL DEFAULT 0,
+  compression_ratio DOUBLE NOT NULL DEFAULT 0,
   sort_order INT NOT NULL DEFAULT 0,
-  created_at TIMESTAMPTZ NOT NULL
-);
+  created_at DATETIME(3) NOT NULL,
+  INDEX idx_task_media_task_role_order (task_id, role, sort_order, created_at),
+  CONSTRAINT fk_task_media_task FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE TABLE IF NOT EXISTS canvases (
-  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-  canvas_id TEXT NOT NULL,
-  name TEXT NOT NULL DEFAULT '',
-  canvas_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  workspace_id VARCHAR(64) NOT NULL,
+  canvas_id VARCHAR(128) NOT NULL,
+  name VARCHAR(255) NOT NULL DEFAULT '',
+  canvas_json JSON NOT NULL,
   sort_order INT NOT NULL DEFAULT 0,
-  created_at TIMESTAMPTZ NOT NULL,
-  updated_at TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (workspace_id, canvas_id)
-);
+  created_at DATETIME(3) NOT NULL,
+  updated_at DATETIME(3) NOT NULL,
+  PRIMARY KEY (workspace_id, canvas_id),
+  INDEX idx_canvases_workspace_order (workspace_id, sort_order, canvas_id),
+  CONSTRAINT fk_canvases_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE TABLE IF NOT EXISTS plaza_items (
-  id TEXT PRIMARY KEY,
-  item_type TEXT NOT NULL DEFAULT 'task' CHECK (item_type IN ('task', 'canvas')),
-  task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
-  workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
-  canvas_id TEXT,
-  canvas_name TEXT NOT NULL DEFAULT '',
-  canvas_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-  task_type TEXT NOT NULL DEFAULT 'image_generation' CHECK (task_type IN ('image_generation', 'video_generation')),
-  prompt TEXT NOT NULL,
-  model TEXT NOT NULL,
-  size TEXT NOT NULL,
-  quality TEXT NOT NULL,
-  output_format TEXT NOT NULL,
+  id VARCHAR(64) PRIMARY KEY,
+  item_type VARCHAR(32) NOT NULL DEFAULT 'task' CHECK (item_type IN ('task', 'canvas')),
+  task_id VARCHAR(64),
+  workspace_id VARCHAR(64),
+  canvas_id VARCHAR(128),
+  canvas_name VARCHAR(255) NOT NULL DEFAULT '',
+  canvas_json JSON NOT NULL,
+  task_type VARCHAR(32) NOT NULL DEFAULT 'image_generation' CHECK (task_type IN ('image_generation', 'video_generation')),
+  prompt MEDIUMTEXT NOT NULL,
+  model VARCHAR(128) NOT NULL,
+  size VARCHAR(64) NOT NULL,
+  quality VARCHAR(32) NOT NULL,
+  output_format VARCHAR(32) NOT NULL,
   output_compression INT NOT NULL,
-  background TEXT NOT NULL,
-  moderation TEXT NOT NULL,
-  input_fidelity TEXT NOT NULL DEFAULT 'high',
+  background VARCHAR(32) NOT NULL,
+  moderation VARCHAR(32) NOT NULL,
+  input_fidelity VARCHAR(32) NOT NULL DEFAULT 'high',
   n INT NOT NULL,
   stream BOOLEAN NOT NULL DEFAULT FALSE,
-  style TEXT NOT NULL DEFAULT '',
-  response_format TEXT NOT NULL DEFAULT '',
-  reference_images_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-  reference_videos_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-  reference_audios_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-  result_images_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-  result_videos_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-  video_ratio TEXT NOT NULL DEFAULT '',
+  style VARCHAR(128) NOT NULL DEFAULT '',
+  response_format VARCHAR(128) NOT NULL DEFAULT '',
+  reference_images_json JSON NOT NULL,
+  reference_videos_json JSON NOT NULL,
+  reference_audios_json JSON NOT NULL,
+  result_images_json JSON NOT NULL,
+  result_videos_json JSON NOT NULL,
+  video_ratio VARCHAR(32) NOT NULL DEFAULT '',
   video_width INT NOT NULL DEFAULT 0,
   video_height INT NOT NULL DEFAULT 0,
   video_duration INT NOT NULL DEFAULT 0,
@@ -480,43 +473,51 @@ CREATE TABLE IF NOT EXISTS plaza_items (
   video_draft BOOLEAN NOT NULL DEFAULT FALSE,
   watermark BOOLEAN NOT NULL DEFAULT FALSE,
   like_count INT NOT NULL DEFAULT 0,
-  created_at TIMESTAMPTZ NOT NULL,
-  updated_at TIMESTAMPTZ NOT NULL,
+  created_at DATETIME(3) NOT NULL,
+  updated_at DATETIME(3) NOT NULL,
   CHECK (
     (item_type = 'task' AND task_id IS NOT NULL AND canvas_id IS NULL)
     OR
     (item_type = 'canvas' AND task_id IS NULL AND workspace_id IS NOT NULL AND canvas_id IS NOT NULL)
   ),
-  FOREIGN KEY (workspace_id, canvas_id) REFERENCES canvases(workspace_id, canvas_id) ON DELETE CASCADE
-);
+  UNIQUE KEY idx_plaza_task_unique (task_id),
+  UNIQUE KEY idx_plaza_canvas_unique (workspace_id, canvas_id),
+  INDEX idx_plaza_created (created_at DESC, id DESC),
+  INDEX idx_plaza_likes (like_count DESC, created_at DESC, id DESC),
+  CONSTRAINT fk_plaza_task FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+  CONSTRAINT fk_plaza_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+  CONSTRAINT fk_plaza_canvas FOREIGN KEY (workspace_id, canvas_id) REFERENCES canvases(workspace_id, canvas_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE TABLE IF NOT EXISTS plaza_likes (
-  plaza_id TEXT NOT NULL REFERENCES plaza_items(id) ON DELETE CASCADE,
-  client_id TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (plaza_id, client_id)
-);
+  plaza_id VARCHAR(64) NOT NULL,
+  client_id VARCHAR(128) NOT NULL,
+  created_at DATETIME(3) NOT NULL,
+  PRIMARY KEY (plaza_id, client_id),
+  CONSTRAINT fk_plaza_likes_item FOREIGN KEY (plaza_id) REFERENCES plaza_items(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE TABLE IF NOT EXISTS site_config (
-  config_key TEXT PRIMARY KEY,
+  config_key VARCHAR(128) PRIMARY KEY,
   value TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_tasks_workspace_created ON tasks(workspace_id, created_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_tasks_workspace_status_created ON tasks(workspace_id, status, created_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_tasks_pending_queue ON tasks(created_at ASC, id ASC) WHERE status = 'pending';
-CREATE INDEX IF NOT EXISTS idx_tasks_video_poll ON tasks ((COALESCE(next_poll_at, updated_at)), id) WHERE task_type = 'video_generation' AND status = 'running' AND upstream_task_id <> '';
-CREATE INDEX IF NOT EXISTS idx_task_media_task_role_order ON task_media_assets(task_id, role, sort_order, created_at);
-CREATE INDEX IF NOT EXISTS idx_canvases_workspace_order ON canvases(workspace_id, sort_order, canvas_id);
-CREATE INDEX IF NOT EXISTS idx_plaza_created ON plaza_items(created_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_plaza_likes ON plaza_items(like_count DESC, created_at DESC, id DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_plaza_task_unique ON plaza_items(task_id) WHERE item_type = 'task';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_plaza_canvas_unique ON plaza_items(workspace_id, canvas_id) WHERE item_type = 'canvas';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS gallery_assets (
+  sha256 CHAR(64) NOT NULL PRIMARY KEY,
+  url VARCHAR(2048) NOT NULL,
+  thumbnail_url VARCHAR(2048) NOT NULL DEFAULT '',
+  first_frame_url VARCHAR(2048) NOT NULL DEFAULT '',
+  last_frame_url VARCHAR(2048) NOT NULL DEFAULT '',
+  filename VARCHAR(512) NOT NULL DEFAULT '',
+  content_type VARCHAR(255) NOT NULL DEFAULT '',
+  etag VARCHAR(255) NOT NULL DEFAULT '',
+  size BIGINT NOT NULL DEFAULT 0,
+  created_at DATETIME(3) NOT NULL,
+  updated_at DATETIME(3) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 `)
 	if err != nil {
 		return err
 	}
-	s.ensureTrigramIndexes(ctx)
 	return s.ensureSiteConfig(ctx)
 }
-
 func (s *Store) ensureNoLegacySchema(ctx context.Context) error {
 	columns, err := s.loadSchemaColumns(ctx, []string{"tasks", "canvases", "plaza_items", "task_media_assets"})
 	if err != nil {
@@ -572,16 +573,11 @@ func (s *Store) loadSchemaColumns(ctx context.Context, tables []string) (map[str
 		placeholders = append(placeholders, placeholder(len(args)))
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT c.relname, a.attname
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
-JOIN pg_attribute a ON a.attrelid = c.oid
-WHERE n.nspname = current_schema()
-  AND c.relkind IN ('r', 'p')
-  AND c.relname IN (`+strings.Join(placeholders, ",")+`)
-  AND a.attnum > 0
-  AND NOT a.attisdropped
-ORDER BY c.relname, a.attnum`, args...)
+SELECT table_name, column_name
+FROM information_schema.columns
+WHERE table_schema = DATABASE()
+  AND table_name IN (`+strings.Join(placeholders, ",")+`)
+ORDER BY table_name, ordinal_position`, args...)
 	if err != nil {
 		logDB(ctx, "query error op=migration.load_schema_columns elapsed=%s err=%v", time.Since(started), err)
 		return nil, err
@@ -614,7 +610,7 @@ func (s *Store) tableExists(ctx context.Context, table string) (bool, error) {
 		return s.db.QueryRowContext(ctx, `
 SELECT EXISTS (
   SELECT 1 FROM information_schema.tables
-  WHERE table_schema = current_schema() AND table_name = $1
+  WHERE table_schema = DATABASE() AND table_name = ?
 )`, table).Scan(&exists)
 	})
 	return exists, err
@@ -626,38 +622,22 @@ func (s *Store) columnExists(ctx context.Context, table, column string) (bool, e
 		return s.db.QueryRowContext(ctx, `
 SELECT EXISTS (
   SELECT 1 FROM information_schema.columns
-  WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2
+  WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?
 )`, table, column).Scan(&exists)
 	})
 	return exists, err
 }
 
-func (s *Store) ensureTrigramIndexes(ctx context.Context) {
-	if _, err := execLogged(ctx, s.db, "migration pg_trgm extension", `CREATE EXTENSION IF NOT EXISTS pg_trgm`); err != nil {
-		fmt.Println("db pg_trgm unavailable, fallback to LIKE search:", err)
-		return
-	}
-	if _, err := execLogged(ctx, s.db, "migration pg_trgm indexes", `
-CREATE INDEX IF NOT EXISTS idx_tasks_prompt_trgm ON tasks USING GIN (prompt gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_tasks_final_prompt_trgm ON tasks USING GIN (final_prompt gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_plaza_prompt_trgm ON plaza_items USING GIN (prompt gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_plaza_canvas_name_trgm ON plaza_items USING GIN (canvas_name gin_trgm_ops);
-`); err != nil {
-		fmt.Println("db pg_trgm indexes unavailable, fallback to LIKE search:", err)
-	}
-}
-
 func (s *Store) ensureSiteConfig(ctx context.Context) error {
 	_, err := execLogged(ctx, s.db, "migration site_config defaults", `
-INSERT INTO site_config (config_key, value)
+INSERT IGNORE INTO site_config (config_key, value)
 VALUES
   ('baseurl_whitelist_enabled', 'false'),
   ('baseurl_whitelist', '[]'),
   ('admin_contact_image', ''),
   ('site_title', '图片生成工作台'),
   ('site_icon', 'AI'),
-  ('worker_concurrency', '1')
-ON CONFLICT (config_key) DO NOTHING`)
+  ('worker_concurrency', '1')`)
 	return err
 }
 
@@ -741,7 +721,7 @@ func (s *Store) resolveWorkspace(ctx context.Context, apiKey, baseURL string) (w
 	}
 	var ws workspace
 	err := scanLogged(ctx, "workspace.resolve", func() error {
-		return s.db.QueryRowContext(ctx, `SELECT id, base_url, api_key_encrypted FROM workspaces WHERE base_url = $1 AND api_key_hash = $2`, baseURLKey, hash).Scan(&ws.ID, &ws.BaseURL, &ws.EncryptedAPIKey)
+		return s.db.QueryRowContext(ctx, `SELECT id, base_url, api_key_encrypted FROM workspaces WHERE base_url = ? AND api_key_hash = ?`, baseURLKey, hash).Scan(&ws.ID, &ws.BaseURL, &ws.EncryptedAPIKey)
 	})
 	if err == nil {
 		if _, err := s.decryptAPIKey(ws.EncryptedAPIKey); err != nil {
@@ -760,10 +740,9 @@ func (s *Store) resolveWorkspace(ctx context.Context, apiKey, baseURL string) (w
 	now := time.Now().UTC()
 	ws = workspace{ID: uuid.NewString(), BaseURL: baseURLKey, EncryptedAPIKey: encrypted}
 	result, err := execLogged(ctx, s.db, "workspace.insert", `
-INSERT INTO workspaces (id, base_url, api_key_hash, api_key_encrypted, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $5)
-ON CONFLICT (base_url, api_key_hash) DO NOTHING
-`, ws.ID, ws.BaseURL, hash, encrypted, now)
+INSERT IGNORE INTO workspaces (id, base_url, api_key_hash, api_key_encrypted, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)
+`, ws.ID, ws.BaseURL, hash, encrypted, now, now)
 	if err != nil {
 		return workspace{}, err
 	}
@@ -772,7 +751,7 @@ ON CONFLICT (base_url, api_key_hash) DO NOTHING
 		return ws, nil
 	}
 	err = scanLogged(ctx, "workspace.resolve_after_conflict", func() error {
-		return s.db.QueryRowContext(ctx, `SELECT id, base_url, api_key_encrypted FROM workspaces WHERE base_url = $1 AND api_key_hash = $2`, baseURLKey, hash).Scan(&ws.ID, &ws.BaseURL, &ws.EncryptedAPIKey)
+		return s.db.QueryRowContext(ctx, `SELECT id, base_url, api_key_encrypted FROM workspaces WHERE base_url = ? AND api_key_hash = ?`, baseURLKey, hash).Scan(&ws.ID, &ws.BaseURL, &ws.EncryptedAPIKey)
 	})
 	if err != nil {
 		return workspace{}, err
@@ -865,7 +844,19 @@ func (s *Store) CanvasState(ctx context.Context, apiKey, baseURL string) (model.
 	if err != nil {
 		return model.CanvasState{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT canvas_json::text, updated_at FROM canvases WHERE workspace_id = $1 ORDER BY sort_order ASC, updated_at ASC, canvas_id ASC`, ws.ID)
+	return s.canvasStateByWorkspace(ctx, ws.ID)
+}
+
+func (s *Store) CanvasStateByWorkspace(ctx context.Context, workspaceID string) (model.CanvasState, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return model.CanvasState{}, fmt.Errorf("缺少 workspace_id")
+	}
+	return s.canvasStateByWorkspace(ctx, workspaceID)
+}
+
+func (s *Store) canvasStateByWorkspace(ctx context.Context, workspaceID string) (model.CanvasState, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT canvas_json, updated_at FROM canvases WHERE workspace_id = ? ORDER BY sort_order ASC, updated_at ASC, canvas_id ASC`, workspaceID)
 	if err != nil {
 		return model.CanvasState{}, err
 	}
@@ -975,7 +966,7 @@ func (s *Store) PatchCanvasState(ctx context.Context, apiKey, baseURL string, ch
 	}
 
 	for id := range deleted {
-		if _, err := execLogged(ctx, s.db, "canvas.delete_row canvas_id="+compactID(id), `DELETE FROM canvases WHERE workspace_id = $1 AND canvas_id = $2`, ws.ID, id); err != nil {
+		if _, err := execLogged(ctx, s.db, "canvas.delete_row canvas_id="+compactID(id), `DELETE FROM canvases WHERE workspace_id = ? AND canvas_id = ?`, ws.ID, id); err != nil {
 			return model.CanvasState{}, err
 		}
 	}
@@ -1009,7 +1000,7 @@ func (s *Store) PatchCanvasState(ctx context.Context, apiKey, baseURL string, ch
 		var currentRaw string
 		var sortOrder int
 		err := scanLogged(ctx, "canvas.current_snapshot canvas_id="+compactID(id), func() error {
-			return s.db.QueryRowContext(ctx, `SELECT canvas_json::text, sort_order FROM canvases WHERE workspace_id = $1 AND canvas_id = $2`, ws.ID, id).Scan(&currentRaw, &sortOrder)
+			return s.db.QueryRowContext(ctx, `SELECT canvas_json, sort_order FROM canvases WHERE workspace_id = ? AND canvas_id = ?`, ws.ID, id).Scan(&currentRaw, &sortOrder)
 		})
 		var canvas json.RawMessage
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1059,7 +1050,7 @@ func decodeCanvasArray(raw []byte) ([]json.RawMessage, error) {
 }
 
 func lockCanvasScope(ctx context.Context, tx *sql.Tx, workspaceID string) error {
-	_, err := execLogged(ctx, tx, "canvas.advisory_lock workspace_id="+compactID(workspaceID), `SELECT pg_advisory_xact_lock(hashtext($1), hashtext('canvases'))`, workspaceID)
+	_, err := execLogged(ctx, tx, "canvas.lock_workspace workspace_id="+compactID(workspaceID), `SELECT id FROM workspaces WHERE id = ? FOR UPDATE`, workspaceID)
 	return err
 }
 
@@ -1070,10 +1061,9 @@ func upsertCanvasRow(ctx context.Context, exec sqlExecer, workspaceID, canvasID,
 	}
 	_, err = execLogged(ctx, exec, fmt.Sprintf("canvas.upsert_row canvas_id=%s bytes=%d stored_bytes=%d", compactID(canvasID), len(canvas), len(storedCanvas)), `
 INSERT INTO canvases (workspace_id, canvas_id, name, canvas_json, sort_order, created_at, updated_at)
-VALUES ($1, $2, $3, $4::jsonb, $5, $6, $6)
-ON CONFLICT (workspace_id, canvas_id)
-DO UPDATE SET name = EXCLUDED.name, canvas_json = EXCLUDED.canvas_json, sort_order = EXCLUDED.sort_order, updated_at = EXCLUDED.updated_at
-`, workspaceID, canvasID, name, string(storedCanvas), sortOrder, now)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE name = VALUES(name), canvas_json = VALUES(canvas_json), sort_order = VALUES(sort_order), updated_at = VALUES(updated_at)
+`, workspaceID, canvasID, name, string(storedCanvas), sortOrder, now, now)
 	return err
 }
 
@@ -1084,9 +1074,9 @@ func upsertCanvasRowPreserveSort(ctx context.Context, exec sqlExecQueryer, works
 	}
 	result, err := execLogged(ctx, exec, fmt.Sprintf("canvas.update_row canvas_id=%s bytes=%d stored_bytes=%d", compactID(canvasID), len(canvas), len(storedCanvas)), `
 UPDATE canvases
-SET name = $3, canvas_json = $4::jsonb, updated_at = $5
-WHERE workspace_id = $1 AND canvas_id = $2
-`, workspaceID, canvasID, name, string(storedCanvas), now)
+SET name = ?, canvas_json = ?, updated_at = ?
+WHERE workspace_id = ? AND canvas_id = ?
+`, name, string(storedCanvas), now, workspaceID, canvasID)
 	if err != nil {
 		return err
 	}
@@ -1103,16 +1093,15 @@ WHERE workspace_id = $1 AND canvas_id = $2
 func upsertStoredCanvasRow(ctx context.Context, exec sqlExecer, workspaceID, canvasID, name string, storedCanvas json.RawMessage, sortOrder int, now time.Time, originalBytes int) error {
 	_, err := execLogged(ctx, exec, fmt.Sprintf("canvas.upsert_row canvas_id=%s bytes=%d stored_bytes=%d", compactID(canvasID), originalBytes, len(storedCanvas)), `
 INSERT INTO canvases (workspace_id, canvas_id, name, canvas_json, sort_order, created_at, updated_at)
-VALUES ($1, $2, $3, $4::jsonb, $5, $6, $6)
-ON CONFLICT (workspace_id, canvas_id)
-DO UPDATE SET name = EXCLUDED.name, canvas_json = EXCLUDED.canvas_json, sort_order = EXCLUDED.sort_order, updated_at = EXCLUDED.updated_at
-`, workspaceID, canvasID, name, string(storedCanvas), sortOrder, now)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE name = VALUES(name), canvas_json = VALUES(canvas_json), sort_order = VALUES(sort_order), updated_at = VALUES(updated_at)
+`, workspaceID, canvasID, name, string(storedCanvas), sortOrder, now, now)
 	return err
 }
 
 func deleteMissingCanvases(ctx context.Context, exec sqlExecer, workspaceID string, keepIDs []string) error {
 	if len(keepIDs) == 0 {
-		_, err := execLogged(ctx, exec, "canvas.delete_missing all", `DELETE FROM canvases WHERE workspace_id = $1`, workspaceID)
+		_, err := execLogged(ctx, exec, "canvas.delete_missing all", `DELETE FROM canvases WHERE workspace_id = ?`, workspaceID)
 		return err
 	}
 	args := []any{workspaceID}
@@ -1121,14 +1110,14 @@ func deleteMissingCanvases(ctx context.Context, exec sqlExecer, workspaceID stri
 		args = append(args, id)
 		placeholders = append(placeholders, placeholder(len(args)))
 	}
-	_, err := execLogged(ctx, exec, fmt.Sprintf("canvas.delete_missing keep=%d", len(keepIDs)), `DELETE FROM canvases WHERE workspace_id = $1 AND canvas_id NOT IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	_, err := execLogged(ctx, exec, fmt.Sprintf("canvas.delete_missing keep=%d", len(keepIDs)), `DELETE FROM canvases WHERE workspace_id = ? AND canvas_id NOT IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	return err
 }
 
 func nextCanvasSortOrder(ctx context.Context, query sqlQueryer, workspaceID string) (int, error) {
 	var next int
 	if err := scanLogged(ctx, "canvas.next_sort_order", func() error {
-		return query.QueryRowContext(ctx, `SELECT COALESCE(MAX(sort_order) + 1, 0) FROM canvases WHERE workspace_id = $1`, workspaceID).Scan(&next)
+		return query.QueryRowContext(ctx, `SELECT COALESCE(MAX(sort_order) + 1, 0) FROM canvases WHERE workspace_id = ?`, workspaceID).Scan(&next)
 	}); err != nil {
 		return 0, err
 	}
@@ -1138,7 +1127,7 @@ func nextCanvasSortOrder(ctx context.Context, query sqlQueryer, workspaceID stri
 func currentCanvasSortOrder(ctx context.Context, query sqlQueryer, workspaceID, canvasID string) (int, bool, error) {
 	var sortOrder int
 	err := scanLogged(ctx, "canvas.current_sort_order canvas_id="+compactID(canvasID), func() error {
-		return query.QueryRowContext(ctx, `SELECT sort_order FROM canvases WHERE workspace_id = $1 AND canvas_id = $2`, workspaceID, canvasID).Scan(&sortOrder)
+		return query.QueryRowContext(ctx, `SELECT sort_order FROM canvases WHERE workspace_id = ? AND canvas_id = ?`, workspaceID, canvasID).Scan(&sortOrder)
 	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
@@ -1383,7 +1372,7 @@ func (s *Store) CreateTask(ctx context.Context, task *model.Task) error {
 	 favorite, upstream_task_id, upstream_status, upstream_progress, next_poll_at, poll_count,
 	 video_ratio, video_width, video_height, video_duration, generate_audio, video_draft, watermark,
 	 error_message, elapsed_ms, created_at, updated_at
-	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35)`,
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		task.ID, task.WorkspaceID, task.TaskType, task.Status, task.Prompt, task.FinalPrompt, task.Model,
 		task.Size, task.Quality, task.OutputFormat, task.OutputCompression, task.Background,
 		task.Moderation, task.InputFidelity, task.N, task.Stream, task.Style, task.ResponseFormat,
@@ -1420,16 +1409,28 @@ func (s *Store) ListTasks(ctx context.Context, apiKey, baseURL, status, query, b
 	if err != nil {
 		return nil, 0, err
 	}
-	args := []any{ws.ID}
-	where := []string{"t.workspace_id = $1"}
+	return s.listTasksByWorkspace(ctx, ws.ID, status, query, beforeCreatedAt, beforeID, favoriteOnly, limit)
+}
+
+func (s *Store) ListTasksByWorkspace(ctx context.Context, workspaceID, status, query, beforeCreatedAt, beforeID string, favoriteOnly bool, limit int) ([]model.Task, int, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return nil, 0, fmt.Errorf("缺少 workspace_id")
+	}
+	return s.listTasksByWorkspace(ctx, workspaceID, status, query, beforeCreatedAt, beforeID, favoriteOnly, limit)
+}
+
+func (s *Store) listTasksByWorkspace(ctx context.Context, workspaceID, status, query, beforeCreatedAt, beforeID string, favoriteOnly bool, limit int) ([]model.Task, int, error) {
+	args := []any{workspaceID}
+	where := []string{"t.workspace_id = ?"}
 	if status != "" && status != "all" {
 		args = append(args, status)
 		where = append(where, "t.status = "+placeholder(len(args)))
 	}
 	if query != "" {
-		args = append(args, "%"+query+"%")
-		queryPlaceholder := placeholder(len(args))
-		where = append(where, "(t.prompt ILIKE "+queryPlaceholder+" OR t.final_prompt ILIKE "+queryPlaceholder+" OR t.model ILIKE "+queryPlaceholder+" OR t.task_type ILIKE "+queryPlaceholder+")")
+		pattern := "%" + strings.ToLower(query) + "%"
+		args = append(args, pattern, pattern, pattern, pattern)
+		where = append(where, "(LOWER(t.prompt) LIKE ? OR LOWER(t.final_prompt) LIKE ? OR LOWER(t.model) LIKE ? OR LOWER(t.task_type) LIKE ?)")
 	}
 	if favoriteOnly {
 		where = append(where, "t.favorite = TRUE")
@@ -1470,7 +1471,19 @@ func (s *Store) GetTask(ctx context.Context, id, apiKey, baseURL string) (*model
 	if err != nil {
 		return nil, err
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT `+taskColumns(true)+` FROM `+taskFromClause(true)+` WHERE t.id = $1 AND t.workspace_id = $2`, id, ws.ID)
+	return s.getTaskByWorkspace(ctx, id, ws.ID)
+}
+
+func (s *Store) GetTaskByWorkspace(ctx context.Context, workspaceID, id string) (*model.Task, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return nil, fmt.Errorf("缺少 workspace_id")
+	}
+	return s.getTaskByWorkspace(ctx, id, workspaceID)
+}
+
+func (s *Store) getTaskByWorkspace(ctx context.Context, id, workspaceID string) (*model.Task, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+taskColumns(true)+` FROM `+taskFromClause(true)+` WHERE t.id = ? AND t.workspace_id = ?`, id, workspaceID)
 	task, err := s.scanTask(row)
 	if err != nil {
 		return nil, err
@@ -1479,7 +1492,7 @@ func (s *Store) GetTask(ctx context.Context, id, apiKey, baseURL string) (*model
 }
 
 func (s *Store) GetAnyTask(ctx context.Context, id string) (*model.Task, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+taskColumns(true)+` FROM `+taskFromClause(true)+` WHERE t.id = $1`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT `+taskColumns(true)+` FROM `+taskFromClause(true)+` WHERE t.id = ?`, id)
 	task, err := s.scanTask(row)
 	if err != nil {
 		return nil, err
@@ -1497,7 +1510,7 @@ func (s *Store) ShareTaskToPlaza(ctx context.Context, id, apiKey, baseURL string
 	}
 	now := time.Now().UTC()
 	plazaID := ""
-	if err := s.db.QueryRowContext(ctx, `SELECT id FROM plaza_items WHERE task_id = $1`, id).Scan(&plazaID); err == nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT id FROM plaza_items WHERE task_id = ?`, id).Scan(&plazaID); err == nil {
 		return s.PlazaItem(ctx, plazaID, "")
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
@@ -1524,12 +1537,12 @@ func (s *Store) ShareTaskToPlaza(ctx context.Context, id, apiKey, baseURL string
 	}
 	plazaID = uuid.NewString()
 	_, err = execLogged(ctx, s.db, "plaza.task.insert task_id="+compactID(task.ID), `INSERT INTO plaza_items (
-	 id, item_type, task_id, workspace_id, task_type, prompt, model, size, quality, output_format, output_compression,
+	 id, item_type, task_id, workspace_id, canvas_id, canvas_name, canvas_json, task_type, prompt, model, size, quality, output_format, output_compression,
 	 background, moderation, input_fidelity, n, stream, style, response_format, reference_images_json,
 	 reference_videos_json, reference_audios_json, result_images_json, result_videos_json,
 	 video_ratio, video_width, video_height, video_duration, generate_audio, video_draft, watermark,
 	 like_count, created_at, updated_at
-	) VALUES ($1, 'task', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb, $19::jsonb, $20::jsonb, $21::jsonb, $22::jsonb, $23, $24, $25, $26, $27, $28, $29, 0, $30, $31)`,
+	) VALUES (?, 'task', ?, ?, NULL, '', '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
 		plazaID, task.ID, task.WorkspaceID, task.TaskType, task.Prompt, task.Model, task.Size, task.Quality, task.OutputFormat,
 		task.OutputCompression, task.Background, task.Moderation, task.InputFidelity, task.N, task.Stream, task.Style,
 		task.ResponseFormat, string(refs), string(refVideos), string(refAudios), string(results), string(resultVideos),
@@ -1596,10 +1609,10 @@ func (s *Store) ShareCanvasToPlaza(ctx context.Context, apiKey, baseURL, name st
 	}
 	plazaID := ""
 	err = scanLogged(ctx, "plaza.canvas.select_for_update canvas_id="+compactID(canvasID), func() error {
-		return tx.QueryRowContext(ctx, `SELECT id FROM plaza_items WHERE item_type = 'canvas' AND workspace_id = $1 AND canvas_id = $2 FOR UPDATE`, ws.ID, canvasID).Scan(&plazaID)
+		return tx.QueryRowContext(ctx, `SELECT id FROM plaza_items WHERE item_type = 'canvas' AND workspace_id = ? AND canvas_id = ? FOR UPDATE`, ws.ID, canvasID).Scan(&plazaID)
 	})
 	if err == nil {
-		if _, err := execLogged(ctx, tx, "plaza.canvas.update plaza_id="+compactID(plazaID), `UPDATE plaza_items SET canvas_name = $1, canvas_json = $2::jsonb, prompt = $3, updated_at = $4 WHERE id = $5`, name, string(canvas), prompt, now, plazaID); err != nil {
+		if _, err := execLogged(ctx, tx, "plaza.canvas.update plaza_id="+compactID(plazaID), `UPDATE plaza_items SET canvas_name = ?, canvas_json = ?, prompt = ?, updated_at = ? WHERE id = ?`, name, string(canvas), prompt, now, plazaID); err != nil {
 			return nil, err
 		}
 	} else if errors.Is(err, sql.ErrNoRows) {
@@ -1610,7 +1623,7 @@ func (s *Store) ShareCanvasToPlaza(ctx context.Context, apiKey, baseURL, name st
 		 response_format, reference_images_json, reference_videos_json, reference_audios_json,
 		 result_images_json, result_videos_json, video_ratio, video_width, video_height, video_duration,
 		 generate_audio, video_draft, watermark, like_count, created_at, updated_at
-		) VALUES ($1, 'canvas', NULL, $2, $3, $4, $5::jsonb, 'image_generation', $6, 'canvas', '', '', '', 0, '', '', 'high', 1, false, '', '', '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '', 0, 0, 0, false, false, false, 0, $7, $8)`,
+		) VALUES (?, 'canvas', NULL, ?, ?, ?, ?, 'image_generation', ?, 'canvas', '', '', '', 0, '', '', 'high', 1, false, '', '', '[]', '[]', '[]', '[]', '[]', '', 0, 0, 0, false, false, false, 0, ?, ?)`,
 			plazaID, ws.ID, canvasID, name, string(canvas), prompt, now, now)
 		if err != nil {
 			return nil, err
@@ -1633,7 +1646,7 @@ func (s *Store) UnshareCanvasFromPlaza(ctx context.Context, apiKey, baseURL, can
 	if err != nil {
 		return err
 	}
-	_, err = execLogged(ctx, s.db, "plaza.canvas.delete canvas_id="+compactID(canvasID), `DELETE FROM plaza_items WHERE item_type = 'canvas' AND workspace_id = $1 AND canvas_id = $2`, ws.ID, canvasID)
+	_, err = execLogged(ctx, s.db, "plaza.canvas.delete canvas_id="+compactID(canvasID), `DELETE FROM plaza_items WHERE item_type = 'canvas' AND workspace_id = ? AND canvas_id = ?`, ws.ID, canvasID)
 	return err
 }
 
@@ -1642,7 +1655,7 @@ func (s *Store) UnshareTaskFromPlaza(ctx context.Context, id, apiKey, baseURL st
 	if err != nil {
 		return err
 	}
-	result, err := execLogged(ctx, s.db, "plaza.task.delete task_id="+compactID(task.ID), `DELETE FROM plaza_items WHERE item_type = 'task' AND task_id = $1`, task.ID)
+	result, err := execLogged(ctx, s.db, "plaza.task.delete task_id="+compactID(task.ID), `DELETE FROM plaza_items WHERE item_type = 'task' AND task_id = ?`, task.ID)
 	if err != nil {
 		return err
 	}
@@ -1667,7 +1680,7 @@ func (s *Store) TaskUpdates(ctx context.Context, apiKey, baseURL string, ids []s
 		args = append(args, id)
 		placeholders = append(placeholders, placeholder(len(args)))
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT t.id, t.status, t.error_message, t.elapsed_ms, t.updated_at, t.started_at, t.completed_at, CASE WHEN t.status = 'pending' THEN (SELECT COUNT(*) FROM tasks queued WHERE queued.status = 'pending' AND queued.created_at < t.created_at) ELSE 0 END, t.upstream_status, t.upstream_progress FROM tasks t WHERE t.workspace_id = $1 AND t.id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT t.id, t.status, t.error_message, t.elapsed_ms, t.updated_at, t.started_at, t.completed_at, CASE WHEN t.status = 'pending' THEN (SELECT COUNT(*) FROM tasks queued WHERE queued.status = 'pending' AND queued.created_at < t.created_at) ELSE 0 END, t.upstream_status, t.upstream_progress FROM tasks t WHERE t.workspace_id = ? AND t.id IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1702,12 +1715,12 @@ func (s *Store) ListPlazaItems(ctx context.Context, sort, q, beforeCreatedAt, be
 	keyword := strings.TrimSpace(q)
 	if keyword != "" {
 		pattern := "%" + strings.ToLower(keyword) + "%"
-		args = append(args, pattern)
-		wherePlaceholder := placeholder(len(args))
-		where = append(where, fmt.Sprintf("(LOWER(prompt) LIKE %s OR LOWER(model) LIKE %s OR LOWER(size) LIKE %s OR LOWER(quality) LIKE %s OR LOWER(output_format) LIKE %s OR LOWER(background) LIKE %s OR LOWER(canvas_name) LIKE %s)", wherePlaceholder, wherePlaceholder, wherePlaceholder, wherePlaceholder, wherePlaceholder, wherePlaceholder, wherePlaceholder))
-		countArgs = append(countArgs, pattern)
-		countPlaceholder := placeholder(len(countArgs))
-		countWhere = append(countWhere, fmt.Sprintf("(LOWER(prompt) LIKE %s OR LOWER(model) LIKE %s OR LOWER(size) LIKE %s OR LOWER(quality) LIKE %s OR LOWER(output_format) LIKE %s OR LOWER(background) LIKE %s OR LOWER(canvas_name) LIKE %s)", countPlaceholder, countPlaceholder, countPlaceholder, countPlaceholder, countPlaceholder, countPlaceholder, countPlaceholder))
+		for range 7 {
+			args = append(args, pattern)
+			countArgs = append(countArgs, pattern)
+		}
+		where = append(where, "(LOWER(prompt) LIKE ? OR LOWER(model) LIKE ? OR LOWER(size) LIKE ? OR LOWER(quality) LIKE ? OR LOWER(output_format) LIKE ? OR LOWER(background) LIKE ? OR LOWER(canvas_name) LIKE ?)")
+		countWhere = append(countWhere, "(LOWER(prompt) LIKE ? OR LOWER(model) LIKE ? OR LOWER(size) LIKE ? OR LOWER(quality) LIKE ? OR LOWER(output_format) LIKE ? OR LOWER(background) LIKE ? OR LOWER(canvas_name) LIKE ?)")
 	}
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM plaza_items WHERE `+strings.Join(countWhere, " AND "), countArgs...).Scan(&total); err != nil {
 		return nil, 0, err
@@ -1745,7 +1758,7 @@ func (s *Store) ListPlazaItems(ctx context.Context, sort, q, beforeCreatedAt, be
 }
 
 func (s *Store) PlazaItem(ctx context.Context, id, clientID string) (*model.PlazaItem, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+plazaColumns()+` FROM plaza_items WHERE id = $2`, clientID, id)
+	row := s.db.QueryRowContext(ctx, `SELECT `+plazaColumns()+` FROM plaza_items WHERE id = ?`, clientID, id)
 	return scanPlazaItem(row)
 }
 
@@ -1760,7 +1773,7 @@ func (s *Store) SetPlazaLike(ctx context.Context, id, clientID string, liked boo
 	defer txLog.Rollback(tx)
 	var exists bool
 	if err := scanLogged(ctx, "plaza.like.exists id="+compactID(id), func() error {
-		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM plaza_items WHERE id = $1)`, id).Scan(&exists)
+		return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM plaza_items WHERE id = ?)`, id).Scan(&exists)
 	}); err != nil {
 		return nil, err
 	}
@@ -1768,22 +1781,22 @@ func (s *Store) SetPlazaLike(ctx context.Context, id, clientID string, liked boo
 		return nil, sql.ErrNoRows
 	}
 	if liked {
-		result, err := execLogged(ctx, tx, "plaza.like.insert id="+compactID(id), `INSERT INTO plaza_likes (plaza_id, client_id, created_at) VALUES ($1, $2, $3) ON CONFLICT (plaza_id, client_id) DO NOTHING`, id, clientID, time.Now().UTC())
+		result, err := execLogged(ctx, tx, "plaza.like.insert id="+compactID(id), `INSERT IGNORE INTO plaza_likes (plaza_id, client_id, created_at) VALUES (?, ?, ?)`, id, clientID, time.Now().UTC())
 		if err != nil {
 			return nil, err
 		}
 		if count, _ := result.RowsAffected(); count > 0 {
-			if _, err := execLogged(ctx, tx, "plaza.like_count.increment id="+compactID(id), `UPDATE plaza_items SET like_count = like_count + 1, updated_at = $1 WHERE id = $2`, time.Now().UTC(), id); err != nil {
+			if _, err := execLogged(ctx, tx, "plaza.like_count.increment id="+compactID(id), `UPDATE plaza_items SET like_count = like_count + 1, updated_at = ? WHERE id = ?`, time.Now().UTC(), id); err != nil {
 				return nil, err
 			}
 		}
 	} else {
-		result, err := execLogged(ctx, tx, "plaza.like.delete id="+compactID(id), `DELETE FROM plaza_likes WHERE plaza_id = $1 AND client_id = $2`, id, clientID)
+		result, err := execLogged(ctx, tx, "plaza.like.delete id="+compactID(id), `DELETE FROM plaza_likes WHERE plaza_id = ? AND client_id = ?`, id, clientID)
 		if err != nil {
 			return nil, err
 		}
 		if count, _ := result.RowsAffected(); count > 0 {
-			if _, err := execLogged(ctx, tx, "plaza.like_count.decrement id="+compactID(id), `UPDATE plaza_items SET like_count = GREATEST(like_count - 1, 0), updated_at = $1 WHERE id = $2`, time.Now().UTC(), id); err != nil {
+			if _, err := execLogged(ctx, tx, "plaza.like_count.decrement id="+compactID(id), `UPDATE plaza_items SET like_count = GREATEST(like_count - 1, 0), updated_at = ? WHERE id = ?`, time.Now().UTC(), id); err != nil {
 				return nil, err
 			}
 		}
@@ -1799,7 +1812,7 @@ func (s *Store) DeleteTask(ctx context.Context, id, apiKey, baseURL string) erro
 	if err != nil {
 		return err
 	}
-	result, err := execLogged(ctx, s.db, "task.delete id="+compactID(id), `DELETE FROM tasks WHERE id = $1 AND workspace_id = $2`, id, ws.ID)
+	result, err := execLogged(ctx, s.db, "task.delete id="+compactID(id), `DELETE FROM tasks WHERE id = ? AND workspace_id = ?`, id, ws.ID)
 	if err != nil {
 		return err
 	}
@@ -1815,7 +1828,7 @@ func (s *Store) SetFavorite(ctx context.Context, id, apiKey, baseURL string, fav
 	if err != nil {
 		return err
 	}
-	result, err := execLogged(ctx, s.db, "task.favorite id="+compactID(id), `UPDATE tasks SET favorite = $1, updated_at = $2 WHERE id = $3 AND workspace_id = $4`, favorite, time.Now().UTC(), id, ws.ID)
+	result, err := execLogged(ctx, s.db, "task.favorite id="+compactID(id), `UPDATE tasks SET favorite = ?, updated_at = ? WHERE id = ? AND workspace_id = ?`, favorite, time.Now().UTC(), id, ws.ID)
 	if err != nil {
 		return err
 	}
@@ -1830,7 +1843,7 @@ func (s *Store) FailStaleImageTasks(ctx context.Context, maxAge time.Duration) e
 	cutoff := time.Now().UTC().Add(-maxAge)
 	now := time.Now().UTC()
 	message := fmt.Sprintf("图片生成超过 %d 分钟，已自动断开并标记失败；上游可能仍在处理，请检查上游记录后手动重试", int(maxAge.Minutes()))
-	_, err := execLogged(ctx, s.db, "task.fail_stale_image", `UPDATE tasks SET status = $1, error_message = $2, elapsed_ms = GREATEST(elapsed_ms, EXTRACT(EPOCH FROM ($3 - started_at))::BIGINT * 1000), completed_at = $3, updated_at = $3 WHERE status = $4 AND task_type = $5 AND started_at < $6`, model.TaskFailed, message, now, model.TaskRunning, model.TaskTypeImageGeneration, cutoff)
+	_, err := execLogged(ctx, s.db, "task.fail_stale_image", `UPDATE tasks SET status = ?, error_message = ?, elapsed_ms = GREATEST(elapsed_ms, TIMESTAMPDIFF(MICROSECOND, started_at, ?) DIV 1000), completed_at = ?, updated_at = ? WHERE status = ? AND task_type = ? AND started_at < ?`, model.TaskFailed, message, now, now, now, model.TaskRunning, model.TaskTypeImageGeneration, cutoff)
 	return err
 }
 
@@ -1844,14 +1857,14 @@ func (s *Store) NextPendingTask(ctx context.Context) (*model.Task, error) {
 	var task *model.Task
 	err = scanLogged(ctx, "task.next_pending.select_for_update", func() error {
 		var scanErr error
-		task, scanErr = s.scanTask(tx.QueryRowContext(ctx, `SELECT `+taskColumns(false)+` FROM `+taskFromClause(false)+` WHERE t.status = $1 ORDER BY t.created_at ASC LIMIT 1 FOR UPDATE OF t SKIP LOCKED`, model.TaskPending))
+		task, scanErr = s.scanTask(tx.QueryRowContext(ctx, `SELECT `+taskColumns(false)+` FROM `+taskFromClause(false)+` WHERE t.status = ? ORDER BY t.created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`, model.TaskPending))
 		return scanErr
 	})
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now().UTC()
-	result, err := execLogged(ctx, tx, "task.next_pending.mark_running id="+compactID(task.ID), `UPDATE tasks SET status = $1, started_at = $2, updated_at = $3 WHERE id = $4 AND status = $5`, model.TaskRunning, now, now, task.ID, model.TaskPending)
+	result, err := execLogged(ctx, tx, "task.next_pending.mark_running id="+compactID(task.ID), `UPDATE tasks SET status = ?, started_at = ?, updated_at = ? WHERE id = ? AND status = ?`, model.TaskRunning, now, now, task.ID, model.TaskPending)
 	if err != nil {
 		return nil, err
 	}
@@ -1875,7 +1888,7 @@ func (s *Store) CompleteTask(ctx context.Context, id string, finalPrompt, reques
 		return err
 	}
 	defer txLog.Rollback(tx)
-	result, err := execLogged(ctx, tx, "task.complete_image.update id="+compactID(id), `UPDATE tasks SET status = $1, final_prompt = $2, elapsed_ms = $3, completed_at = $4, updated_at = $5, error_message = '' WHERE id = $6`, model.TaskSucceeded, finalPrompt, elapsedMS, now, now, id)
+	result, err := execLogged(ctx, tx, "task.complete_image.update id="+compactID(id), `UPDATE tasks SET status = ?, final_prompt = ?, elapsed_ms = ?, completed_at = ?, updated_at = ?, error_message = '' WHERE id = ?`, model.TaskSucceeded, finalPrompt, elapsedMS, now, now, id)
 	if err != nil {
 		return err
 	}
@@ -1901,7 +1914,7 @@ func (s *Store) MarkVideoSubmitted(ctx context.Context, id, upstreamTaskID, upst
 		return err
 	}
 	defer txLog.Rollback(tx)
-	result, err := execLogged(ctx, tx, "task.video_submitted.update id="+compactID(id), `UPDATE tasks SET status = $1, upstream_task_id = $2, upstream_status = $3, upstream_progress = $4, next_poll_at = $5, poll_count = 0, updated_at = $6 WHERE id = $7`, model.TaskRunning, upstreamTaskID, upstreamStatus, progress, nextPollAt, now, id)
+	result, err := execLogged(ctx, tx, "task.video_submitted.update id="+compactID(id), `UPDATE tasks SET status = ?, upstream_task_id = ?, upstream_status = ?, upstream_progress = ?, next_poll_at = ?, poll_count = 0, updated_at = ? WHERE id = ?`, model.TaskRunning, upstreamTaskID, upstreamStatus, progress, nextPollAt, now, id)
 	if err != nil {
 		return err
 	}
@@ -1920,7 +1933,7 @@ func (s *Store) VideoTasksToPoll(ctx context.Context, limit int) ([]model.Task, 
 	if limit <= 0 || limit > 20 {
 		limit = 10
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+taskColumns(true)+` FROM `+taskFromClause(true)+` WHERE t.task_type = $1 AND t.status = $2 AND t.upstream_task_id <> '' AND (t.next_poll_at IS NULL OR t.next_poll_at <= $3) ORDER BY COALESCE(t.next_poll_at, t.updated_at) ASC LIMIT $4`, model.TaskTypeVideoGeneration, model.TaskRunning, time.Now().UTC(), limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+taskColumns(true)+` FROM `+taskFromClause(true)+` WHERE t.task_type = ? AND t.status = ? AND t.upstream_task_id <> '' AND (t.next_poll_at IS NULL OR t.next_poll_at <= ?) ORDER BY COALESCE(t.next_poll_at, t.updated_at) ASC LIMIT ?`, model.TaskTypeVideoGeneration, model.TaskRunning, time.Now().UTC(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1939,7 +1952,7 @@ func (s *Store) UpdateVideoPoll(ctx context.Context, id, upstreamStatus string, 
 		return err
 	}
 	defer txLog.Rollback(tx)
-	result, err := execLogged(ctx, tx, "task.video_poll_update.update id="+compactID(id), `UPDATE tasks SET upstream_status = $1, upstream_progress = $2, next_poll_at = $3, poll_count = poll_count + 1, updated_at = $4 WHERE id = $5`, upstreamStatus, progress, nextPollAt, now, id)
+	result, err := execLogged(ctx, tx, "task.video_poll_update.update id="+compactID(id), `UPDATE tasks SET upstream_status = ?, upstream_progress = ?, next_poll_at = ?, poll_count = poll_count + 1, updated_at = ? WHERE id = ?`, upstreamStatus, progress, nextPollAt, now, id)
 	if err != nil {
 		return err
 	}
@@ -1961,7 +1974,7 @@ func (s *Store) CompleteVideoTask(ctx context.Context, id string, finalPrompt, r
 		return err
 	}
 	defer txLog.Rollback(tx)
-	result, err := execLogged(ctx, tx, "task.complete_video.update id="+compactID(id), `UPDATE tasks SET status = $1, final_prompt = $2, upstream_status = $3, upstream_progress = 100, elapsed_ms = $4, completed_at = $5, updated_at = $6, next_poll_at = NULL, error_message = '' WHERE id = $7`, model.TaskSucceeded, finalPrompt, "SUCCESS", elapsedMS, now, now, id)
+	result, err := execLogged(ctx, tx, "task.complete_video.update id="+compactID(id), `UPDATE tasks SET status = ?, final_prompt = ?, upstream_status = ?, upstream_progress = 100, elapsed_ms = ?, completed_at = ?, updated_at = ?, next_poll_at = NULL, error_message = '' WHERE id = ?`, model.TaskSucceeded, finalPrompt, "SUCCESS", elapsedMS, now, now, id)
 	if err != nil {
 		return err
 	}
@@ -1979,6 +1992,222 @@ func (s *Store) CompleteVideoTask(ctx context.Context, id string, finalPrompt, r
 	return nil
 }
 
+func (s *Store) FindGalleryAssetBySHA256(ctx context.Context, sha256Hex string) (model.UploadedImage, bool, error) {
+	sha256Hex = strings.TrimSpace(strings.ToLower(sha256Hex))
+	if sha256Hex == "" {
+		return model.UploadedImage{}, false, nil
+	}
+	var image model.UploadedImage
+	err := s.db.QueryRowContext(ctx, `
+SELECT url, thumbnail_url, first_frame_url, last_frame_url, filename, content_type, etag, size
+FROM gallery_assets
+WHERE sha256 = ?`, sha256Hex).Scan(&image.URL, &image.ThumbnailURL, &image.FirstFrameURL, &image.LastFrameURL, &image.Filename, &image.ContentType, &image.ETag, &image.OriginalSize)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.UploadedImage{}, false, nil
+	}
+	if err != nil {
+		return model.UploadedImage{}, false, err
+	}
+	image.SHA256 = sha256Hex
+	image.CompressedSize = image.OriginalSize
+	image.Deduplicated = true
+	return image, true, nil
+}
+
+func (s *Store) SaveGalleryAsset(ctx context.Context, sha256Hex string, image model.UploadedImage) error {
+	sha256Hex = strings.TrimSpace(strings.ToLower(sha256Hex))
+	if sha256Hex == "" || image.URL == "" {
+		return nil
+	}
+	now := time.Now().UTC()
+	_, err := execLogged(ctx, s.db, "gallery.asset.save sha256="+compactID(sha256Hex), `
+INSERT INTO gallery_assets (
+  sha256, url, thumbnail_url, first_frame_url, last_frame_url, filename, content_type, etag, size, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE sha256 = sha256`,
+		sha256Hex, image.URL, image.ThumbnailURL, image.FirstFrameURL, image.LastFrameURL, image.Filename,
+		image.ContentType, image.ETag, image.OriginalSize, now, now)
+	return err
+}
+
+func normalizeGalleryUserListOptions(options GalleryUserListOptions) GalleryUserListOptions {
+	options.Query = strings.TrimSpace(options.Query)
+	if options.Limit <= 0 {
+		options.Limit = 30
+	}
+	if options.Limit > 100 {
+		options.Limit = 100
+	}
+	if options.Offset < 0 {
+		options.Offset = 0
+	}
+	if options.Page <= 0 {
+		options.Page = options.Offset/options.Limit + 1
+	} else {
+		options.Offset = (options.Page - 1) * options.Limit
+	}
+	return options
+}
+
+func (s *Store) ListGalleryUsers(ctx context.Context, options GalleryUserListOptions) ([]model.GalleryUser, int, error) {
+	options = normalizeGalleryUserListOptions(options)
+	where := ""
+	args := []any{}
+	if options.Query != "" {
+		where = "WHERE w.base_url LIKE ? OR w.api_key_hash LIKE ?"
+		like := "%" + options.Query + "%"
+		args = append(args, like, like)
+	}
+	var total int
+	if err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM (
+	SELECT w.id
+	FROM workspaces w
+	JOIN tasks t ON t.workspace_id = w.id
+	JOIN task_media_assets m ON m.task_id = t.id
+	`+where+`
+	GROUP BY w.id
+) gallery_users`, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	queryArgs := append([]any{}, args...)
+	queryArgs = append(queryArgs, options.Limit, options.Offset)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT w.id, w.base_url, w.api_key_hash, w.api_key_encrypted, COUNT(m.id) AS asset_count, MAX(m.created_at) AS last_asset_at, w.created_at, w.updated_at
+FROM workspaces w
+JOIN tasks t ON t.workspace_id = w.id
+JOIN task_media_assets m ON m.task_id = t.id
+`+where+`
+GROUP BY w.id, w.base_url, w.api_key_hash, w.api_key_encrypted, w.created_at, w.updated_at
+ORDER BY COALESCE(MAX(m.created_at), w.updated_at) DESC, w.created_at DESC
+LIMIT ? OFFSET ?`, queryArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	users := []model.GalleryUser{}
+	for rows.Next() {
+		var user model.GalleryUser
+		var lastAssetAt sql.NullTime
+		var encryptedAPIKey string
+		if err := rows.Scan(&user.WorkspaceID, &user.BaseURL, &user.APIKeyHash, &encryptedAPIKey, &user.AssetCount, &lastAssetAt, &user.CreatedAt, &user.UpdatedAt); err != nil {
+			return nil, 0, err
+		}
+		if apiKey, err := s.decryptAPIKey(encryptedAPIKey); err == nil {
+			user.APIKeyLabel = maskAPIKey(apiKey)
+			tokenUser, _ := fetchTokenUser(ctx, user.BaseURL, apiKey)
+			user.UserID = tokenUser.UserID
+			user.Username = tokenUser.Username
+		}
+		if user.APIKeyLabel == "" {
+			user.APIKeyLabel = compactID(user.APIKeyHash)
+		}
+		if lastAssetAt.Valid {
+			user.LastAssetAt = &lastAssetAt.Time
+		}
+		users = append(users, user)
+	}
+	return users, total, rows.Err()
+}
+
+type tokenUserInfo struct {
+	UserID   int64
+	Username string
+}
+
+func fetchTokenUser(ctx context.Context, baseURL, apiKey string) (tokenUserInfo, error) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	apiKey = strings.TrimSpace(apiKey)
+	if baseURL == "" || apiKey == "" {
+		return tokenUserInfo{}, fmt.Errorf("缺少 baseurl 或 apikey")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/token/user", nil)
+	if err != nil {
+		return tokenUserInfo{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return tokenUserInfo{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return tokenUserInfo{}, fmt.Errorf("token user status %d", resp.StatusCode)
+	}
+	var body struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+		Data    struct {
+			UserID   int64  `json:"user_id"`
+			Username string `json:"username"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
+		return tokenUserInfo{}, err
+	}
+	if !body.Success {
+		return tokenUserInfo{}, fmt.Errorf("token user failed: %s", body.Message)
+	}
+	return tokenUserInfo{UserID: body.Data.UserID, Username: strings.TrimSpace(body.Data.Username)}, nil
+}
+
+func maskAPIKey(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= 12 {
+		return value
+	}
+	return string(runes[:8]) + "..." + string(runes[len(runes)-4:])
+}
+
+func (s *Store) ListGalleryAssetsByWorkspace(ctx context.Context, workspaceID string) ([]model.GalleryAssetRecord, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return nil, fmt.Errorf("缺少 workspace_id")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT m.id, t.workspace_id, w.base_url,
+       CASE WHEN m.role IN ('result_image', 'result_video', 'result_audio') THEN 'oss'
+            WHEN m.original_size > 0 OR m.compressed_size > 0 THEN 'oss'
+            ELSE 'external' END AS asset_kind,
+       CASE WHEN m.role IN ('result_image', 'result_video', 'result_audio') THEN 'ai_generated'
+            WHEN m.original_size > 0 OR m.compressed_size > 0 THEN 'user_upload'
+            ELSE 'external_url' END AS source_type,
+       m.asset_type, m.role, m.url, m.thumbnail_url, m.first_frame_url, m.last_frame_url, m.filename,
+       '', '', '', COALESCE(NULLIF(m.original_size, 0), m.compressed_size, 0), FALSE,
+       t.id, t.task_type, t.prompt, t.final_prompt, t.model, t.size, t.quality, t.output_format,
+       t.background, t.moderation, t.input_fidelity, t.video_ratio, t.video_width, t.video_height,
+       t.video_duration, t.generate_audio, t.video_draft, t.watermark, m.created_at
+FROM task_media_assets m
+JOIN tasks t ON t.id = m.task_id
+JOIN workspaces w ON w.id = t.workspace_id
+WHERE t.workspace_id = ?
+ORDER BY m.created_at DESC, m.sort_order ASC, m.id DESC`, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	records := []model.GalleryAssetRecord{}
+	for rows.Next() {
+		var record model.GalleryAssetRecord
+		if err := rows.Scan(&record.ID, &record.WorkspaceID, &record.BaseURL, &record.AssetKind, &record.SourceType, &record.MediaType, &record.Role, &record.URL,
+			&record.ThumbnailURL, &record.FirstFrameURL, &record.LastFrameURL, &record.Filename, &record.SHA256, &record.ETag, &record.ContentType,
+			&record.Size, &record.Deduplicated, &record.TaskID, &record.TaskType, &record.Prompt, &record.FinalPrompt, &record.Model,
+			&record.SizeParam, &record.Quality, &record.OutputFormat, &record.Background, &record.Moderation, &record.InputFidelity,
+			&record.VideoRatio, &record.VideoWidth, &record.VideoHeight, &record.VideoDuration, &record.GenerateAudio, &record.Draft,
+			&record.Watermark, &record.CreatedAt); err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
 func (s *Store) FailTask(ctx context.Context, id string, finalPrompt, requestHeaders, requestJSON, responseHeaders, responseJSON, message string, elapsedMS int64) error {
 	now := time.Now().UTC()
 	tx, txLog, err := s.beginTx(ctx, "task.fail id="+compactID(id))
@@ -1986,7 +2215,7 @@ func (s *Store) FailTask(ctx context.Context, id string, finalPrompt, requestHea
 		return err
 	}
 	defer txLog.Rollback(tx)
-	result, err := execLogged(ctx, tx, "task.fail.update id="+compactID(id), `UPDATE tasks SET status = $1, final_prompt = $2, error_message = $3, elapsed_ms = $4, completed_at = $5, updated_at = $6 WHERE id = $7`, model.TaskFailed, finalPrompt, message, elapsedMS, now, now, id)
+	result, err := execLogged(ctx, tx, "task.fail.update id="+compactID(id), `UPDATE tasks SET status = ?, final_prompt = ?, error_message = ?, elapsed_ms = ?, completed_at = ?, updated_at = ? WHERE id = ?`, model.TaskFailed, finalPrompt, message, elapsedMS, now, now, id)
 	if err != nil {
 		return err
 	}
@@ -2006,13 +2235,13 @@ func replaceTaskSource(ctx context.Context, exec sqlExecer, taskID, requestHeade
 	responseJSON = sourceclean.CompactStringForStorage(responseJSON)
 	_, err := execLogged(ctx, exec, fmt.Sprintf("task_source.replace task_id=%s request_bytes=%d response_bytes=%d", compactID(taskID), len(requestJSON), len(responseJSON)), `
 INSERT INTO task_sources (task_id, request_headers, request_json, response_headers, response_json, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6)
-ON CONFLICT (task_id) DO UPDATE SET
-  request_headers = EXCLUDED.request_headers,
-  request_json = EXCLUDED.request_json,
-  response_headers = EXCLUDED.response_headers,
-  response_json = EXCLUDED.response_json,
-  updated_at = EXCLUDED.updated_at
+VALUES (?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+  request_headers = VALUES(request_headers),
+  request_json = VALUES(request_json),
+  response_headers = VALUES(response_headers),
+  response_json = VALUES(response_json),
+  updated_at = VALUES(updated_at)
 `, taskID, requestHeaders, requestJSON, responseHeaders, responseJSON, now)
 	return err
 }
@@ -2029,12 +2258,12 @@ func saveTaskSourceBestEffort(ctx context.Context, exec sqlExecer, taskID, reque
 func updateTaskResponseSource(ctx context.Context, exec sqlExecer, taskID, responseHeaders, responseJSON string, now time.Time) error {
 	responseJSON = sourceclean.CompactStringForStorage(responseJSON)
 	_, err := execLogged(ctx, exec, fmt.Sprintf("task_source.update_response task_id=%s response_bytes=%d", compactID(taskID), len(responseJSON)), `
-INSERT INTO task_sources (task_id, response_headers, response_json, updated_at)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (task_id) DO UPDATE SET
-  response_headers = EXCLUDED.response_headers,
-  response_json = EXCLUDED.response_json,
-  updated_at = EXCLUDED.updated_at
+INSERT INTO task_sources (task_id, request_headers, request_json, response_headers, response_json, updated_at)
+VALUES (?, '', '', ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+  response_headers = VALUES(response_headers),
+  response_json = VALUES(response_json),
+  updated_at = VALUES(updated_at)
 `, taskID, responseHeaders, responseJSON, now)
 	return err
 }
@@ -2049,7 +2278,7 @@ func updateTaskResponseSourceBestEffort(ctx context.Context, exec sqlExecer, tas
 }
 
 func replaceTaskImageAssets(ctx context.Context, exec sqlExecer, taskID, role string, items []model.UploadedImage, now time.Time) error {
-	if _, err := execLogged(ctx, exec, fmt.Sprintf("task_media.delete task_id=%s role=%s", compactID(taskID), role), `DELETE FROM task_media_assets WHERE task_id = $1 AND role = $2`, taskID, role); err != nil {
+	if _, err := execLogged(ctx, exec, fmt.Sprintf("task_media.delete task_id=%s role=%s", compactID(taskID), role), `DELETE FROM task_media_assets WHERE task_id = ? AND role = ?`, taskID, role); err != nil {
 		return err
 	}
 	for index, item := range items {
@@ -2062,7 +2291,7 @@ INSERT INTO task_media_assets (
  id, task_id, role, asset_type, url, thumbnail_url, filename, node_id, reference_label,
  video_frame_role, mask_reference_label, mask_url, original_size, compressed_size, compression_ratio,
  sort_order, created_at
-) VALUES ($1, $2, $3, 'image', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+) VALUES (?, ?, ?, 'image', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `, uuid.NewString(), taskID, role, item.URL, item.ThumbnailURL, item.Filename, item.NodeID, item.ReferenceLabel,
 			item.VideoFrameRole, item.MaskReferenceLabel, item.MaskURL, item.OriginalSize, item.CompressedSize,
 			item.CompressionRatio, index, now); err != nil {
@@ -2073,7 +2302,7 @@ INSERT INTO task_media_assets (
 }
 
 func replaceTaskMediaAssets(ctx context.Context, exec sqlExecer, taskID, role string, items []model.MediaAsset, now time.Time) error {
-	if _, err := execLogged(ctx, exec, fmt.Sprintf("task_media.delete task_id=%s role=%s", compactID(taskID), role), `DELETE FROM task_media_assets WHERE task_id = $1 AND role = $2`, taskID, role); err != nil {
+	if _, err := execLogged(ctx, exec, fmt.Sprintf("task_media.delete task_id=%s role=%s", compactID(taskID), role), `DELETE FROM task_media_assets WHERE task_id = ? AND role = ?`, taskID, role); err != nil {
 		return err
 	}
 	for index, item := range items {
@@ -2089,7 +2318,7 @@ func replaceTaskMediaAssets(ctx context.Context, exec sqlExecer, taskID, role st
 INSERT INTO task_media_assets (
  id, task_id, role, asset_type, url, thumbnail_url, first_frame_url, last_frame_url, filename, node_id, reference_label,
  duration, clip_start, clip_end, width, height, sort_order, created_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `, uuid.NewString(), taskID, role, assetType, item.URL, item.ThumbnailURL, item.FirstFrameURL, item.LastFrameURL,
 			item.Filename, item.NodeID, item.ReferenceLabel, item.Duration, item.ClipStart, item.ClipEnd, item.Width, item.Height, index, now); err != nil {
 			return err
@@ -2129,7 +2358,7 @@ func taskColumns(includeSource bool) string {
 }
 
 func plazaColumns() string {
-	return `id, item_type, COALESCE(task_id, ''), COALESCE(canvas_id, ''), canvas_name, canvas_json::text, task_type, prompt, model, size, quality, output_format, output_compression, background, moderation, input_fidelity, n, stream, style, response_format, reference_images_json::text, reference_videos_json::text, reference_audios_json::text, result_images_json::text, result_videos_json::text, video_ratio, video_width, video_height, video_duration, generate_audio, video_draft, watermark, like_count, EXISTS(SELECT 1 FROM plaza_likes WHERE plaza_likes.plaza_id = plaza_items.id AND plaza_likes.client_id = $1), created_at`
+	return `id, item_type, COALESCE(task_id, ''), COALESCE(canvas_id, ''), canvas_name, canvas_json, task_type, prompt, model, size, quality, output_format, output_compression, background, moderation, input_fidelity, n, stream, style, response_format, reference_images_json, reference_videos_json, reference_audios_json, result_images_json, result_videos_json, video_ratio, video_width, video_height, video_duration, generate_audio, video_draft, watermark, like_count, EXISTS(SELECT 1 FROM plaza_likes WHERE plaza_likes.plaza_id = plaza_items.id AND plaza_likes.client_id = ?), created_at`
 }
 
 type scanner interface {
@@ -2457,5 +2686,5 @@ func MustJSON(value any) string {
 }
 
 func placeholder(index int) string {
-	return fmt.Sprintf("$%d", index)
+	return "?"
 }

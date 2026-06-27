@@ -14,6 +14,91 @@ export interface UploadedImage {
   compressed_size?: number
   compression_ratio?: number
   mask_url?: string
+  sha256?: string
+  etag?: string
+  content_type?: string
+  deduplicated?: boolean
+}
+
+export interface GalleryObject {
+  key: string
+  fullKey: string
+  name: string
+  isPrefix: boolean
+  size: number
+  etag?: string
+  lastModified?: string
+  storageClass?: string
+  contentType?: string
+  url?: string
+}
+
+export interface GalleryList {
+  objects: GalleryObject[]
+  prefix: string
+  nextToken: string
+}
+
+export interface GalleryUser {
+  workspace_id: string
+  baseurl: string
+  api_key_hash: string
+  api_key_label?: string
+  user_id?: number
+  username?: string
+  asset_count: number
+  last_asset_at?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface GalleryUserList {
+  users: GalleryUser[]
+  total: number
+  has_more: boolean
+  next_offset: number
+  page: number
+  page_size: number
+  total_pages: number
+}
+
+export interface GalleryAssetRecord {
+  id: string
+  workspace_id: string
+  baseurl: string
+  asset_kind: 'oss' | 'external' | string
+  source_type: 'user_upload' | 'ai_generated' | 'external_url' | string
+  media_type: string
+  role?: string
+  url: string
+  thumbnail_url?: string
+  first_frame_url?: string
+  last_frame_url?: string
+  filename?: string
+  sha256?: string
+  etag?: string
+  content_type?: string
+  size?: number
+  deduplicated?: boolean
+  task_id?: string
+  task_type?: 'image_generation' | 'video_generation' | string
+  prompt?: string
+  final_prompt?: string
+  model?: string
+  size_param?: string
+  quality?: string
+  output_format?: string
+  background?: string
+  moderation?: string
+  input_fidelity?: string
+  video_ratio?: string
+  video_width?: number
+  video_height?: number
+  video_duration?: number
+  generate_audio?: boolean
+  draft?: boolean
+  watermark?: boolean
+  created_at: string
 }
 
 export interface MediaAsset {
@@ -30,6 +115,10 @@ export interface MediaAsset {
   clip_end?: number
   width?: number
   height?: number
+  sha256?: string
+  etag?: string
+  content_type?: string
+  original_size?: number
 }
 
 export interface Task {

@@ -43,7 +43,14 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	fmt.Println("app init: stale cleanup done")
 	gen := generator.New(filepath.Join(cfg.DataDir, "tmp"))
 	host := imagehost.New(cfg)
-	h := &handler.Handler{Store: store, Generator: gen, ImageHost: host}
+	h := &handler.Handler{
+		Store:                store,
+		Generator:            gen,
+		ImageHost:            host,
+		GalleryAdminUsername: cfg.GalleryAdminUsername,
+		GalleryAdminPassword: cfg.GalleryAdminPassword,
+		GallerySessionSecret: cfg.GallerySessionSecret,
+	}
 	mux := http.NewServeMux()
 	h.Register(mux)
 	mux.HandleFunc("/", staticHandler(cfg.StaticDir))

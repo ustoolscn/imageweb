@@ -1,6 +1,10 @@
 package handler
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -29,9 +33,12 @@ import (
 )
 
 type Handler struct {
-	Store     *db.Store
-	Generator *generator.Client
-	ImageHost *imagehost.Client
+	Store                *db.Store
+	Generator            *generator.Client
+	ImageHost            *imagehost.Client
+	GalleryAdminUsername string
+	GalleryAdminPassword string
+	GallerySessionSecret string
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
@@ -40,6 +47,13 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/models", h.models)
 	mux.HandleFunc("/api/llm", h.llm)
 	mux.HandleFunc("/api/upload", h.upload)
+	mux.HandleFunc("/api/gallery/login", h.galleryLogin)
+	mux.HandleFunc("/api/gallery/logout", h.galleryLogout)
+	mux.HandleFunc("/api/gallery/me", h.galleryMe)
+	mux.HandleFunc("/api/gallery/users", h.galleryUsers)
+	mux.HandleFunc("/api/gallery/users/", h.galleryUserByID)
+	mux.HandleFunc("/api/gallery/objects", h.galleryObjects)
+	mux.HandleFunc("/api/gallery/link", h.galleryLink)
 	mux.HandleFunc("/api/download", h.download)
 	mux.HandleFunc("/api/video-frames", h.videoFrames)
 	mux.HandleFunc("/api/mask-preview", h.maskPreview)
@@ -378,7 +392,7 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.ImageHost == nil {
-		writeError(w, http.StatusInternalServerError, "图床未配置")
+		writeError(w, http.StatusInternalServerError, "图库未配置")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 512<<20)
@@ -392,12 +406,259 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+	sha256Hex := strings.TrimSpace(strings.ToLower(r.FormValue("sha256")))
+	if sha256Hex != "" {
+		if existing, found, err := h.Store.FindGalleryAssetBySHA256(r.Context(), sha256Hex); err != nil {
+			writeError(w, http.StatusBadGateway, "查询图库查重索引失败："+err.Error())
+			return
+		} else if found {
+			writeJSON(w, http.StatusOK, map[string]any{"success": true, "url": existing.URL, "data": existing})
+			return
+		}
+	}
 	image, err := h.ImageHost.UploadReader(r.Context(), header.Filename, header.Header.Get("Content-Type"), file)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	if sha256Hex != "" {
+		image.SHA256 = sha256Hex
+		if err := h.Store.SaveGalleryAsset(r.Context(), sha256Hex, image); err != nil {
+			writeError(w, http.StatusBadGateway, "保存图库查重索引失败："+err.Error())
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "url": image.URL, "data": image})
+}
+
+func (h *Handler) galleryLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if !decodeJSONLimit(w, r, &req, 8<<10) {
+		return
+	}
+	if h.GalleryAdminPassword == "" {
+		writeError(w, http.StatusForbidden, "图库管理未启用，请配置 GALLERY_ADMIN_PASSWORD")
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(req.Username), []byte(defaultString(h.GalleryAdminUsername, "admin"))) != 1 ||
+		subtle.ConstantTimeCompare([]byte(req.Password), []byte(h.GalleryAdminPassword)) != 1 {
+		writeError(w, http.StatusUnauthorized, "用户名或密码错误")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "image_web_gallery_session",
+		Value:    h.gallerySessionValue(),
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int((24 * time.Hour).Seconds()),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"username": defaultString(h.GalleryAdminUsername, "admin")})
+}
+
+func (h *Handler) galleryLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: "image_web_gallery_session", Value: "", Path: "/", HttpOnly: true, MaxAge: -1})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (h *Handler) galleryMe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !h.galleryAuthed(r) {
+		writeError(w, http.StatusUnauthorized, "请先登录图库管理")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"username": defaultString(h.GalleryAdminUsername, "admin")})
+}
+
+func (h *Handler) galleryUsers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !h.galleryAuthed(r) {
+		writeError(w, http.StatusUnauthorized, "请先登录图库管理")
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if r.URL.Query().Get("page") != "" {
+		offset = (page - 1) * limit
+	}
+	users, total, err := h.Store.ListGalleryUsers(r.Context(), db.GalleryUserListOptions{
+		Query:  r.URL.Query().Get("q"),
+		Limit:  limit,
+		Offset: offset,
+		Page:   page,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "读取用户列表失败："+err.Error())
+		return
+	}
+	nextOffset := offset + len(users)
+	totalPages := 0
+	if total > 0 {
+		totalPages = (total + limit - 1) / limit
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"users":       users,
+		"total":       total,
+		"has_more":    nextOffset < total,
+		"next_offset": nextOffset,
+		"page":        page,
+		"page_size":   limit,
+		"total_pages": totalPages,
+	})
+}
+
+func (h *Handler) galleryUserByID(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !h.galleryAuthed(r) {
+		writeError(w, http.StatusUnauthorized, "请先登录图库管理")
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/api/gallery/users/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 2 || parts[0] == "" {
+		writeError(w, http.StatusBadRequest, "缺少用户 workspace_id")
+		return
+	}
+	workspaceID := parts[0]
+	switch parts[1] {
+	case "assets":
+		assets, err := h.Store.ListGalleryAssetsByWorkspace(r.Context(), workspaceID)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "读取用户资产失败："+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"assets": assets})
+	case "tasks":
+		if len(parts) >= 3 {
+			task, err := h.Store.GetTaskByWorkspace(r.Context(), workspaceID, parts[2])
+			if err != nil {
+				writeError(w, http.StatusNotFound, "任务不存在")
+				return
+			}
+			writeJSON(w, http.StatusOK, task)
+			return
+		}
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		tasks, total, err := h.Store.ListTasksByWorkspace(r.Context(), workspaceID, r.URL.Query().Get("status"), r.URL.Query().Get("q"), r.URL.Query().Get("before_created_at"), r.URL.Query().Get("before_id"), r.URL.Query().Get("favorite") == "1", limit)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "读取用户任务失败："+err.Error())
+			return
+		}
+		writeTaskList(w, tasks, total, limit)
+	case "canvases":
+		state, err := h.Store.CanvasStateByWorkspace(r.Context(), workspaceID)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "读取用户画布失败："+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, state)
+	default:
+		writeError(w, http.StatusNotFound, "管理接口不存在")
+		return
+	}
+}
+
+func (h *Handler) galleryObjects(w http.ResponseWriter, r *http.Request) {
+	if !h.galleryAuthed(r) {
+		writeError(w, http.StatusUnauthorized, "请先登录图库管理")
+		return
+	}
+	if h.ImageHost == nil {
+		writeError(w, http.StatusInternalServerError, "图库未配置")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		items, err := h.ImageHost.ListObjects(r.Context(), r.URL.Query().Get("prefix"), r.URL.Query().Get("token"), limit)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "读取 OSS 图库失败："+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
+	case http.MethodDelete:
+		key := strings.TrimSpace(r.URL.Query().Get("key"))
+		if key == "" {
+			writeError(w, http.StatusBadRequest, "缺少图库对象 key")
+			return
+		}
+		if err := h.ImageHost.DeleteObject(r.Context(), key); err != nil {
+			writeError(w, http.StatusBadGateway, "删除 OSS 对象失败："+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (h *Handler) galleryLink(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !h.galleryAuthed(r) {
+		writeError(w, http.StatusUnauthorized, "请先登录图库管理")
+		return
+	}
+	key := strings.TrimSpace(r.URL.Query().Get("key"))
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "缺少图库对象 key")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"url": h.ImageHost.ObjectURL(key)})
+}
+
+func (h *Handler) galleryAuthed(r *http.Request) bool {
+	cookie, err := r.Cookie("image_web_gallery_session")
+	if err != nil {
+		return false
+	}
+	expected := h.gallerySessionValue()
+	return subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(expected)) == 1
+}
+
+func (h *Handler) gallerySessionValue() string {
+	secret := h.GallerySessionSecret
+	if secret == "" {
+		secret = h.GalleryAdminPassword
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(defaultString(h.GalleryAdminUsername, "admin")))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func (h *Handler) videoFrames(w http.ResponseWriter, r *http.Request) {
@@ -406,7 +667,7 @@ func (h *Handler) videoFrames(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.ImageHost == nil {
-		writeError(w, http.StatusInternalServerError, "图床未配置")
+		writeError(w, http.StatusInternalServerError, "图库未配置")
 		return
 	}
 	var req struct {
@@ -426,16 +687,11 @@ func (h *Handler) videoFrames(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "视频地址无效")
 		return
 	}
-	frames, err := h.ImageHost.ExtractVideoFramesFromURL(r.Context(), req.URL, req.Filename)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	frames.URL = req.URL
-	if frames.Filename == "" {
-		frames.Filename = defaultString(req.Filename, filenameFromURL(req.URL, "reference-video.mp4"))
-	}
-	writeJSON(w, http.StatusOK, frames)
+	writeJSON(w, http.StatusOK, model.MediaAsset{
+		Type:     "video",
+		URL:      req.URL,
+		Filename: defaultString(req.Filename, filenameFromURL(req.URL, "reference-video.mp4")),
+	})
 }
 
 func (h *Handler) maskPreview(w http.ResponseWriter, r *http.Request) {
@@ -504,6 +760,10 @@ func (h *Handler) listTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	writeTaskList(w, tasks, total, limit)
+}
+
+func writeTaskList(w http.ResponseWriter, tasks []model.Task, total, limit int) {
 	hasMore := false
 	if limit <= 0 || limit > 60 {
 		limit = 30

@@ -145,7 +145,7 @@ func buildPayload(task *model.Task, finalPrompt string) (map[string]any, error) 
 	}
 	payload := map[string]any{
 		"model":          imageModel(task),
-		"prompt":         finalPrompt,
+		"prompt":         injectGPTImage2PromptSize(task, finalPrompt, size),
 		"n":              1,
 		"size":           size,
 		"quality":        normalizeGPTImage2Quality(task.Quality),
@@ -763,6 +763,23 @@ func normalizeGPTImage2Size(size string) (string, error) {
 	return fmt.Sprintf("%dx%d", width, height), nil
 }
 
+func injectGPTImage2PromptSize(task *model.Task, prompt, normalizedSize string) string {
+	prompt = strings.TrimSpace(prompt)
+	normalizedSize = strings.TrimSpace(normalizedSize)
+	if !isGPTImage2Model(task) || normalizedSize == "" || strings.EqualFold(normalizedSize, "auto") {
+		return prompt
+	}
+	parts := strings.Split(normalizedSize, "x")
+	if len(parts) != 2 {
+		return prompt
+	}
+	instruction := fmt.Sprintf("请生成尺寸为 %s像素x%s像素 的图片。", parts[0], parts[1])
+	if prompt == "" {
+		return instruction
+	}
+	return prompt + "\n\n" + instruction
+}
+
 func validateGPTImage2Size(width, height int) error {
 	longSide := max(width, height)
 	shortSide := min(width, height)
@@ -1046,7 +1063,7 @@ func buildEditRequestSummary(task *model.Task, finalPrompt string) (map[string]s
 	format := normalizeOutputFormat(task.OutputFormat)
 	payload := map[string]string{
 		"model":         imageModel(task),
-		"prompt":        finalPrompt,
+		"prompt":        injectGPTImage2PromptSize(task, finalPrompt, size),
 		"n":             "1",
 		"size":          size,
 		"quality":       normalizeGPTImage2Quality(task.Quality),

@@ -16,11 +16,16 @@ const props = defineProps<{
   plazaSort: PlazaSort
   themeMode: ThemeMode
   hideCanvas?: boolean
+  adminMode?: boolean
+  adminSection?: 'tasks' | 'canvas'
+  adminUserLabel?: string
 }>()
 
 const emit = defineEmits<{
   openSettings: []
   openOnboarding: []
+  openAdminUserSwitcher: []
+  switchAdminSection: [section: 'tasks' | 'canvas']
   switchView: [mode: ViewMode]
   refreshTasks: []
   resetTasks: []
@@ -68,6 +73,8 @@ const currentThemeIcon = computed(() => {
   return 'contrast'
 })
 
+const effectiveViewMode = computed(() => props.adminMode ? (props.adminSection || 'tasks') : props.viewMode)
+
 function updateStatus(value: string) {
   currentStatus.value = value
   emit('resetTasks')
@@ -87,24 +94,35 @@ function updateStatus(value: string) {
           <button class="settings-button icon-only" title="连接设置" aria-label="连接设置" @click="emit('openSettings')">
             <AppIcon name="settings" />
           </button>
+          <button v-if="adminMode" class="settings-button admin-user-mini icon-only" :title="`切换用户：${adminUserLabel || ''}`" aria-label="切换用户" @click="emit('openAdminUserSwitcher')">
+            <AppIcon name="user" />
+          </button>
         </div>
         <p>{{ visibleSubtitle }}</p>
       </div>
     </div>
 
-    <div class="toolbar-controls" :class="{ tasks: viewMode === 'tasks', plaza: viewMode === 'plaza', canvas: viewMode === 'canvas' }">
-      <div class="view-tabs three-tabs" :class="{ 'two-tabs': hideCanvas }">
-        <button title="任务" aria-label="任务" :class="{ active: viewMode === 'tasks' }" @click="emit('switchView', 'tasks')">
+    <div class="toolbar-controls" :class="{ tasks: effectiveViewMode === 'tasks', plaza: effectiveViewMode === 'plaza', canvas: effectiveViewMode === 'canvas', admin: adminMode }">
+      <div v-if="!adminMode" class="view-tabs" :class="hideCanvas ? 'two-tabs' : 'three-tabs'">
+        <button title="任务" aria-label="任务" :class="{ active: effectiveViewMode === 'tasks' }" @click="emit('switchView', 'tasks')">
           <AppIcon name="task" /><span class="view-tab-label">任务</span>
         </button>
-        <button v-if="!hideCanvas" title="画布" aria-label="画布" :class="{ active: viewMode === 'canvas' }" @click="emit('switchView', 'canvas')">
+        <button v-if="!hideCanvas" title="画布" aria-label="画布" :class="{ active: effectiveViewMode === 'canvas' }" @click="emit('switchView', 'canvas')">
           <AppIcon name="canvas" /><span class="view-tab-label">画布</span>
         </button>
-        <button title="广场" aria-label="广场" :class="{ active: viewMode === 'plaza' }" @click="emit('switchView', 'plaza')">
+        <button title="广场" aria-label="广场" :class="{ active: effectiveViewMode === 'plaza' }" @click="emit('switchView', 'plaza')">
           <AppIcon name="gallery" /><span class="view-tab-label">广场</span>
         </button>
       </div>
-      <template v-if="viewMode === 'tasks'">
+      <div v-if="adminMode" class="view-tabs two-tabs admin-view-tabs">
+        <button title="任务" aria-label="任务" :class="{ active: effectiveViewMode === 'tasks' }" @click="emit('switchAdminSection', 'tasks')">
+          <AppIcon name="task" /><span class="view-tab-label">任务</span>
+        </button>
+        <button title="画布" aria-label="画布" :class="{ active: effectiveViewMode === 'canvas' }" @click="emit('switchAdminSection', 'canvas')">
+          <AppIcon name="canvas" /><span class="view-tab-label">画布</span>
+        </button>
+      </div>
+      <template v-if="effectiveViewMode === 'tasks'">
         <InlineSelect class="toolbar-status-select" label="状态" :model-value="currentStatus" :options="statusOptions" @update:model-value="updateStatus" />
         <div class="search-wrap">
           <input v-model="currentKeyword" class="search" placeholder="搜索提示词、参数..." @keyup.enter="emit('resetTasks')" />
@@ -119,7 +137,7 @@ function updateStatus(value: string) {
           <AppIcon name="refresh" /><span class="toolbar-action-label">刷新</span>
         </button>
       </template>
-      <template v-else-if="viewMode === 'plaza'">
+      <template v-else-if="effectiveViewMode === 'plaza'">
         <div class="search-wrap plaza-search">
           <input v-model="currentPlazaKeyword" class="search" placeholder="搜索广场作品..." @keyup.enter="emit('refreshPlazaItems')" />
         </div>
@@ -131,6 +149,12 @@ function updateStatus(value: string) {
           <button :class="{ active: plazaSort === 'likes' }" @click="emit('switchPlazaSort', 'likes')">点赞最多</button>
         </div>
         <button class="ghost compact-on-narrow" title="刷新" aria-label="刷新" @click="emit('refreshPlazaItems')">
+          <AppIcon name="refresh" /><span class="toolbar-action-label">刷新</span>
+        </button>
+      </template>
+      <template v-else-if="adminMode && effectiveViewMode === 'canvas'">
+        <span></span>
+        <button class="ghost compact-on-narrow" title="刷新画布" aria-label="刷新画布" @click="emit('refreshTasks')">
           <AppIcon name="refresh" /><span class="toolbar-action-label">刷新</span>
         </button>
       </template>

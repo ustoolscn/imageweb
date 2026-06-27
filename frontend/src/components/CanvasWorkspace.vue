@@ -106,6 +106,8 @@ const props = defineProps<{
   sharedCanvasIds?: string[]
   canvasTaskSnapshots?: Record<string, Task>
   canvasImport?: { token: number; canvas: unknown } | null
+  readOnly?: boolean
+  externalCanvasState?: { token: number; canvases: unknown; updated_at: string } | null
   runNodeAction?: (payload: CanvasRunPayload, applyTask: (task: Task) => void) => Promise<unknown> | void
   runLlmAction?: (payload: CanvasLLMPayload, applyResult: (text: string) => void) => Promise<unknown> | void
 }>()
@@ -348,6 +350,7 @@ const flowConnectionLineOptions = {
   style: { stroke: 'rgba(230, 230, 230, .78)', strokeWidth: 2.5 },
 }
 watch(canvases, () => {
+  if (props.readOnly) return
   if (applyingStoredCanvases) return
   if (isTransientCanvasMutation()) return
   const saved = applyingCloudCanvases
@@ -357,14 +360,17 @@ watch(canvases, () => {
   if (!restoringHistory && !applyingCloudCanvases) queueCanvasHistorySnapshot()
 }, { deep: true })
 watch(activeCanvasID, () => {
-  saveCanvasMeta()
+  if (!props.readOnly) saveCanvasMeta()
   activeCanvasDrawer.value = ''
   nextTick(() => focusActiveCanvasElements(180))
 })
-watch([() => props.apikey, () => props.baseurl], () => syncWorkspaceCanvases(), { immediate: true })
+watch([() => props.apikey, () => props.baseurl], () => {
+  if (!props.readOnly) syncWorkspaceCanvases()
+}, { immediate: true })
 watch([() => props.apikey, () => props.baseurl], () => queueAssetRefresh(), { immediate: true })
+watch(() => props.externalCanvasState?.token, () => applyExternalCanvasState(), { immediate: true })
 watch(() => props.canvasImport?.token, (token) => {
-  if (!token || token === lastCanvasImportToken || !props.canvasImport?.canvas) return
+  if (props.readOnly || !token || token === lastCanvasImportToken || !props.canvasImport?.canvas) return
   lastCanvasImportToken = token
   importCanvasTemplate(props.canvasImport.canvas)
 }, { immediate: true })
@@ -449,6 +455,7 @@ function isMaskSizeInputTarget(target: EventTarget | null) {
 }
 
 function onCanvasKeyDown(event: KeyboardEvent) {
+  if (props.readOnly && (event.key === 'Delete' || event.key === 'Backspace' || (event.ctrlKey && event.key.toLowerCase() === 'z'))) return
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'v' && !isTextInputTarget(event.target)) {
     handleClipboardImagePaste(event)
     return
@@ -746,7 +753,27 @@ function syncWorkspaceCanvases() {
   loadCloudCanvases()
 }
 
+function applyExternalCanvasState() {
+  if (!props.readOnly || !props.externalCanvasState) return
+  const cloudCanvases = normalizeCanvases(props.externalCanvasState.canvases)
+  const cloudUpdatedAt = normalizeTimestamp(props.externalCanvasState.updated_at)
+  applyingCloudCanvases = true
+  canvases.value = cloudCanvases
+  activeCanvasID.value = validActiveCanvasID(cloudCanvases, activeCanvasID.value)
+  canvasLastSavedAt.value = cloudUpdatedAt
+  canvasLastCloudSavedAt.value = cloudUpdatedAt
+  lastCloudSavePayload = serializeCanvases(cloudCanvases)
+  canvasSaveState.value = 'saved'
+  canvasSaveDetail.value = cloudCanvases.length ? `只读 · 云端 ${formatSaveTime(cloudUpdatedAt)}` : '只读 · 暂无云端画布'
+  nextTick(() => {
+    applyingCloudCanvases = false
+    focusActiveCanvasElements(180)
+    queueCanvasReady()
+  })
+}
+
 function saveCanvases(options: { updatedAt?: string; cloudUpdatedAt?: string; state?: CanvasSaveState; detail?: string } = {}) {
+  if (props.readOnly) return false
   const updatedAt = options.updatedAt || nowISO()
   try {
     localStorage.setItem(currentCanvasStorageKeys().canvas, JSON.stringify(canvases.value))
@@ -788,6 +815,7 @@ function saveCanvasMeta(overrides: Partial<CanvasLocalMeta> = {}) {
 }
 
 async function loadCloudCanvases() {
+  if (props.readOnly) return
   if (!props.apikey || !props.baseurl) return
   const previousState = canvasSaveState.value
   const previousDetail = canvasSaveDetail.value
@@ -840,6 +868,7 @@ async function loadCloudCanvases() {
 }
 
 function queueCloudCanvasSave() {
+  if (props.readOnly) return
   if (loadingCloudCanvases || !props.apikey || !props.baseurl) return
   window.clearTimeout(cloudSaveTimer)
   canvasSaveState.value = 'pending'
@@ -848,11 +877,13 @@ function queueCloudCanvasSave() {
 }
 
 function persistCanvasNow() {
+  if (props.readOnly) return
   const saved = saveCanvases()
   if (saved || (props.apikey && props.baseurl)) queueCloudCanvasSave()
 }
 
 async function saveCanvasesToCloud() {
+  if (props.readOnly) return
   if (!props.apikey || !props.baseurl) return
   if (cloudSaveInFlight) {
     cloudSaveQueuedDuringInFlight = true
@@ -1215,6 +1246,7 @@ function nextCanvasName() {
 }
 
 function createCanvas() {
+  if (props.readOnly) return
   const next = { id: createID(), name: nextCanvasName(), elements: [], connections: [] }
   canvases.value.push(next)
   activeCanvasID.value = next.id
@@ -1537,6 +1569,7 @@ async function uploadMediaFiles(event: Event) {
 }
 
 function addMediaNode(kind: MediaNodeKind = 'image_media', position?: { x: number; y: number }) {
+  if (props.readOnly) return
   if (!activeCanvas.value) return
   const center = position || screenToWorld(window.innerWidth / 2, window.innerHeight / 2)
   const type = mediaTypeFromKind(kind) || 'image'
@@ -1563,6 +1596,7 @@ function addMediaNode(kind: MediaNodeKind = 'image_media', position?: { x: numbe
 }
 
 function addAssetNode(position?: { x: number; y: number }) {
+  if (props.readOnly) return
   const center = position || screenToWorld(window.innerWidth / 2, window.innerHeight / 2)
   const minSize = minNodeSize('asset')
   pushCanvasElement({
@@ -1744,17 +1778,20 @@ function filenameFromURL(url: string) {
 }
 
 function addPromptNode(position?: { x: number; y: number }) {
+  if (props.readOnly) return
   const center = position || screenToWorld(window.innerWidth / 2, window.innerHeight / 2)
   pushCanvasElement({ id: createID(), kind: 'prompt', text: '', x: center.x, y: center.y - 85, width: 320, height: 170, zIndex: maxCanvasZIndex() + 1 }, center)
 }
 
 function addMergeNode(position?: { x: number; y: number }) {
+  if (props.readOnly) return
   const center = position || screenToWorld(window.innerWidth / 2, window.innerHeight / 2)
   const minSize = minNodeSize('merge')
   pushCanvasElement({ id: createID(), kind: 'merge', text: '', x: center.x, y: center.y - minSize.height / 2, width: minSize.width, height: minSize.height, zIndex: maxCanvasZIndex() + 1 }, center)
 }
 
 function addViewControlNode(position?: { x: number; y: number }) {
+  if (props.readOnly) return
   const center = position || screenToWorld(window.innerWidth / 2, window.innerHeight / 2)
   const minSize = minNodeSize('view_control')
   pushCanvasElement({
@@ -1777,6 +1814,7 @@ function addViewControlNode(position?: { x: number; y: number }) {
 }
 
 function addAiNode(position?: { x: number; y: number }) {
+  if (props.readOnly) return
   const center = position || screenToWorld(window.innerWidth / 2, window.innerHeight / 2)
   const minSize = minNodeSize('ai')
   pushCanvasElement({
@@ -2144,6 +2182,7 @@ function toggleCanvasVideoDraft(element: CanvasElement) {
 }
 
 function addGenerateNode(kind: GenerateNodeKind | 'mask' = props.defaultForm.task_type === 'video_generation' ? 'video' : 'image', position?: { x: number; y: number }) {
+  if (props.readOnly) return
   if (!activeCanvas.value) return
   const center = position || screenToWorld(window.innerWidth / 2, window.innerHeight / 2)
   const element = createProcessElement(kind, center)
@@ -2171,12 +2210,14 @@ function placeContextMenu(clientX: number, clientY: number, items: CanvasContext
 }
 
 function removeElement(id: string) {
+  if (props.readOnly) return
   if (!activeCanvas.value) return
   activeCanvas.value.elements = activeCanvas.value.elements.filter((element) => element.id !== id)
   activeCanvas.value.connections = activeCanvas.value.connections.filter((connection) => connection.from !== id && connection.to !== id)
 }
 
 function openCanvasContextMenu(event: MouseEvent) {
+  if (props.readOnly) return
   event.preventDefault()
   const point = screenToWorld(event.clientX, event.clientY)
   canvasContextMenu.value = placeContextMenu(event.clientX, event.clientY, [
@@ -2190,6 +2231,7 @@ function openCanvasContextMenu(event: MouseEvent) {
 }
 
 function openNodeContextMenu(element: CanvasElement, event: MouseEvent) {
+  if (props.readOnly) return
   event.preventDefault()
   const selectedIDs = Array.from(selectedNodeIDs.value).filter((id) => Boolean(elementByID(id)))
   if (selectedIDs.length > 1 && selectedIDs.includes(element.id)) {
@@ -2235,6 +2277,7 @@ function downloadNodeMedia(element: CanvasElement) {
 }
 
 function openSelectionContextMenu(event: { event: MouseEvent; nodes: Array<{ id: string }> }) {
+  if (props.readOnly) return
   const eventIDs = event.nodes.map((node) => node.id).filter((id) => Boolean(elementByID(id)))
   const cachedIDs = Array.from(selectedNodeIDs.value).filter((id) => Boolean(elementByID(id)))
   const selectedIDs = eventIDs.length > 1 ? eventIDs : cachedIDs
@@ -2422,6 +2465,7 @@ function workflowLevelsForElements(elements: CanvasElement[]) {
 }
 
 function openEdgeContextMenu(event: EdgeMouseEvent) {
+  if (props.readOnly) return
   event.event.preventDefault()
   event.event.stopPropagation()
   const sourceEvent = event.event
@@ -4354,6 +4398,7 @@ async function runToNode(element: CanvasElement) {
 }
 
 async function runCanvasWorkflow() {
+  if (props.readOnly) return
   if (runningWorkflow.value) return
   runningWorkflow.value = true
   const blockedIDs = frozenUpstreamIDs()
@@ -4446,7 +4491,7 @@ async function runTailFrameNode(element: CanvasElement) {
         sourceElement.media_last_frame_url = source.last_frame_url || ''
       }
     } catch {
-      throw new Error('后端无法抽取该视频尾帧，请确认视频地址可访问且服务器已安装 ffmpeg')
+      throw new Error('该视频没有可用尾帧，请使用已上传到图库的视频素材')
     }
   }
   if (source.last_frame_url) {
@@ -4503,6 +4548,7 @@ function miniMapNodeColor(node: { data?: { element?: CanvasElement } }) {
 }
 
 function onFlowConnect(connection: Connection) {
+  if (props.readOnly) return
   suppressFlowConnectEnd.value = true
   pendingFlowConnection.value = null
   if (!activeCanvas.value || !connection.source || !connection.target || connection.source === connection.target) return
@@ -4526,6 +4572,7 @@ function isValidFlowConnection(connection: Connection) {
 }
 
 function onFlowEdgeUpdate(event: EdgeUpdateEvent) {
+  if (props.readOnly) return
   if (!activeCanvas.value) return
   const connection = event.connection
   if (!connection.source || !connection.target || connection.source === connection.target) return
@@ -4548,6 +4595,7 @@ function onFlowEdgeUpdate(event: EdgeUpdateEvent) {
 }
 
 function onFlowConnectStart(params: { nodeId?: string | null; handleType?: string | null }) {
+  if (props.readOnly) return
   suppressFlowConnectEnd.value = false
   pendingFlowConnection.value = params.nodeId && (params.handleType === 'source' || params.handleType === 'target')
     ? { nodeId: params.nodeId, handleType: params.handleType }
@@ -4555,6 +4603,7 @@ function onFlowConnectStart(params: { nodeId?: string | null; handleType?: strin
 }
 
 function onFlowConnectEnd(event?: MouseEvent | TouchEvent) {
+  if (props.readOnly) return
   const pending = pendingFlowConnection.value
   pendingFlowConnection.value = null
   if (!pending) return
@@ -4584,6 +4633,7 @@ function onFlowConnectEnd(event?: MouseEvent | TouchEvent) {
 }
 
 function onFlowNodesChange(changes: NodeChange[]) {
+  if (props.readOnly) return
   let nextSelected = selectedNodeIDs.value
   const selectedNow: string[] = []
   for (const change of changes) {
@@ -5240,7 +5290,7 @@ function clamp(value: number, min: number, max: number) {
 </script>
 
 <template>
-  <section class="canvas-workspace" :class="{ 'space-panning': spacePanning, 'zen-mode': zenMode, 'assets-open': showAssets }" @click="canvasContextMenu = null; activeCanvasDrawer = ''" @contextmenu.prevent.stop="openCanvasContextMenu" @wheel.capture="onCanvasWheel" @pointerdown.capture="onCanvasPointerDownCapture" @pointermove="onPointerMove" @pointerup="stopDrag" @pointercancel="stopDrag">
+  <section class="canvas-workspace" :class="{ 'space-panning': spacePanning, 'zen-mode': zenMode, 'assets-open': showAssets, 'read-only': readOnly }" @click="canvasContextMenu = null; activeCanvasDrawer = ''" @contextmenu.prevent.stop="openCanvasContextMenu" @wheel.capture="onCanvasWheel" @pointerdown.capture="onCanvasPointerDownCapture" @pointermove="onPointerMove" @pointerup="stopDrag" @pointercancel="stopDrag">
     <div class="canvas-topbar glass-panel" :class="{ 'zen-collapsed': zenMode }" @pointerdown.stop>
       <div class="canvas-console-track">
         <div class="canvas-console-content" :aria-hidden="zenMode">
@@ -5252,11 +5302,13 @@ function clamp(value: number, min: number, max: number) {
           </div>
           <div class="canvas-switcher canvas-console-group canvas-group-board" :class="drawerGroupClass('board')">
             <InlineSelect class="toolbar-status-select canvas-board-select" label="画布" :model-value="activeCanvasID" :options="canvasOptions" @update:model-value="activeCanvasID = $event" />
-            <button type="button" title="新建画布" @click="createCanvas"><AppIcon name="add" /></button>
-            <button type="button" title="重命名画布" @click="openRenameCanvas"><AppIcon name="pencil" /></button>
-            <button type="button" :title="activeCanvasShared ? '取消广场分享' : '分享到广场'" :disabled="!activeCanvas" @click="toggleActiveCanvasShare"><AppIcon :name="activeCanvasShared ? 'eyeOff' : 'share'" /></button>
-            <button type="button" title="更新广场分享" :disabled="!activeCanvas || !activeCanvasShared" @click="shareActiveCanvas"><AppIcon name="upload" /></button>
-            <button type="button" title="删除画布" :disabled="canvases.length <= 1" @click="openDeleteCanvas"><AppIcon name="close" /></button>
+            <template v-if="!readOnly">
+              <button type="button" title="新建画布" @click="createCanvas"><AppIcon name="add" /></button>
+              <button type="button" title="重命名画布" @click="openRenameCanvas"><AppIcon name="pencil" /></button>
+              <button type="button" :title="activeCanvasShared ? '取消广场分享' : '分享到广场'" :disabled="!activeCanvas" @click="toggleActiveCanvasShare"><AppIcon :name="activeCanvasShared ? 'eyeOff' : 'share'" /></button>
+              <button type="button" title="更新广场分享" :disabled="!activeCanvas || !activeCanvasShared" @click="shareActiveCanvas"><AppIcon name="upload" /></button>
+              <button type="button" title="删除画布" :disabled="canvases.length <= 1" @click="openDeleteCanvas"><AppIcon name="close" /></button>
+            </template>
           </div>
           <div class="canvas-save-status canvas-console-group canvas-group-save" :class="[`is-${canvasSaveState}`, drawerGroupClass('save')]" :title="canvasSaveTitle">
             <span aria-hidden="true"></span>
@@ -5264,7 +5316,7 @@ function clamp(value: number, min: number, max: number) {
             <small>{{ canvasSaveDetail }}</small>
           </div>
           <span class="canvas-tool-divider" aria-hidden="true"></span>
-          <div class="canvas-switcher canvas-node-tools canvas-console-group canvas-group-nodes" :class="drawerGroupClass('nodes')">
+          <div v-if="!readOnly" class="canvas-switcher canvas-node-tools canvas-console-group canvas-group-nodes" :class="drawerGroupClass('nodes')">
             <button type="button" title="添加文字提示词" @click="addPromptNode()"><AppIcon name="text" /></button>
             <button type="button" title="添加媒体节点" @click="addAssetNode()"><AppIcon name="gallery" /></button>
             <button type="button" title="添加汇合节点" @click="addMergeNode()"><AppIcon name="merge" /></button>
@@ -5289,7 +5341,7 @@ function clamp(value: number, min: number, max: number) {
     </button>
     <button type="button" class="canvas-minimap-toggle glass-panel" :class="{ active: showMiniMap }" :title="showMiniMap && !zenMode ? '隐藏小地图' : '显示小地图'" @pointerdown.stop @click.stop="toggleMiniMap($event)"><AppIcon name="map" /></button>
 
-    <VueFlow id="canvas-flow" class="canvas-flow" :nodes="flowNodes" :edges="flowEdges" :min-zoom="MIN_ZOOM" :max-zoom="MAX_ZOOM" :default-viewport="{ x: pan.x, y: pan.y, zoom }" :nodes-draggable="!spacePanning" :pan-on-drag="false" :elevate-nodes-on-select="false" :elevate-edges-on-select="true" :default-edge-options="flowDefaultEdgeOptions" :connection-line-options="flowConnectionLineOptions" :connection-mode="ConnectionMode.Strict" :is-valid-connection="isValidFlowConnection" :connect-on-click="true" :edges-updatable="true" :edges-focusable="true" :nodes-focusable="true" pan-activation-key-code="Space" :selection-key-code="true" :select-nodes-on-drag="true" :zoom-on-scroll="false" delete-key-code="Delete" @connect="onFlowConnect" @connect-start="onFlowConnectStart" @connect-end="onFlowConnectEnd" @connectStart="onFlowConnectStart" @connectEnd="onFlowConnectEnd" @edge-update="onFlowEdgeUpdate" @edgeUpdate="onFlowEdgeUpdate" @nodes-change="onFlowNodesChange" @edges-change="onFlowEdgesChange" @pane-click="onFlowPaneClick" @node-drag-start="onFlowNodeDragStart" @node-drag-stop="onFlowNodeDragStop" @edge-context-menu="openEdgeContextMenu" @selection-context-menu="openSelectionContextMenu" @viewport-change="onFlowViewportChange">
+    <VueFlow id="canvas-flow" class="canvas-flow" :nodes="flowNodes" :edges="flowEdges" :min-zoom="MIN_ZOOM" :max-zoom="MAX_ZOOM" :default-viewport="{ x: pan.x, y: pan.y, zoom }" :nodes-draggable="!spacePanning && !readOnly" :pan-on-drag="false" :elevate-nodes-on-select="false" :elevate-edges-on-select="true" :default-edge-options="flowDefaultEdgeOptions" :connection-line-options="flowConnectionLineOptions" :connection-mode="ConnectionMode.Strict" :is-valid-connection="isValidFlowConnection" :connect-on-click="!readOnly" :edges-updatable="!readOnly" :edges-focusable="!readOnly" :nodes-focusable="true" pan-activation-key-code="Space" :selection-key-code="true" :select-nodes-on-drag="!readOnly" :zoom-on-scroll="false" :delete-key-code="readOnly ? null : 'Delete'" @connect="onFlowConnect" @connect-start="onFlowConnectStart" @connect-end="onFlowConnectEnd" @connectStart="onFlowConnectStart" @connectEnd="onFlowConnectEnd" @edge-update="onFlowEdgeUpdate" @edgeUpdate="onFlowEdgeUpdate" @nodes-change="onFlowNodesChange" @edges-change="onFlowEdgesChange" @pane-click="onFlowPaneClick" @node-drag-start="onFlowNodeDragStart" @node-drag-stop="onFlowNodeDragStop" @edge-context-menu="openEdgeContextMenu" @selection-context-menu="openSelectionContextMenu" @viewport-change="onFlowViewportChange">
       <MiniMap
         v-if="showMiniMap"
         class="canvas-vueflow-minimap glass-panel"

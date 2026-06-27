@@ -256,18 +256,12 @@ func (w *Worker) pollVideo(ctx context.Context, task *model.Task) {
 		FirstFrameURL: uploaded.FirstFrameURL,
 		LastFrameURL:  uploaded.LastFrameURL,
 		Filename:      uploaded.Filename,
+		ETag:          uploaded.ETag,
+		ContentType:   uploaded.ContentType,
+		OriginalSize:  uploaded.OriginalSize,
 		Duration:      result.Duration,
 		Width:         task.VideoWidth,
 		Height:        task.VideoHeight,
-	}
-	if video.FirstFrameURL == "" || video.LastFrameURL == "" {
-		if frames, err := w.ImageHost.ExtractVideoFramesFromFile(ctx, path, uploaded.Filename); err == nil {
-			video.ThumbnailURL = frames.ThumbnailURL
-			video.FirstFrameURL = frames.FirstFrameURL
-			video.LastFrameURL = frames.LastFrameURL
-		} else {
-			fmt.Println("worker video frame extract skipped:", "id=", task.ID, "error=", err)
-		}
 	}
 	fmt.Println("worker video uploaded:", "id=", task.ID, "uploaded_url=", uploaded.URL, "filename=", uploaded.Filename)
 	if err := w.Store.CompleteVideoTask(ctx, task.ID, task.Prompt, result.ResponseHeaders, result.ResponseJSON, []model.MediaAsset{video}, time.Since(defaultTime(task.StartedAt, task.CreatedAt)).Milliseconds()); err != nil {

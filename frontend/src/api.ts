@@ -1,4 +1,4 @@
-import type { CreateTaskPayload, MediaAsset, PlazaItem, Task, UploadedImage } from './types'
+import type { CreateTaskPayload, GalleryList, GalleryUserList, MediaAsset, PlazaItem, Task, UploadedImage } from './types'
 
 export class APIError extends Error {
   code?: string
@@ -139,7 +139,7 @@ function toUploadedImage(data: unknown): UploadedImage {
   }
   const url = response.data?.url || response.url
   if (!url) {
-    throw new Error('图片上传失败：图床未返回链接')
+    throw new Error('图片上传失败：图库未返回链接')
   }
   return {
     url,
@@ -150,6 +150,10 @@ function toUploadedImage(data: unknown): UploadedImage {
     original_size: response.data?.original_size,
     compressed_size: response.data?.compressed_size,
     compression_ratio: response.data?.compression_ratio,
+    sha256: response.data?.sha256,
+    etag: response.data?.etag,
+    content_type: response.data?.content_type,
+    deduplicated: response.data?.deduplicated,
   }
 }
 
@@ -159,6 +163,61 @@ export async function fetchVideoFrames(url: string, filename = ''): Promise<Medi
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url, filename }),
   })
+}
+
+export async function galleryLogin(username: string, password: string) {
+  return request<{ username: string }>('/api/gallery/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  })
+}
+
+export async function galleryLogout() {
+  return request<{ ok: boolean }>('/api/gallery/logout', { method: 'POST' })
+}
+
+export async function galleryMe() {
+  return request<{ username: string }>('/api/gallery/me')
+}
+
+export async function listGalleryUsers(q = '', page = 1, limit = 30) {
+  const params = new URLSearchParams({ limit: String(limit), page: String(page) })
+  if (q) params.set('q', q)
+  return request<GalleryUserList>(`/api/gallery/users?${params}`)
+}
+
+export async function listGalleryUserTasks(workspaceID: string, status: string, q: string, favoriteOnly: boolean, beforeCreatedAt = '', beforeID = '', limit = 30) {
+  const params = new URLSearchParams({ limit: String(limit) })
+  if (status && status !== 'all') params.set('status', status)
+  if (q) params.set('q', q)
+  if (favoriteOnly) params.set('favorite', '1')
+  if (beforeCreatedAt && beforeID) {
+    params.set('before_created_at', beforeCreatedAt)
+    params.set('before_id', beforeID)
+  }
+  return request<{ data: Task[]; has_more: boolean; next_before_created_at: string; next_before_id: string; total: number }>(`/api/gallery/users/${encodeURIComponent(workspaceID)}/tasks?${params}`)
+}
+
+export async function getGalleryUserTask(workspaceID: string, taskID: string): Promise<Task> {
+  return request<Task>(`/api/gallery/users/${encodeURIComponent(workspaceID)}/tasks/${encodeURIComponent(taskID)}`)
+}
+
+export async function fetchGalleryUserCanvases(workspaceID: string) {
+  return request<{ canvases: unknown; updated_at: string }>(`/api/gallery/users/${encodeURIComponent(workspaceID)}/canvases`)
+}
+
+export async function listGalleryObjects(prefix = '', token = '', limit = 50) {
+  const params = new URLSearchParams({ prefix, token, limit: String(limit) })
+  return request<GalleryList>(`/api/gallery/objects?${params}`)
+}
+
+export async function deleteGalleryObject(key: string) {
+  return request<{ ok: boolean }>(`/api/gallery/objects?key=${encodeURIComponent(key)}`, { method: 'DELETE' })
+}
+
+export async function galleryObjectLink(key: string) {
+  return request<{ url: string }>(`/api/gallery/link?key=${encodeURIComponent(key)}`)
 }
 
 export async function fetchModels(baseurl: string, apikey: string) {
@@ -186,9 +245,12 @@ export async function runLLM(payload: {
   })
 }
 
-export async function uploadImage(file: File): Promise<UploadedImage> {
+export async function uploadImage(file: File, credentials?: { baseurl: string; apikey: string }): Promise<UploadedImage> {
   const form = new FormData()
   form.append('file', file)
+  form.append('sha256', await fileSHA256(file))
+  if (credentials?.baseurl) form.append('baseurl', credentials.baseurl)
+  if (credentials?.apikey) form.append('apikey', credentials.apikey)
   const response = await fetch('/api/upload', {
     method: 'POST',
     body: form,
@@ -199,6 +261,12 @@ export async function uploadImage(file: File): Promise<UploadedImage> {
     throw new Error(data?.error || `图片上传失败：${response.status}`)
   }
   return toUploadedImage(data)
+}
+
+async function fileSHA256(file: File): Promise<string> {
+  const buffer = await file.arrayBuffer()
+  const digest = await crypto.subtle.digest('SHA-256', buffer)
+  return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
 export async function createTask(payload: CreateTaskPayload): Promise<Task> {

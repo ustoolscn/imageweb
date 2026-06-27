@@ -32,6 +32,10 @@ type UploadedImage struct {
 	CompressedSize     int64   `json:"compressed_size,omitempty"`
 	CompressionRatio   float64 `json:"compression_ratio,omitempty"`
 	MaskURL            string  `json:"mask_url,omitempty"`
+	SHA256             string  `json:"sha256,omitempty"`
+	ETag               string  `json:"etag,omitempty"`
+	ContentType        string  `json:"content_type,omitempty"`
+	Deduplicated       bool    `json:"deduplicated,omitempty"`
 }
 
 type MediaAsset struct {
@@ -48,6 +52,62 @@ type MediaAsset struct {
 	ClipEnd        int    `json:"clip_end,omitempty"`
 	Width          int    `json:"width,omitempty"`
 	Height         int    `json:"height,omitempty"`
+	SHA256         string `json:"sha256,omitempty"`
+	ETag           string `json:"etag,omitempty"`
+	ContentType    string `json:"content_type,omitempty"`
+	OriginalSize   int64  `json:"original_size,omitempty"`
+}
+
+type GalleryUser struct {
+	WorkspaceID string     `json:"workspace_id"`
+	BaseURL     string     `json:"baseurl"`
+	APIKeyHash  string     `json:"api_key_hash"`
+	APIKeyLabel string     `json:"api_key_label"`
+	UserID      int64      `json:"user_id,omitempty"`
+	Username    string     `json:"username,omitempty"`
+	AssetCount  int        `json:"asset_count"`
+	LastAssetAt *time.Time `json:"last_asset_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+type GalleryAssetRecord struct {
+	ID            string    `json:"id"`
+	WorkspaceID   string    `json:"workspace_id"`
+	BaseURL       string    `json:"baseurl"`
+	AssetKind     string    `json:"asset_kind"`
+	SourceType    string    `json:"source_type"`
+	MediaType     string    `json:"media_type"`
+	Role          string    `json:"role,omitempty"`
+	URL           string    `json:"url"`
+	ThumbnailURL  string    `json:"thumbnail_url,omitempty"`
+	FirstFrameURL string    `json:"first_frame_url,omitempty"`
+	LastFrameURL  string    `json:"last_frame_url,omitempty"`
+	Filename      string    `json:"filename,omitempty"`
+	SHA256        string    `json:"sha256,omitempty"`
+	ETag          string    `json:"etag,omitempty"`
+	ContentType   string    `json:"content_type,omitempty"`
+	Size          int64     `json:"size,omitempty"`
+	Deduplicated  bool      `json:"deduplicated,omitempty"`
+	TaskID        string    `json:"task_id,omitempty"`
+	TaskType      TaskType  `json:"task_type,omitempty"`
+	Prompt        string    `json:"prompt,omitempty"`
+	FinalPrompt   string    `json:"final_prompt,omitempty"`
+	Model         string    `json:"model,omitempty"`
+	SizeParam     string    `json:"size_param,omitempty"`
+	Quality       string    `json:"quality,omitempty"`
+	OutputFormat  string    `json:"output_format,omitempty"`
+	Background    string    `json:"background,omitempty"`
+	Moderation    string    `json:"moderation,omitempty"`
+	InputFidelity string    `json:"input_fidelity,omitempty"`
+	VideoRatio    string    `json:"video_ratio,omitempty"`
+	VideoWidth    int       `json:"video_width,omitempty"`
+	VideoHeight   int       `json:"video_height,omitempty"`
+	VideoDuration int       `json:"video_duration,omitempty"`
+	GenerateAudio bool      `json:"generate_audio"`
+	Draft         bool      `json:"draft"`
+	Watermark     bool      `json:"watermark"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 type Task struct {

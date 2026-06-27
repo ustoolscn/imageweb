@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { APIError, createTask, deleteTask, fetchModels, fetchSiteBrand, fetchTaskUpdates, fetchVideoFrames, getTask, listPlazaItems, listTasks, retryTask, runLLM, setPlazaLike, setTaskFavorite, shareCanvas, shareTask, unshareCanvas, unshareTask, uploadImage } from './api'
+import { APIError, createTask, deleteTask, fetchGalleryUserCanvases, fetchModels, fetchSiteBrand, fetchTaskUpdates, fetchVideoFrames, galleryLogin, galleryMe, getGalleryUserTask, getTask, listGalleryUserTasks, listGalleryUsers, listPlazaItems, listTasks, retryTask, runLLM, setPlazaLike, setTaskFavorite, shareCanvas, shareTask, unshareCanvas, unshareTask, uploadImage } from './api'
 import AdminContactModal from './components/AdminContactModal.vue'
 import AppIcon from './components/AppIcon.vue'
 import AppToolbar from './components/AppToolbar.vue'
@@ -20,7 +20,7 @@ import { downloadFile } from './lib/download'
 import { nanoBananaRatios, nanoBananaSizeBaseOptions, nanoBananaSizeValue, parseNanoBananaSize, parseSeedreamSize, ratioOptions, seedreamRatios, seedreamSizeBaseOptions, seedreamSizeValue, sizeBaseOptions, sizeFromRatio, type SizeBase } from './lib/sizes'
 import { normalizeVideoSettings, supportsVideoDraft, videoRatioOptions, videoResolutionFromSize, videoResolutionOptions, videoSizeFor, videoSizeLabel, type VideoResolution } from './lib/videoModels'
 import { canOpenSource, canShareTask, isFavorite, maskBaseURL } from './lib/view'
-import type { CreateTaskPayload, MediaAsset, PlazaItem, Task, UploadedImage } from './types'
+import type { CreateTaskPayload, GalleryUser, MediaAsset, PlazaItem, Task, UploadedImage } from './types'
 import type { CanvasLLMPayload, CanvasRunPayload, ImageForm, PendingReferenceAudio, PendingReferenceImage, PendingReferenceVideo, PreviewImage, SettingsPayload, ThemeMode, ViewMode, AppliedThemeMode } from './uiTypes'
 
 const MASK_EDIT_MAX_SIDE = 1600
@@ -32,6 +32,9 @@ const SEEDREAM_MODEL = 'doubao-seedream-5.0-lite'
 const DEFAULT_VIDEO_MODEL = 'doubao-seedance-2.0'
 const VIEW_MODE_STORAGE_KEY = 'image_web_view_mode'
 const ONBOARDING_STORAGE_KEY = 'image_web_onboarding_seen_v1'
+const GALLERY_ADMIN_PATH = '/gallery-admin'
+const GALLERY_ADMIN_ALIASES = new Set([GALLERY_ADMIN_PATH, '/admin/gallery'])
+const GALLERY_USER_PAGE_SIZE = 5
 
 const savedModel = localStorage.getItem('image_web_model') || 'gpt-image-2'
 const savedTheme = parseSavedTheme(localStorage.getItem('image_web_theme'))
@@ -42,6 +45,20 @@ const tasks = ref<Task[]>([])
 const totalTasks = ref(0)
 const plazaItems = ref<PlazaItem[]>([])
 const totalPlazaItems = ref(0)
+const galleryUsers = ref<GalleryUser[]>([])
+const selectedGalleryUserSnapshot = ref<GalleryUser | null>(null)
+const selectedGalleryUserID = ref('')
+const galleryLoggedIn = ref(false)
+const galleryLoading = ref(false)
+const galleryUserSearch = ref('')
+const galleryUserTotal = ref(0)
+const galleryUserPage = ref(1)
+const galleryUserTotalPages = ref(0)
+const galleryError = ref('')
+const galleryLoginForm = reactive({ username: 'admin', password: '' })
+const showGalleryUserSwitcher = ref(false)
+const gallerySection = ref<'tasks' | 'canvas'>('tasks')
+const galleryCanvasState = ref<{ token: number; canvases: unknown; updated_at: string } | null>(null)
 const viewMode = ref<ViewMode>(savedViewMode)
 const canvasZenMode = ref(false)
 const canvasFrameReady = ref(false)
@@ -108,6 +125,8 @@ const referenceMaskFiles = ref<Array<File | null>>([])
 const referenceMaskPreviews = ref<Array<string | null>>([])
 let pollTimer: number | undefined
 let clockTimer: number | undefined
+let galleryUserSearchTimer: number | undefined
+let galleryUsersRequestToken = 0
 let systemThemeQuery: MediaQueryList | undefined
 let compactCanvasQuery: MediaQueryList | undefined
 let taskUpdatePromise: Promise<void> | null = null
@@ -120,6 +139,43 @@ const maskPreviewCache = new Map<string, string>()
 const maskPreviewPending = new Map<string, Promise<string>>()
 let lastPlazaRefreshAt = 0
 let plazaRefreshPromise: Promise<void> | null = null
+
+function normalizeRoutePath(pathname: string) {
+  const normalized = pathname.trim() || '/'
+  if (normalized === '/') return normalized
+  return normalized.endsWith('/') ? normalized.slice(0, -1) : normalized
+}
+
+function isGalleryAdminPath(pathname: string) {
+  return GALLERY_ADMIN_ALIASES.has(normalizeRoutePath(pathname).toLowerCase())
+}
+
+function viewModeFromLocation(): ViewMode | null {
+  return isGalleryAdminPath(window.location.pathname) ? 'gallery' : null
+}
+
+function syncLocationForView(mode: ViewMode, replace = false) {
+  const url = new URL(window.location.href)
+  const currentPath = normalizeRoutePath(url.pathname)
+  let nextPath = currentPath
+  if (mode === 'gallery') nextPath = GALLERY_ADMIN_PATH
+  else if (isGalleryAdminPath(currentPath)) nextPath = '/'
+  if (nextPath === currentPath) return
+  url.pathname = nextPath
+  const nextURL = url.pathname + url.search + url.hash
+  if (replace) window.history.replaceState({}, '', nextURL)
+  else window.history.pushState({}, '', nextURL)
+}
+
+function syncViewModeFromLocation() {
+  const modeFromLocation = viewModeFromLocation()
+  if (modeFromLocation) {
+    viewMode.value = modeFromLocation
+    if (modeFromLocation === 'gallery') ensureGallerySession()
+  } else if (viewMode.value === 'gallery') {
+    viewMode.value = 'tasks'
+  }
+}
 
 function parseSavedTheme(value: string | null): ThemeMode {
   return value === 'light' || value === 'dark' || value === 'system' ? value : 'system'
@@ -186,7 +242,18 @@ const referenceLabelCounters = reactive({ image: 1, video: 1, audio: 1 })
 
 const hasConfig = computed(() => Boolean(baseurl.value && apikey.value))
 const sharedCanvasIds = computed(() => plazaItems.value.filter((item) => item.item_type === 'canvas').map(plazaCanvasID).filter(Boolean))
-const visibleSubtitle = computed(() => viewMode.value === 'plaza' ? `公开广场 · 已加载 ${plazaItems.value.length} 条 · 总计 ${totalPlazaItems.value} 条` : (hasConfig.value ? `${maskBaseURL(baseurl.value)} · 已加载 ${tasks.value.length} 条 · 总计 ${totalTasks.value} 条` : '通过 URL 传入 baseurl 和 apikey 后开始使用'))
+const isGalleryMode = computed(() => viewMode.value === 'gallery')
+const selectedGalleryUser = computed(() => galleryUsers.value.find((user) => user.workspace_id === selectedGalleryUserID.value) || selectedGalleryUserSnapshot.value)
+const selectedGalleryUserLabel = computed(() => {
+  const user = selectedGalleryUser.value
+  if (!user) return '选择用户'
+  return `${galleryUserDisplayLabel(user)} · ${maskBaseURL(user.baseurl)}`
+})
+const visibleSubtitle = computed(() => {
+  if (viewMode.value === 'gallery') return galleryLoggedIn.value ? `管理端 · ${selectedGalleryUserLabel.value} · ${gallerySection.value === 'canvas' ? '画布' : `已加载 ${tasks.value.length} 条 · 总计 ${totalTasks.value} 条`}` : '管理端 · 登录后选择用户查看'
+  if (viewMode.value === 'plaza') return `公开广场 · 已加载 ${plazaItems.value.length} 条 · 总计 ${totalPlazaItems.value} 条`
+  return hasConfig.value ? `${maskBaseURL(baseurl.value)} · 已加载 ${tasks.value.length} 条 · 总计 ${totalTasks.value} 条` : '通过 URL 传入 baseurl 和 apikey 后开始使用'
+})
 const draftSize = computed(() => sizeFromRatio(sizeDraft.base, sizeDraft.ratio))
 const isNanoBananaForm = computed(() => form.model === NANO_BANANA_MODEL)
 const isSeedreamForm = computed(() => form.model === SEEDREAM_MODEL)
@@ -223,7 +290,8 @@ watch(themeMode, (theme) => {
 }, { immediate: true })
 
 watch(viewMode, (mode) => {
-  localStorage.setItem(VIEW_MODE_STORAGE_KEY, mode)
+  if (mode !== 'gallery') localStorage.setItem(VIEW_MODE_STORAGE_KEY, mode)
+  syncLocationForView(mode, true)
   if (mode !== 'canvas') canvasZenMode.value = false
   if (mode !== 'canvas') canvasFrameReady.value = false
   if (mode === 'canvas' && hideCanvasForCompact.value) viewMode.value = 'tasks'
@@ -231,6 +299,14 @@ watch(viewMode, (mode) => {
 
 watch(hideCanvasForCompact, (hidden) => {
   if (hidden && viewMode.value === 'canvas') viewMode.value = 'tasks'
+})
+
+watch(galleryUserSearch, () => {
+  if (!galleryLoggedIn.value || !showGalleryUserSwitcher.value) return
+  if (galleryUserSearchTimer) window.clearTimeout(galleryUserSearchTimer)
+  galleryUserSearchTimer = window.setTimeout(() => {
+    refreshGalleryUsers({ page: 1, refreshCurrentUser: false })
+  }, 300)
 })
 
 type AppContextMenuItem = { label: string; action: () => void; disabled?: boolean; danger?: boolean }
@@ -261,7 +337,7 @@ function openContextMenu(event: MouseEvent, items: AppContextMenuItem[]) {
 
 function openPageContextMenu(event: MouseEvent) {
   openContextMenu(event, [
-    { label: '刷新当前视图', action: () => viewMode.value === 'plaza' ? refreshPlazaItems() : refreshTasks() },
+    { label: '刷新当前视图', action: () => viewMode.value === 'gallery' ? refreshGallerySection() : viewMode.value === 'plaza' ? refreshPlazaItems() : refreshTasks() },
     { label: '连接设置', action: openSettings },
     { label: `切换主题：${themeMode.value === 'dark' ? '浅色' : '深色'}`, action: toggleTheme },
   ])
@@ -278,6 +354,13 @@ function runContextAction(item: { action: () => void; disabled?: boolean }) {
 }
 
 function openTaskContextMenu(task: Task, event: MouseEvent) {
+  if (isGalleryMode.value) {
+    openContextMenu(event, [
+      { label: '查看详情', action: () => { selectedTask.value = task } },
+      { label: '查看源数据', action: () => openSourceTask(task), disabled: !canOpenSource(task) },
+    ])
+    return
+  }
   openContextMenu(event, [
     { label: '查看详情', action: () => { selectedTask.value = task } },
     { label: '复用配置', action: () => reuseTask(task) },
@@ -525,6 +608,7 @@ function createClientID() {
 
 async function toggleFavorite(task: Task, event?: Event) {
   event?.stopPropagation()
+  if (isGalleryMode.value) return
   try {
     const updated = await setTaskFavorite(task.id, apikey.value, baseurl.value, !task.favorite)
     patchTask(updated)
@@ -704,7 +788,9 @@ async function openSourceTask(task: Task, event?: Event) {
   event?.stopPropagation()
   if (!canOpenSource(task)) return
   try {
-    sourceTask.value = await getTask(task.id, apikey.value, baseurl.value)
+    sourceTask.value = isGalleryMode.value && selectedGalleryUserID.value
+      ? await getGalleryUserTask(selectedGalleryUserID.value, task.id)
+      : await getTask(task.id, apikey.value, baseurl.value)
   } catch (error) {
     showMessage(error instanceof Error ? error.message : '源数据加载失败')
   }
@@ -718,9 +804,11 @@ onMounted(() => {
   syncSystemThemeMode()
   syncCompactCanvasMode()
   loadConfigFromURL()
+  syncViewModeFromLocation()
   refreshSiteBrand()
   syncSizeDraft(form.size)
   window.addEventListener('resize', syncMaskCanvasDisplaySize)
+  window.addEventListener('popstate', syncViewModeFromLocation)
   if (hasConfig.value) {
     loadModels()
     refreshTasks()
@@ -737,10 +825,12 @@ onMounted(() => {
 onUnmounted(() => {
   if (pollTimer) window.clearTimeout(pollTimer)
   if (clockTimer) window.clearInterval(clockTimer)
+  if (galleryUserSearchTimer) window.clearTimeout(galleryUserSearchTimer)
   systemThemeQuery?.removeEventListener('change', syncSystemThemeMode)
   compactCanvasQuery?.removeEventListener('change', syncCompactCanvasMode)
   window.removeEventListener('resize', syncMaskCanvasDisplaySize)
   window.removeEventListener('scroll', onPageScroll)
+  window.removeEventListener('popstate', syncViewModeFromLocation)
   revokePreviews()
 })
 
@@ -845,6 +935,10 @@ function extractModelIDs(result: unknown): string[] {
 }
 
 async function refreshTasks(limit = Math.max(30, tasks.value.length)) {
+  if (isGalleryMode.value) {
+    await refreshGalleryUserTasks(limit)
+    return
+  }
   if (!apikey.value || baseURLBlocked.value) return
   loading.value = true
   try {
@@ -867,7 +961,8 @@ async function resetTasks() {
   hasMoreTasks.value = false
   nextTaskBeforeCreatedAt.value = ''
   nextTaskBeforeID.value = ''
-  await refreshTasks(30)
+  if (isGalleryMode.value) await refreshGalleryUserTasks(30)
+  else await refreshTasks(30)
 }
 
 async function refreshPlazaItems(limit = Math.max(30, plazaItems.value.length)) {
@@ -910,6 +1005,10 @@ async function resetPlazaItems() {
 }
 
 async function loadMoreTasks() {
+  if (isGalleryMode.value) {
+    await loadMoreGalleryUserTasks()
+    return
+  }
   if (!apikey.value || baseURLBlocked.value || loading.value || loadingMore.value || !hasMoreTasks.value) return
   loadingMore.value = true
   try {
@@ -1338,6 +1437,7 @@ function toAudioAsset(audio: PendingReferenceAudio): MediaAsset {
 }
 
 async function removeTask(task: Task) {
+  if (isGalleryMode.value) return
   if (!confirm('确定删除这个任务记录吗？')) return
   await deleteTask(task.id, apikey.value, baseurl.value)
   if (selectedTask.value?.id === task.id) selectedTask.value = null
@@ -1345,6 +1445,7 @@ async function removeTask(task: Task) {
 }
 
 async function rerunTask(task: Task) {
+  if (isGalleryMode.value) return
   await retryTask(task.id, apikey.value, baseurl.value)
   await refreshTasks()
   showMessage('已创建重新生成任务')
@@ -1352,6 +1453,7 @@ async function rerunTask(task: Task) {
 
 async function toggleTaskShare(task: Task, event?: Event) {
   event?.stopPropagation()
+  if (isGalleryMode.value) return
   if (!canShareTask(task)) return
   try {
     if (task.shared_to_plaza) {
@@ -1447,6 +1549,10 @@ function reusePlazaItem(item: PlazaItem) {
   reuseTask(item)
 }
 
+function uploadCredentials() {
+  return { baseurl: baseurl.value, apikey: apikey.value }
+}
+
 async function togglePlazaLike(item: PlazaItem, event?: Event) {
   event?.stopPropagation()
   try {
@@ -1472,7 +1578,7 @@ async function prepareCanvasReferenceImages(images: UploadedImage[]) {
       prepared.push({ ...image, mask_url: '' })
       continue
     }
-    const uploadedMask = await uploadImage(new File([maskBlob], `canvas-mask-${prepared.length + 1}.png`, { type: 'image/png' }))
+    const uploadedMask = await uploadImage(new File([maskBlob], `canvas-mask-${prepared.length + 1}.png`, { type: 'image/png' }), uploadCredentials())
     prepared.push({ ...image, mask_url: uploadedMask.url })
   }
   return prepared
@@ -1510,6 +1616,7 @@ function loadImageElement(src: string) {
 }
 
 function reuseTask(task: Task | PlazaItem) {
+  if (isGalleryMode.value) return
   resetReferenceLabels()
   if ('task_type' in task) {
     form.task_type = task.task_type || 'image_generation'
@@ -1635,7 +1742,9 @@ function switchView(mode: ViewMode) {
   const previousMode = viewMode.value
   if (mode === 'canvas' && previousMode !== 'canvas') canvasFrameReady.value = false
   viewMode.value = mode
+  syncLocationForView(mode)
   if (mode === 'plaza') ensurePlazaItemsFresh()
+  if (mode === 'gallery') ensureGallerySession()
   if (mode === 'canvas' && hasConfig.value && !tasks.value.length) refreshTasks()
 }
 
@@ -1663,7 +1772,7 @@ function appendReferenceFiles(files: File[]) {
 
 async function uploadReferenceFile(file: File, index: number) {
   try {
-    const uploaded = await uploadImage(file)
+    const uploaded = await uploadImage(file, uploadCredentials())
     const current = referenceImages.value[index]
     if (!current) return
     referenceImages.value[index] = { ...uploaded, reference_label: current.reference_label, preview_url: current.preview_url, uploading: false }
@@ -1707,7 +1816,7 @@ async function uploadReferenceMediaFile(file: File, type: 'video' | 'audio') {
   list.value.push(item)
   const index = list.value.length - 1
   try {
-    const uploaded = await uploadImage(file)
+    const uploaded = await uploadImage(file, uploadCredentials())
     if (!list.value[index]) return
     list.value[index] = {
       ...list.value[index],
@@ -1716,6 +1825,10 @@ async function uploadReferenceMediaFile(file: File, type: 'video' | 'audio') {
       first_frame_url: uploaded.first_frame_url,
       last_frame_url: uploaded.last_frame_url,
       filename: uploaded.filename || file.name,
+      sha256: uploaded.sha256,
+      etag: uploaded.etag,
+      content_type: uploaded.content_type,
+      original_size: uploaded.original_size,
       loading: false,
     }
     if (type === 'video') {
@@ -2185,6 +2298,188 @@ function syncSizeDraft(size: string) {
   ensureAllowedSizeBase()
 }
 
+async function ensureGallerySession() {
+  try {
+    await galleryMe()
+    galleryLoggedIn.value = true
+    await refreshGalleryUsers()
+  } catch {
+    galleryLoggedIn.value = false
+  }
+}
+
+async function loginGallery() {
+  galleryError.value = ''
+  try {
+    await galleryLogin(galleryLoginForm.username, galleryLoginForm.password)
+    galleryLoggedIn.value = true
+    galleryLoginForm.password = ''
+    await refreshGalleryUsers()
+  } catch (error) {
+    galleryError.value = error instanceof Error ? error.message : '图库登录失败'
+  }
+}
+
+type GalleryUserRefreshOptions = {
+  page?: number
+  refreshCurrentUser?: boolean
+}
+
+async function refreshGalleryUsers(options: GalleryUserRefreshOptions = {}) {
+  if (!galleryLoggedIn.value) return
+  const requestToken = ++galleryUsersRequestToken
+  const query = galleryUserSearch.value.trim()
+  const requestedPage = Math.max(1, options.page || galleryUserPage.value || 1)
+  galleryLoading.value = true
+  galleryError.value = ''
+  try {
+    const result = await listGalleryUsers(query, requestedPage, GALLERY_USER_PAGE_SIZE)
+    if (requestToken !== galleryUsersRequestToken) return
+    galleryUsers.value = result.users
+    galleryUserTotal.value = result.total
+    galleryUserPage.value = result.page || requestedPage
+    galleryUserTotalPages.value = result.total_pages || 0
+    const selectedInPage = galleryUsers.value.find((user) => user.workspace_id === selectedGalleryUserID.value)
+    if (selectedInPage) selectedGalleryUserSnapshot.value = selectedInPage
+    if (!selectedGalleryUserID.value && result.users.length) {
+      selectedGalleryUserID.value = result.users[0].workspace_id
+      selectedGalleryUserSnapshot.value = result.users[0]
+    }
+    if (options.refreshCurrentUser !== false && selectedGalleryUserID.value) await refreshGalleryUserTasks()
+  } catch (error) {
+    galleryError.value = error instanceof Error ? error.message : '读取用户列表失败'
+  } finally {
+    if (requestToken === galleryUsersRequestToken) {
+      galleryLoading.value = false
+    }
+  }
+}
+
+async function switchGalleryUserPage(page: number) {
+  if (page < 1 || (galleryUserTotalPages.value && page > galleryUserTotalPages.value) || page === galleryUserPage.value) return
+  await refreshGalleryUsers({ page, refreshCurrentUser: false })
+}
+
+function galleryUserPageNumbers() {
+  const total = galleryUserTotalPages.value
+  const current = galleryUserPage.value
+  if (total <= 7) return Array.from({ length: total }, (_, index) => index + 1)
+  const pages = new Set([1, total, current - 1, current, current + 1])
+  if (current <= 3) {
+    pages.add(2)
+    pages.add(3)
+    pages.add(4)
+  }
+  if (current >= total - 2) {
+    pages.add(total - 3)
+    pages.add(total - 2)
+    pages.add(total - 1)
+  }
+  return Array.from(pages).filter((page) => page >= 1 && page <= total).sort((a, b) => a - b)
+}
+
+async function refreshGallerySection() {
+  if (gallerySection.value === 'canvas') await refreshGalleryCanvases()
+  else await refreshGalleryUserTasks()
+}
+
+async function switchGallerySection(section: 'tasks' | 'canvas') {
+  gallerySection.value = section
+  selectedTask.value = null
+  canvasFrameReady.value = false
+  if (section === 'canvas') await refreshGalleryCanvases()
+  else await refreshGalleryUserTasks()
+}
+
+async function refreshGalleryUserTasks(limit = Math.max(30, tasks.value.length)) {
+  if (!galleryLoggedIn.value || !selectedGalleryUserID.value) return
+  loading.value = true
+  galleryError.value = ''
+  try {
+    const result = await listGalleryUserTasks(selectedGalleryUserID.value, status.value, keyword.value, favoriteOnly.value, '', '', limit)
+    tasks.value = result.data
+    prefetchTaskMasks(result.data)
+    totalTasks.value = result.total
+    hasMoreTasks.value = result.has_more
+    nextTaskBeforeCreatedAt.value = result.next_before_created_at
+    nextTaskBeforeID.value = result.next_before_id
+  } catch (error) {
+    galleryError.value = error instanceof Error ? error.message : '读取用户任务失败'
+  } finally {
+    loading.value = false
+  }
+}
+
+async function selectGalleryUser(user: GalleryUser) {
+  selectedGalleryUserID.value = user.workspace_id
+  selectedGalleryUserSnapshot.value = user
+  showGalleryUserSwitcher.value = false
+  selectedTask.value = null
+  galleryCanvasState.value = null
+  if (gallerySection.value === 'canvas') await refreshGalleryCanvases()
+  else await resetTasks()
+}
+
+async function refreshGalleryCanvases() {
+  if (!galleryLoggedIn.value || !selectedGalleryUserID.value) return
+  galleryError.value = ''
+  canvasFrameReady.value = false
+  galleryCanvasState.value = { token: Date.now(), canvases: [], updated_at: '' }
+  try {
+    const result = await fetchGalleryUserCanvases(selectedGalleryUserID.value)
+    galleryCanvasState.value = {
+      token: Date.now(),
+      canvases: result.canvases,
+      updated_at: result.updated_at,
+    }
+  } catch (error) {
+    galleryError.value = error instanceof Error ? error.message : '读取用户画布失败'
+  }
+}
+
+async function loadMoreGalleryUserTasks() {
+  if (!galleryLoggedIn.value || !selectedGalleryUserID.value || loading.value || loadingMore.value || !hasMoreTasks.value) return
+  loadingMore.value = true
+  galleryError.value = ''
+  try {
+    const result = await listGalleryUserTasks(selectedGalleryUserID.value, status.value, keyword.value, favoriteOnly.value, nextTaskBeforeCreatedAt.value, nextTaskBeforeID.value)
+    const existing = new Set(tasks.value.map((task) => task.id))
+    const nextTasks = result.data.filter((task) => !existing.has(task.id))
+    tasks.value.push(...nextTasks)
+    prefetchTaskMasks(nextTasks)
+    totalTasks.value = result.total
+    hasMoreTasks.value = result.has_more
+    nextTaskBeforeCreatedAt.value = result.next_before_created_at
+    nextTaskBeforeID.value = result.next_before_id
+  } catch (error) {
+    galleryError.value = error instanceof Error ? error.message : '读取用户任务失败'
+  } finally {
+    loadingMore.value = false
+  }
+}
+
+function shortHash(value: string) {
+  return value ? `${value.slice(0, 10)}...` : '-'
+}
+
+function galleryUserAPIKeyLabel(user: GalleryUser) {
+  return user.api_key_label || shortHash(user.api_key_hash)
+}
+
+function galleryUserDisplayLabel(user: GalleryUser) {
+  const name = (user.username || '').trim()
+  if (user.user_id && name) return `#${user.user_id} ${name}`
+  if (user.user_id) return `#${user.user_id}`
+  if (name) return name
+  return galleryUserAPIKeyLabel(user)
+}
+
+function formatDateTime(value?: string) {
+  if (!value) return '-'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+}
+
 function showMessage(text: string) {
   message.value = text
   window.setTimeout(() => {
@@ -2195,7 +2490,7 @@ function showMessage(text: string) {
 </script>
 
 <template>
-  <main class="page" :class="[`theme-${appliedThemeMode}`, { 'canvas-view': viewMode === 'canvas', 'canvas-zen-view': viewMode === 'canvas' && canvasZenMode }]" @click="closeContextMenu" @contextmenu.prevent="openPageContextMenu">
+  <main class="page" :class="[`theme-${appliedThemeMode}`, { 'canvas-view': viewMode === 'canvas' || (viewMode === 'gallery' && gallerySection === 'canvas'), 'canvas-zen-view': (viewMode === 'canvas' || (viewMode === 'gallery' && gallerySection === 'canvas')) && canvasZenMode }]" @click="closeContextMenu" @contextmenu.prevent="openPageContextMenu">
     <Transition name="canvas-toolbar-slide">
       <AppToolbar
         v-if="!(viewMode === 'canvas' && canvasZenMode)"
@@ -2210,11 +2505,16 @@ function showMessage(text: string) {
         :plaza-sort="plazaSort"
         :theme-mode="themeMode"
         :hide-canvas="hideCanvasForCompact"
+        :admin-mode="isGalleryMode"
+        :admin-section="gallerySection"
+        :admin-user-label="selectedGalleryUserLabel"
         @open-settings="openSettings"
         @open-onboarding="openOnboarding"
+        @open-admin-user-switcher="showGalleryUserSwitcher = true"
+        @switch-admin-section="switchGallerySection"
         @switch-view="switchView"
-        @refresh-tasks="refreshTasks"
-        @reset-tasks="resetTasks"
+        @refresh-tasks="isGalleryMode ? refreshGallerySection() : refreshTasks()"
+        @reset-tasks="isGalleryMode ? refreshGallerySection() : resetTasks()"
         @refresh-plaza-items="refreshPlazaItems"
         @switch-plaza-sort="switchPlazaSort"
         @toggle-theme="toggleTheme"
@@ -2223,14 +2523,15 @@ function showMessage(text: string) {
     </Transition>
 
     <TaskGrid
-      v-if="viewMode === 'tasks'"
+      v-if="viewMode === 'tasks' || (viewMode === 'gallery' && galleryLoggedIn && gallerySection === 'tasks')"
       :tasks="tasks"
-      :has-config="hasConfig"
-      :base-url-blocked="baseURLBlocked"
+      :has-config="isGalleryMode ? true : hasConfig"
+      :base-url-blocked="isGalleryMode ? false : baseURLBlocked"
       :admin-contact-image="adminContactImage"
       :loading-more="loadingMore"
       :has-more-tasks="hasMoreTasks"
       :clock="clock"
+      :admin-mode="isGalleryMode"
       @show-admin-contact="showAdminContact = true"
       @select-task="selectedTask = $event"
       @context-menu="openTaskContextMenu"
@@ -2245,9 +2546,9 @@ function showMessage(text: string) {
 
     <KeepAlive>
       <CanvasWorkspace
-        v-if="viewMode === 'canvas'"
-        :apikey="apikey"
-        :baseurl="baseurl"
+        v-if="viewMode === 'canvas' || (viewMode === 'gallery' && galleryLoggedIn && gallerySection === 'canvas')"
+        :apikey="isGalleryMode ? '' : apikey"
+        :baseurl="isGalleryMode ? '' : baseurl"
         :tasks="tasks"
         :default-form="form"
         :models="models"
@@ -2255,6 +2556,8 @@ function showMessage(text: string) {
         :shared-canvas-ids="sharedCanvasIds"
         :canvas-task-snapshots="canvasTaskSnapshots"
         :canvas-import="pendingCanvasImport"
+        :read-only="isGalleryMode"
+        :external-canvas-state="isGalleryMode ? galleryCanvasState : null"
         :run-node-action="runCanvasNode"
         :run-llm-action="runCanvasLLM"
         @select-task="selectedTask = $event"
@@ -2270,7 +2573,7 @@ function showMessage(text: string) {
     </KeepAlive>
 
     <Transition name="canvas-loading-fade">
-      <div v-if="viewMode === 'canvas' && !canvasFrameReady" class="canvas-entry-loading">
+      <div v-if="(viewMode === 'canvas' || (viewMode === 'gallery' && galleryLoggedIn && gallerySection === 'canvas')) && !canvasFrameReady" class="canvas-entry-loading">
         <div class="canvas-entry-loading-panel glass-panel">
           <div class="spinner" aria-hidden="true"></div>
           <strong>正在载入画布</strong>
@@ -2291,6 +2594,17 @@ function showMessage(text: string) {
       @toggle-like="togglePlazaLike"
       @load-more="loadMorePlazaItems"
     />
+
+    <section v-if="viewMode === 'gallery' && !galleryLoggedIn" class="gallery-manager glass-panel">
+      <form v-if="!galleryLoggedIn" class="gallery-login" @submit.prevent="loginGallery">
+        <h2>图库管理</h2>
+        <input v-model="galleryLoginForm.username" autocomplete="username" placeholder="管理员账号" />
+        <input v-model="galleryLoginForm.password" type="password" autocomplete="current-password" placeholder="管理员密码" />
+        <button type="submit">登录</button>
+        <p v-if="galleryError">{{ galleryError }}</p>
+      </form>
+    </section>
+    <p v-if="viewMode === 'gallery' && galleryLoggedIn && galleryError" class="gallery-error floating-gallery-error">{{ galleryError }}</p>
 
     <button
       v-if="viewMode === 'tasks'"
@@ -2437,10 +2751,65 @@ function showMessage(text: string) {
       </section>
     </div>
 
+    <div v-if="showGalleryUserSwitcher" class="modal-backdrop" @click.self="showGalleryUserSwitcher = false">
+      <section class="gallery-user-switcher light-modal">
+        <button class="modal-close" type="button" @click="showGalleryUserSwitcher = false"><AppIcon name="close" /></button>
+        <div class="gallery-user-switcher-head">
+          <div>
+            <h2>切换用户</h2>
+            <p>{{ galleryUserTotal }} 个有资源用户 · 第 {{ galleryUserTotalPages ? galleryUserPage : 0 }} / {{ galleryUserTotalPages }} 页 · 按最近素材排序</p>
+          </div>
+          <button type="button" @click="refreshGalleryUsers()"><AppIcon name="refresh" />刷新</button>
+        </div>
+        <div class="gallery-user-search">
+          <AppIcon name="search" />
+          <input v-model="galleryUserSearch" type="search" placeholder="搜索 BaseURL 或 APIKEY hash" />
+        </div>
+        <p v-if="galleryError" class="gallery-error">{{ galleryError }}</p>
+        <div class="gallery-user-list">
+          <button
+            v-for="user in galleryUsers"
+            :key="user.workspace_id"
+            type="button"
+            :class="{ active: selectedGalleryUserID === user.workspace_id }"
+            @click="selectGalleryUser(user)"
+          >
+            <span class="gallery-user-avatar">{{ (user.username || maskBaseURL(user.baseurl)).slice(0, 1).toUpperCase() }}</span>
+            <span class="gallery-user-main">
+              <strong>{{ galleryUserDisplayLabel(user) }}</strong>
+              <small>{{ maskBaseURL(user.baseurl) }} · APIKEY {{ galleryUserAPIKeyLabel(user) }}</small>
+            </span>
+            <span class="gallery-user-meta">
+              <strong>{{ user.asset_count }}</strong>
+              <small>资源</small>
+            </span>
+            <span class="gallery-user-date">{{ formatDateTime(user.last_asset_at) }}</span>
+          </button>
+          <p v-if="galleryLoading">正在读取用户...</p>
+          <p v-else-if="!galleryUsers.length">{{ galleryUserSearch.trim() ? '没有匹配的用户' : '暂无用户' }}</p>
+        </div>
+        <div v-if="galleryUserTotalPages > 1" class="gallery-user-pagination">
+          <button type="button" :disabled="galleryUserPage <= 1 || galleryLoading" @click="switchGalleryUserPage(galleryUserPage - 1)">上一页</button>
+          <button
+            v-for="page in galleryUserPageNumbers()"
+            :key="page"
+            type="button"
+            :class="{ active: page === galleryUserPage }"
+            :disabled="galleryLoading"
+            @click="switchGalleryUserPage(page)"
+          >
+            {{ page }}
+          </button>
+          <button type="button" :disabled="galleryUserPage >= galleryUserTotalPages || galleryLoading" @click="switchGalleryUserPage(galleryUserPage + 1)">下一页</button>
+        </div>
+      </section>
+    </div>
+
     <TaskDetailModal
       v-if="selectedTask"
       :task="selectedTask"
       :clock="clock"
+      :admin-preview-only="isGalleryMode"
       @close="selectedTask = null"
       @open-preview="openPreviewImage"
       @reuse="reuseTask"

@@ -2,13 +2,14 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { Task } from '../types'
 import { imageSizeLabel } from '../lib/sizes'
-import { canShareTask, formatTime, isFavorite, isVideoTask, maskBaseURL, queueText, statusText, taskReferenceImages, timeText } from '../lib/view'
+import { canShareTask, displayImageURL, formatTime, isFavorite, isVideoTask, maskBaseURL, queueText, statusText, taskReferenceImages, timeText } from '../lib/view'
 import { videoRatioLabel } from '../lib/videoModels'
 import AppIcon from './AppIcon.vue'
 
 const props = defineProps<{
   task: Task
   clock: number
+  adminPreviewOnly?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -122,7 +123,7 @@ onBeforeUnmount(() => {
         @pointerup="stopMediaPan"
         @pointercancel="stopMediaPan"
       >
-        <template v-if="isVideoTask(task) && detailVideo?.url">
+        <template v-if="isVideoTask(task) && detailVideo?.url && !adminPreviewOnly">
           <img v-if="!videoReady && detailVideoCover" class="detail-video-poster" :src="detailVideoCover" alt="视频封面" draggable="false" crossorigin="anonymous" />
           <div v-if="!videoReady" class="detail-video-loading">
             <span></span>
@@ -130,6 +131,7 @@ onBeforeUnmount(() => {
           </div>
           <video ref="videoRef" class="detail-video" :class="{ ready: videoReady }" :src="detailVideo.url" :controls="videoReady" autoplay playsinline preload="auto" crossorigin="anonymous" :style="mediaTransform" @loadeddata="videoReady = true" @canplay="videoReady = true" />
         </template>
+        <img v-else-if="isVideoTask(task) && detailVideoCover" :src="detailVideoCover" alt="视频预览" loading="lazy" decoding="async" draggable="false" crossorigin="anonymous" :style="mediaTransform" />
         <img v-else-if="task.result_images?.[0]?.url" :src="task.result_images[0].url" alt="生成结果" loading="lazy" decoding="async" draggable="false" crossorigin="anonymous" :style="mediaTransform" />
         <div v-else class="detail-state">
           <span>{{ task.status === 'failed' ? '!' : '...' }}</span>
@@ -144,8 +146,8 @@ onBeforeUnmount(() => {
         <div v-if="taskReferenceImages(task).length" class="detail-section">
           <div class="section-title">参考图片</div>
           <div class="detail-references">
-            <button v-for="(image, index) in taskReferenceImages(task)" :key="`${image.url}-${index}`" type="button" @click="emit('openPreview', image.url, image.filename || `参考图 ${index + 1}`, $event, image.mask_url)">
-              <img :src="image.url" :alt="image.filename || '参考图'" loading="lazy" decoding="async" crossorigin="anonymous" />
+            <button v-for="(image, index) in taskReferenceImages(task)" :key="`${image.url}-${index}`" type="button" @click="emit('openPreview', adminPreviewOnly ? displayImageURL(image) : image.url, image.filename || `参考图 ${index + 1}`, $event, image.mask_url)">
+              <img :src="displayImageURL(image)" :alt="image.filename || '参考图'" loading="lazy" decoding="async" crossorigin="anonymous" />
               <span>{{ image.filename || `参考 ${index + 1}` }}{{ image.mask_url ? ' · 蒙板' : '' }}</span>
             </button>
           </div>
@@ -167,7 +169,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <p class="detail-time">创建于 {{ formatTime(task.created_at) }} · 状态 {{ queueText(task) || statusText(task.status) }}</p>
-        <div class="detail-buttons">
+        <div v-if="!adminPreviewOnly" class="detail-buttons">
           <button class="blue" @click="emit('reuse', task); emit('close')">
             <AppIcon name="copy" />
             <span>复用配置</span>
@@ -194,6 +196,12 @@ onBeforeUnmount(() => {
           </button>
           <button class="star" :class="{ favorite: isFavorite(task) }" :title="isFavorite(task) ? '取消收藏' : '收藏'" :aria-label="isFavorite(task) ? '取消收藏' : '收藏'" @click="emit('toggleFavorite', task, $event)">
             <AppIcon name="favorite" />
+          </button>
+        </div>
+        <div v-else class="detail-buttons">
+          <button class="purple" :disabled="!canShareTask(task)" @click="emit('openResult', task)">
+            <AppIcon name="download" />
+            <span>下载资源</span>
           </button>
         </div>
       </div>
